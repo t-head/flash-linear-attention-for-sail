@@ -43,3 +43,6 @@ __pycache__
 
 # macOS
 .DS_Store
+
+# autotune debug patches
+*.patch

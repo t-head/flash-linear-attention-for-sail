@@ -41,11 +41,15 @@ else:
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        # --- 810E best configs ---
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=4),   # H=8,16,48,64
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=4, num_stages=4),   # H=32
+        triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=1),  # H=128
+        # --- 890P best configs ---
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),   # H=8,16,32,48
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=5), # H=64,128
     ],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    key=['H', 'K', 'V', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -106,17 +110,33 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
+def _prune_wy_bwd_configs(configs, named_args, **kwargs):
+    """For large K (>192) use larger BK tiles to reduce the number of K splits
+    and the bf16 dot accumulation error in dk."""
+    K = kwargs.get('K', 0)
+    if K > 192:
+        return [c for c in configs if c.kwargs.get('BK', 32) >= 64]
+    return configs
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=4),
+        triton.Config({'BK': 16, 'BV': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 16, 'BV': 32}, num_warps=4, num_stages=4),
+        # Large-K hardening tiles; only active when K > 192 via early_config_prune.
+        triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 128, 'BV': 32}, num_warps=8, num_stages=2),
+        triton.Config({'BK': 128, 'BV': 32}, num_warps=8, num_stages=3),
     ],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    key=['H', 'K', 'V', 'BT', 'IS_VARLEN'],
+    prune_configs_by={'early_config_prune': _prune_wy_bwd_configs},
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -166,27 +186,23 @@ def prepare_wy_repr_bwd_kernel(
         p_g = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
         b_g_exp = tl.exp(b_g)
+        b_bg = b_b * b_g_exp
         b_dg = tl.zeros([BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_dw = tl.make_block_ptr(dw + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         # [BT, BK]
         b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_dw = tl.load(p_dw, boundary_check=(0, 1))
         if USE_G:
-            b_kbg = b_k * (b_b * b_g_exp)[:, None]
+            b_kbg = (b_k * b_bg[:, None]).to(b_dw.dtype)
         else:
             b_kbg = b_k * b_b[:, None]
-        b_dw = tl.load(p_dw, boundary_check=(0, 1))
 
-        b_dA += tl.dot(b_dw, tl.trans(b_kbg).to(b_dw.dtype))
-        b_dkbg = tl.dot(b_A, b_dw)
-        if USE_G:
-            b_dk = b_dkbg * (b_g_exp * b_b)[:, None]
-            b_db += tl.sum(b_dkbg * b_k * b_g_exp[:, None], 1)
-            b_dg += tl.sum(b_dkbg * b_kbg, 1)
-        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+        # only accumulate dA here; dkbg=A@dw is deferred to loop3
+        # to eliminate the dk1 global store/load round-trip
+        b_dA = tl.dot(b_dw, tl.trans(b_kbg), acc=b_dA)
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(v + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
@@ -195,7 +211,7 @@ def prepare_wy_repr_bwd_kernel(
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
         b_du = tl.load(p_du, boundary_check=(0, 1))
-        b_dA += tl.dot(b_du, tl.trans(b_vb))
+        b_dA = tl.dot(b_du, tl.trans(b_vb), acc=b_dA)
         b_dvb = tl.dot(b_A, b_du)
         b_dv = b_dvb * b_b[:, None]
         b_db += tl.sum(b_dvb * b_v, 1)
@@ -204,38 +220,51 @@ def prepare_wy_repr_bwd_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    b_dA = tl.where(m_A, b_dA, 0)
-    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
+    b_dA = tl.dot(tl.where(m_A, b_dA, 0).to(b_A.dtype), b_A)
     b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
 
     if USE_G:
         b_dA *= exp(b_g[:, None] - b_g[None, :])
 
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
     b_dA = tl.where(m_A, -b_dA, 0).to(k.dtype.element_ty)
 
-    tl.debug_barrier()
+    # hoist (dA*beta)^T out of the i_k loop: reused by all K blocks.
+    # folding beta into dA lets both loop3 dots share the same B operand (b_k)
+    # (dA^T @ (k*beta) == (dA*beta)^T @ k)
+    b_dAbt = tl.trans((b_dA * b_b[:, None]).to(b_dA.dtype))
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_dk = tl.make_block_ptr(dk + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dw = tl.make_block_ptr(dw + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kt = tl.trans(b_k)
-        b_ktb = b_kt * b_b[None, :]
+        b_dw = tl.load(p_dw, boundary_check=(0, 1), eviction_policy="evict_first")
 
-        b_A += tl.dot(b_k, b_kt)
+        # dkb/dAkb share b_k as B-operand; dkbg uses b_dw (evict_first)
         b_dkb = tl.dot(b_dA, b_k)
-        b_db += tl.sum(b_dkb * b_k, 1)
-        b_dk = b_dkb * b_b[:, None] + tl.trans(tl.dot(b_ktb.to(b_dA.dtype), b_dA))
-        b_dk += tl.load(p_dk, boundary_check=(0, 1))
+        b_dAkb = tl.dot(b_dAbt, b_k)
+        b_dkbg = tl.dot(b_A, b_dw)
+
+        if USE_G:
+            b_dk = b_dkb * b_b[:, None] + b_dAkb + b_dkbg * b_bg[:, None]
+            # db/dg from dkbg
+            b_t = b_g_exp * tl.sum(b_dkbg * b_k, 1)
+            b_db += b_t
+            b_dg += b_t * b_b
+            # db/dg from dkb
+            b_t = tl.sum(b_dkb * b_k, 1)
+            b_db += b_t
+            b_dg += b_t * b_b
+            # dg from dAkb
+            b_dg -= tl.sum(b_k * b_dAkb, 1)
+        else:
+            b_dk = b_dkb * b_b[:, None] + b_dAkb + b_dkbg * b_b[:, None]
+            b_db += tl.sum(b_dkb * b_k, 1)
 
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_db, b_db.to(p_db.dtype.element_ty), boundary_check=(0,))
 
-    b_A *= b_b[:, None]
     if USE_G:
-        b_AdA = b_dA * b_A
         p_dg = tl.make_block_ptr(dg + (bos*H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_dg += tl.sum(b_AdA, axis=1) - tl.sum(b_AdA, axis=0)
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
 
 
@@ -249,8 +278,6 @@ def recompute_w_u_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -272,8 +299,6 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
     )
     return w, u
 
@@ -292,10 +317,6 @@ def prepare_wy_repr_bwd(
     BT = 64
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    CONST_TILING = 64 if check_shared_mem() else 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
-
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
     dg = torch.empty_like(g) if g is not None else None
@@ -319,8 +340,6 @@ def prepare_wy_repr_bwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
     )
     return dk, dv, db, dg
 

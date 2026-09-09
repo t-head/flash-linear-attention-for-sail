@@ -178,7 +178,7 @@ def merge_16x16_to_32x32_inverse_kernel(
 @triton.autotune(
     configs=[
         triton.Config({'DOT_PRECISION': DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
+        for num_warps in [2, 4]
         for num_stages in [2, 3, 4, 5]
         for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
     ],

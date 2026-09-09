@@ -398,6 +398,10 @@ IS_NVIDIA_HOPPER = (IS_NVIDIA and ('NVIDIA H' in torch.cuda.get_device_name(0) o
 IS_NVIDIA_BLACKWELL = (IS_NVIDIA and torch.cuda.get_device_capability()[0] == 10)
 USE_CUDA_GRAPH = (IS_NVIDIA and os.environ.get('FLA_USE_CUDA_GRAPH', '0') == '1')
 
+# PPU (ZW-series) identification. The parts report through the CUDA backend and their
+# capability tuples collide with real NVIDIA ones ((8, 0) = A100), so match the model name.
+IS_PPU = (IS_NVIDIA and 'ZW' in torch.cuda.get_device_name(0))
+
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 IS_TF32_SUPPORTED = (IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8)
 IS_GATHER_SUPPORTED = hasattr(triton.language, 'gather')
@@ -483,6 +487,7 @@ def _register_aliases():
         'IS_TF32_SUPPORTED',
         'IS_GATHER_SUPPORTED',
         'IS_TMA_SUPPORTED',
+        'IS_PPU',
     ):
         if hasattr(current_module, key):
             setattr(current_module, key.lower(), getattr(current_module, key))

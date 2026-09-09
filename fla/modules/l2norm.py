@@ -8,6 +8,8 @@ import triton.language as tl
 from fla.utils import IS_AMD, autotune_cache_kwargs, input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
+L2NORM_BT = 16
+L2NORM_NUM_WARPS = 4
 NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 
 
@@ -75,12 +77,8 @@ def l2norm_bwd_kernel1(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in BT_LIST
-    ],
-    key=['D', 'NB'],
+    configs=[triton.Config({'BT': L2NORM_BT}, num_warps=L2NORM_NUM_WARPS)],
+    key=['D'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -109,12 +107,9 @@ def l2norm_fwd_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in BT_LIST
-    ],
-    key=['D', 'NB'],
+    # Pinned to the same single config as l2norm_fwd_kernel; see the rationale at the top.
+    configs=[triton.Config({'BT': L2NORM_BT}, num_warps=L2NORM_NUM_WARPS)],
+    key=['D'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
