@@ -418,9 +418,10 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
 
         # Update dv
-        # aiu path only when K tiles exactly into BK-wide blocks -- otherwise the tail block
-        # reaches into the next head (same reason as fwd_kernel_h above).
-        if USE_AIU and K % BK == 0:
+        # tl.aiu_load obeys the PPU shape rules: 2-byte-typed tile, contiguous K width a 32-byte
+        # multiple (BK*2 % 32 == 0 for bf16), BLOCK_M % 16 == 0, power-of-2 dims. BK in {32,64,128}
+        # all satisfy this and load correctly in isolation, and BK=64/128 also run correctly here.
+        if USE_AIU and K % BK == 0 and BK % 64 == 0:
             b_k = tl.aiu_load(k, (i_t * BT, 0), (BT, BK), (T, H*K), DT_K, (1, 0))
         else:
             p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
@@ -431,7 +432,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         b_dv = tl.dot(b_k, b_dh1.to(b_k.dtype))
 
         if K > BK:
-            if USE_AIU and K % BK == 0:
+            if USE_AIU and K % BK == 0 and BK % 64 == 0:
                 b_k = tl.aiu_load(k, (i_t * BT, BK), (BT, BK), (T, H*K), DT_K, (1, 0))
             else:
                 p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, BK), (BT, BK), (1, 0))
@@ -442,7 +443,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             b_dv = tl.dot(b_k, b_dh2.to(b_k.dtype), acc=b_dv)
 
         if K > 2*BK:
-            if USE_AIU and K % BK == 0:
+            if USE_AIU and K % BK == 0 and BK % 64 == 0:
                 b_k = tl.aiu_load(k, (i_t * BT, 2*BK), (BT, BK), (T, H*K), DT_K, (1, 0))
             else:
                 p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 2*BK), (BT, BK), (1, 0))
@@ -453,7 +454,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             b_dv = tl.dot(b_k, b_dh3.to(b_k.dtype), acc=b_dv)
 
         if K > 3*BK:
-            if USE_AIU and K % BK == 0:
+            if USE_AIU and K % BK == 0 and BK % 64 == 0:
                 b_k = tl.aiu_load(k, (i_t * BT, 3*BK), (BT, BK), (T, H*K), DT_K, (1, 0))
             else:
                 p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 3*BK), (BT, BK), (1, 0))

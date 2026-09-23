@@ -742,6 +742,10 @@ def chunk_bwd_dqkwg(
     dk = torch.empty_like(k)
     dg = torch.zeros(NK_MAX, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
     dw = torch.empty_like(w) if w is not None else None
+    # restore_value=['dg'] clones dg during autotune benchmarking, but dg is None on the
+    # non-gated path (USE_G=False, kernel never touches it). Pass an inert placeholder so the
+    # clone gets a real tensor; the returned dg stays None.
+    dg_arg = dg if dg is not None else q.new_empty(1, dtype=torch.float32)
 
     grid = lambda meta: (triton.cdiv(K, meta['BK']), NT, B * H)
 
@@ -775,7 +779,7 @@ def chunk_bwd_dqkwg(
         dq=dq,
         dk=dk,
         dv=None,
-        dg=dg,
+        dg=dg_arg,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
