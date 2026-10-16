@@ -1,0 +1,16 @@
+# FLA 0.5.2 PR quick-test commands
+# Each non-empty, non-comment line is executed as a shell command.
+
+python -m pytest -v tests/ops/test_gdn.py -k "fused_recurrent" --durations=30
+python -m pytest -v tests/ops/test_gdn.py -k "(test_chunk and not varlen and not gate_in_kernel) or blackwell" --durations=30
+python -m pytest -v tests/ops/test_gdn.py -k "(chunk_varlen or chunk_gate_in_kernel) and not flash_qla" --durations=30
+python -m pytest -v tests/ops/test_gdn.py -k "flash_qla or test_gate or prepare_wy_repr" --durations=30
+python -m pytest -v tests/ops/test_gdn_kernels.py --durations=30
+python -m pytest -v tests/context_parallel/test_cp_gdn.py --durations=30
+python -m pytest -v tests/context_parallel/test_cp_bwd_gk_offset.py --durations=30
+python -m pytest -v tests/context_parallel/test_cp_conv.py --durations=30
+python -m pytest -v tests/modules/test_conv.py --durations=30
+python -m pytest -v tests/layers/test_gated_deltanet.py --durations=30
+python -m pytest -v tests/ops/test_intracard_cache.py --durations=30
+# tests/ops/test_gdn_qwen.py: file absent on this branch; uncomment once it lands
+# python -m pytest -v tests/ops/test_gdn_qwen.py --durations=30
