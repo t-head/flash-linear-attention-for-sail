@@ -12,5 +12,4 @@ python -m pytest -v tests/context_parallel/test_cp_conv.py --durations=30
 python -m pytest -v tests/modules/test_conv.py --durations=30
 python -m pytest -v tests/layers/test_gated_deltanet.py --durations=30
 python -m pytest -v tests/ops/test_intracard_cache.py --durations=30
-# tests/ops/test_gdn_qwen.py: file absent on this branch; uncomment once it lands
-# python -m pytest -v tests/ops/test_gdn_qwen.py --durations=30
+python -m pytest -v tests/ops/test_gdn_qwen.py --durations=30
