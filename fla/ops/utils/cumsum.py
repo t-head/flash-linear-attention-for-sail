@@ -24,7 +24,7 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 @fla_cache_autotune(
     configs=[
         triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8]
+        for num_warps in [1, 2, 4]
     ],
     key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,

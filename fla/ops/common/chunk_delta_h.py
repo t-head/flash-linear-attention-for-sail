@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -16,6 +18,7 @@ from fla.ops.utils.op import exp2
 from fla.utils import (
     IS_NVIDIA_BLACKWELL,
     IS_NVIDIA_HOPPER,
+    IS_PPU,
     autotune_cache_kwargs,
     check_shared_mem,
 )
@@ -25,7 +28,20 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # TODO: Triton mainline fixes a Blackwell tl.dot recurrence race.
 # Keep this kernel on num_warps=2 for Blackwell until Triton 3.8 is released
 # and we re-validate the wider config space.
-GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]
+if IS_NVIDIA_BLACKWELL:
+    GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2]
+elif IS_PPU:
+    # PPU-verified expanded num_warps space (seq=8K, heads=16..128).
+    GATED_DELTA_RULE_FWD_H_NUM_WARPS = [4, 8, 16]
+else:
+    GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2, 4]
+
+# Stage the repeatedly-read k/w blocks through the PPU AIU. Gated on the device, since
+# tl.aiu_load only exists in the PPU triton fork; FLA_PPU_DISABLE_AIU=1 forces the plain
+# tl.load path for A/B timing. The env var is read once at import time and frozen, since
+# the PPU triton fork rejects kernel-level references to plain globals.
+_IS_AIU_ENABLED = IS_PPU and os.environ.get('FLA_PPU_DISABLE_AIU', '0') != '1'
+USE_AIU = tl.constexpr(_IS_AIU_ENABLED)
 
 
 @triton.heuristics({
@@ -40,8 +56,8 @@ GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
+        for num_stages in ([2, 3, 4] if IS_PPU or check_shared_mem('ampere') else [2, 1])
+        for BV in ([32, 64, 128] if IS_PPU else ([32, 64] if check_shared_mem('ada') else [32]))
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
@@ -72,6 +88,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
+    USE_AIU: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -110,6 +127,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     w += (bos * HV + i_h).to(tl.int64) * K
     if SAVE_NEW_VALUE:
         v_new += (bos * HV + i_h).to(tl.int64) * V
+
+    # Resolve the element type once per kernel rather than at each aiu_load / cast site,
+    # so the accessor is a single point of edit if it ever has to change. Well defined
+    # here because w/k are kernel pointer args advanced only by integer offsets.
+    DT_W = w.dtype.element_ty
+    DT_K = k.dtype.element_ty
 
     if USE_INITIAL_STATE:
         h0 = h0 + i_nh * K*V
@@ -197,33 +220,53 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 m_h4 = m_k4[:, None] & m_v[None, :]
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), mask=m_h4)
 
-        p_w = w + o_t[:, None] * (HV*K) + o_k1[None, :]
-        b_w = tl.load(p_w, mask=m_t[:, None] & m_k1[None, :], other=0.0)
-        if STATE_V_FIRST:
-            b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
+        last_idx = min((i_t + 1) * BT, T) - 1
+        if USE_G:
+            b_g_last = tl.load(g + (bos * HV + last_idx * HV + i_h).to(tl.int64)).to(tl.float32)
+            p_g = g + (bos * HV + i_h).to(tl.int64) + o_t * HV
+            b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
+
+        # aiu_load clamps rows only; its 64-wide column block walks the physical row
+        # stride (HV*K here), so it is only safe when K tiles into exact 64-wide blocks.
+        if USE_AIU and K % 64 == 0:
+            b_w = tl.aiu_load(w, (i_t * BT, 0), (BT, 64), (T, HV*K), DT_W, (1, 0))
         else:
-            b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
+            p_w = w + o_t[:, None] * (HV*K) + o_k1[None, :]
+            b_w = tl.load(p_w, mask=m_t[:, None] & m_k1[None, :], other=0.0)
+        if STATE_V_FIRST:
+            b_v = tl.dot(b_w, tl.trans(b_h1).to(DT_W))
+        else:
+            b_v = tl.dot(b_w, b_h1.to(DT_W))
         if K > 64:
-            p_w = w + o_t[:, None] * (HV*K) + o_k2[None, :]
-            b_w = tl.load(p_w, mask=m_t[:, None] & m_k2[None, :], other=0.0)
-            if STATE_V_FIRST:
-                b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype))
+            if USE_AIU and K % 64 == 0:
+                b_w = tl.aiu_load(w, (i_t * BT, 64), (BT, 64), (T, HV*K), DT_W, (1, 0))
             else:
-                b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
+                p_w = w + o_t[:, None] * (HV*K) + o_k2[None, :]
+                b_w = tl.load(p_w, mask=m_t[:, None] & m_k2[None, :], other=0.0)
+            if STATE_V_FIRST:
+                b_v += tl.dot(b_w, tl.trans(b_h2).to(DT_W))
+            else:
+                b_v += tl.dot(b_w, b_h2.to(DT_W))
         if K > 128:
-            p_w = w + o_t[:, None] * (HV*K) + o_k3[None, :]
-            b_w = tl.load(p_w, mask=m_t[:, None] & m_k3[None, :], other=0.0)
-            if STATE_V_FIRST:
-                b_v += tl.dot(b_w, tl.trans(b_h3).to(b_w.dtype))
+            if USE_AIU and K % 64 == 0:
+                b_w = tl.aiu_load(w, (i_t * BT, 128), (BT, 64), (T, HV*K), DT_W, (1, 0))
             else:
-                b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
+                p_w = w + o_t[:, None] * (HV*K) + o_k3[None, :]
+                b_w = tl.load(p_w, mask=m_t[:, None] & m_k3[None, :], other=0.0)
+            if STATE_V_FIRST:
+                b_v += tl.dot(b_w, tl.trans(b_h3).to(DT_W))
+            else:
+                b_v += tl.dot(b_w, b_h3.to(DT_W))
         if K > 192:
-            p_w = w + o_t[:, None] * (HV*K) + o_k4[None, :]
-            b_w = tl.load(p_w, mask=m_t[:, None] & m_k4[None, :], other=0.0)
-            if STATE_V_FIRST:
-                b_v += tl.dot(b_w, tl.trans(b_h4).to(b_w.dtype))
+            if USE_AIU and K % 64 == 0:
+                b_w = tl.aiu_load(w, (i_t * BT, 192), (BT, 64), (T, HV*K), DT_W, (1, 0))
             else:
-                b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
+                p_w = w + o_t[:, None] * (HV*K) + o_k4[None, :]
+                b_w = tl.load(p_w, mask=m_t[:, None] & m_k4[None, :], other=0.0)
+            if STATE_V_FIRST:
+                b_v += tl.dot(b_w, tl.trans(b_h4).to(DT_W))
+            else:
+                b_v += tl.dot(b_w, b_h4.to(DT_W))
         p_v = v + o_t[:, None] * (HV*V) + o_v[None, :]
         b_v = tl.load(p_v, mask=m_t[:, None] & m_v[None, :], other=0.0) - b_v
 
@@ -231,11 +274,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_v = v_new + o_t[:, None] * (HV*V) + o_v[None, :]
             tl.store(p_v, b_v.to(p_v.dtype.element_ty), mask=m_t[:, None] & m_v[None, :])
 
-        last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
-            b_g_last = tl.load(g + (bos * HV + last_idx * HV + i_h).to(tl.int64)).to(tl.float32)
-            p_g = g + (bos * HV + i_h).to(tl.int64) + o_t * HV
-            b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
             b_v = b_v * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
             b_g_last = exp2(b_g_last)
             b_h1 *= b_g_last
@@ -274,35 +313,47 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     b_h4 *= exp2(b_gk_last4)[None, :]
                 else:
                     b_h4 *= exp2(b_gk_last4)[:, None]
-        b_v = b_v.to(k.dtype.element_ty)
-
-        p_k = k + o_k1[:, None] + o_t[None, :] * (H*K)
-        b_k = tl.load(p_k, mask=m_k1[:, None] & m_t[None, :], other=0.0)
-        if STATE_V_FIRST:
-            b_h1 += tl.trans(tl.dot(b_k, b_v))
+        # Delay the b_v cast into each dot: the aiu path feeds DT_K-typed blocks straight
+        # in, and per-dot casts avoid a full-tile conversion of an already-loaded value.
+        if USE_AIU and K % 64 == 0:
+            b_k = tl.aiu_load(k, (0, i_t * BT), (64, BT), (H*K, T), DT_K, (0, 1))
         else:
-            b_h1 += tl.dot(b_k, b_v)
+            p_k = k + o_k1[:, None] + o_t[None, :] * (H*K)
+            b_k = tl.load(p_k, mask=m_k1[:, None] & m_t[None, :], other=0.0)
+        if STATE_V_FIRST:
+            b_h1 += tl.trans(tl.dot(b_k, b_v.to(DT_K)))
+        else:
+            b_h1 += tl.dot(b_k, b_v.to(DT_K))
         if K > 64:
-            p_k = k + o_k2[:, None] + o_t[None, :] * (H*K)
-            b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
-            if STATE_V_FIRST:
-                b_h2 += tl.trans(tl.dot(b_k, b_v))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (64, i_t * BT), (64, BT), (H*K, T), DT_K, (0, 1))
             else:
-                b_h2 += tl.dot(b_k, b_v)
+                p_k = k + o_k2[:, None] + o_t[None, :] * (H*K)
+                b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
+            if STATE_V_FIRST:
+                b_h2 += tl.trans(tl.dot(b_k, b_v.to(DT_K)))
+            else:
+                b_h2 += tl.dot(b_k, b_v.to(DT_K))
         if K > 128:
-            p_k = k + o_k3[:, None] + o_t[None, :] * (H*K)
-            b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
-            if STATE_V_FIRST:
-                b_h3 += tl.trans(tl.dot(b_k, b_v))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (128, i_t * BT), (64, BT), (H*K, T), DT_K, (0, 1))
             else:
-                b_h3 += tl.dot(b_k, b_v)
+                p_k = k + o_k3[:, None] + o_t[None, :] * (H*K)
+                b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+            if STATE_V_FIRST:
+                b_h3 += tl.trans(tl.dot(b_k, b_v.to(DT_K)))
+            else:
+                b_h3 += tl.dot(b_k, b_v.to(DT_K))
         if K > 192:
-            p_k = k + o_k4[:, None] + o_t[None, :] * (H*K)
-            b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
-            if STATE_V_FIRST:
-                b_h4 += tl.trans(tl.dot(b_k, b_v))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (192, i_t * BT), (64, BT), (H*K, T), DT_K, (0, 1))
             else:
-                b_h4 += tl.dot(b_k, b_v)
+                p_k = k + o_k4[:, None] + o_t[None, :] * (H*K)
+                b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+            if STATE_V_FIRST:
+                b_h4 += tl.trans(tl.dot(b_k, b_v.to(DT_K)))
+            else:
+                b_h4 += tl.dot(b_k, b_v.to(DT_K))
 
     if STORE_FINAL_STATE:
         if STATE_V_FIRST:
@@ -338,6 +389,18 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_ht)
 
 
+def _prune_dhu_configs(configs, named_args, **kwargs):
+    """For large K (>192) keep BK=128 only: with narrower K tiles the dh/dv K-split
+    accumulates extra bf16 dot error, so PPU keeps the widest tiles for K > 192."""
+    K = kwargs.get('K', 0)
+    if K > 192:
+        return [c for c in configs if c.kwargs.get('BK', 32) >= 128]
+    return configs
+
+
+_DHU_AUTOTUNE_KWARGS = {'prune_configs_by': {'early_config_prune': _prune_dhu_configs}} if IS_PPU else {}
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_GK': lambda args: args['gk'] is not None,
@@ -346,13 +409,37 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @fla_cache_autotune(
-    configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
+    configs=(
+        # PPU-verified best BK/BV configs (seq=8K, heads=16..128): BK is autotuned
+        # jointly with BV, replacing the stock kernel's fixed 64-wide K split.
+        [
+            triton.Config({'BV': 128, 'BK': 128}, num_warps=16, num_stages=2),
+            triton.Config({'BV': 128, 'BK': 32}, num_warps=8, num_stages=2),
+            # lower register pressure (nw=4, ns=1)
+            triton.Config({'BV': 128, 'BK': 32}, num_warps=4, num_stages=2),
+            triton.Config({'BV': 128, 'BK': 32}, num_warps=4, num_stages=1),
+            triton.Config({'BV': 128, 'BK': 32}, num_warps=8, num_stages=1),
+            # smaller BV=64 to halve shared mem & dh accumulator regs
+            triton.Config({'BV': 64, 'BK': 32}, num_warps=4, num_stages=2),
+            triton.Config({'BV': 64, 'BK': 32}, num_warps=4, num_stages=1),
+            triton.Config({'BV': 64, 'BK': 32}, num_warps=8, num_stages=2),
+            # BK=64 (fewer K-loop iterations)
+            triton.Config({'BV': 128, 'BK': 64}, num_warps=8, num_stages=2),
+            triton.Config({'BV': 128, 'BK': 64}, num_warps=4, num_stages=2),
+        ]
+        if IS_PPU
+        else [
+            triton.Config({'BV': BV, 'BK': 64}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4]
+            for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
+            for BV in ([32, 64] if check_shared_mem('ada') else [32])
+        ]
+    ),
+    # PPU keeps BV/BK out of the key since its shapes are fixed, so re-tuning per V
+    # width is pure overhead; stock configs keep BV in the key to preserve behaviour.
+    key=(['H', 'HV', 'K', 'V', 'BT', 'USE_G', 'STATE_V_FIRST'] if IS_PPU
+         else ['H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST']),
+    **_DHU_AUTOTUNE_KWARGS,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -378,11 +465,13 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
+    BK: tl.constexpr,
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
+    USE_AIU: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -397,22 +486,24 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         NT = tl.cdiv(T, BT)
         boh = i_n * NT
 
+    # [BK, BV] or [BV, BK] per STATE_V_FIRST; BK is autotuned on PPU (32..128) and
+    # pinned to 64 elsewhere, matching the stock kernel's fixed K split.
     if STATE_V_FIRST:
-        b_dh1 = tl.zeros([BV, 64], dtype=tl.float32)
-        if K > 64:
-            b_dh2 = tl.zeros([BV, 64], dtype=tl.float32)
-        if K > 128:
-            b_dh3 = tl.zeros([BV, 64], dtype=tl.float32)
-        if K > 192:
-            b_dh4 = tl.zeros([BV, 64], dtype=tl.float32)
+        b_dh1 = tl.zeros([BV, BK], dtype=tl.float32)
+        if K > BK:
+            b_dh2 = tl.zeros([BV, BK], dtype=tl.float32)
+        if K > 2*BK:
+            b_dh3 = tl.zeros([BV, BK], dtype=tl.float32)
+        if K > 3*BK:
+            b_dh4 = tl.zeros([BV, BK], dtype=tl.float32)
     else:
-        b_dh1 = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 64:
-            b_dh2 = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 128:
-            b_dh3 = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 192:
-            b_dh4 = tl.zeros([64, BV], dtype=tl.float32)
+        b_dh1 = tl.zeros([BK, BV], dtype=tl.float32)
+        if K > BK:
+            b_dh2 = tl.zeros([BK, BV], dtype=tl.float32)
+        if K > 2*BK:
+            b_dh3 = tl.zeros([BK, BV], dtype=tl.float32)
+        if K > 3*BK:
+            b_dh4 = tl.zeros([BK, BV], dtype=tl.float32)
 
     # calculate offset
     q += (bos * H + i_h // (HV // H)).to(tl.int64) * K
@@ -430,15 +521,18 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     if USE_FINAL_STATE_GRADIENT:
         dht += i_nh * K*V
 
+    # Same single-point-of-edit rationale as the fwd kernel above.
+    DT_K = k.dtype.element_ty
+
     o_v = i_v * BV + tl.arange(0, BV)
     m_v = o_v < V
-    o_k1 = tl.arange(0, 64)
+    o_k1 = tl.arange(0, BK)
     m_k1 = o_k1 < K
-    o_k2 = 64 + o_k1
+    o_k2 = BK + o_k1
     m_k2 = o_k2 < K
-    o_k3 = 128 + o_k1
+    o_k3 = 2*BK + o_k1
     m_k3 = o_k3 < K
-    o_k4 = 192 + o_k1
+    o_k4 = 3*BK + o_k1
     m_k4 = o_k4 < K
     if USE_FINAL_STATE_GRADIENT:
         if STATE_V_FIRST:
@@ -448,7 +542,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             p_dht1 = dht + o_k1[:, None] * V + o_v[None, :]
             m_dht1 = m_k1[:, None] & m_v[None, :]
         b_dh1 += tl.load(p_dht1, mask=m_dht1, other=0.0)
-        if K > 64:
+        if K > BK:
             if STATE_V_FIRST:
                 p_dht2 = dht + o_v[:, None] * K + o_k2[None, :]
                 m_dht2 = m_v[:, None] & m_k2[None, :]
@@ -456,7 +550,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 p_dht2 = dht + o_k2[:, None] * V + o_v[None, :]
                 m_dht2 = m_k2[:, None] & m_v[None, :]
             b_dh2 += tl.load(p_dht2, mask=m_dht2, other=0.0)
-        if K > 128:
+        if K > 2*BK:
             if STATE_V_FIRST:
                 p_dht3 = dht + o_v[:, None] * K + o_k3[None, :]
                 m_dht3 = m_v[:, None] & m_k3[None, :]
@@ -464,7 +558,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 p_dht3 = dht + o_k3[:, None] * V + o_v[None, :]
                 m_dht3 = m_k3[:, None] & m_v[None, :]
             b_dh3 += tl.load(p_dht3, mask=m_dht3, other=0.0)
-        if K > 192:
+        if K > 3*BK:
             if STATE_V_FIRST:
                 p_dht4 = dht + o_v[:, None] * K + o_k4[None, :]
                 m_dht4 = m_v[:, None] & m_k4[None, :]
@@ -484,7 +578,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             p_dh1 = dh + i_t_int64*HV*K*V + o_k1[:, None] * V + o_v[None, :]
             m_dh1 = m_k1[:, None] & m_v[None, :]
         tl.store(p_dh1, b_dh1.to(p_dh1.dtype.element_ty), mask=m_dh1)
-        if K > 64:
+        if K > BK:
             if STATE_V_FIRST:
                 p_dh2 = dh + i_t_int64*HV*K*V + o_v[:, None] * K + o_k2[None, :]
                 m_dh2 = m_v[:, None] & m_k2[None, :]
@@ -492,7 +586,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 p_dh2 = dh + i_t_int64*HV*K*V + o_k2[:, None] * V + o_v[None, :]
                 m_dh2 = m_k2[:, None] & m_v[None, :]
             tl.store(p_dh2, b_dh2.to(p_dh2.dtype.element_ty), mask=m_dh2)
-        if K > 128:
+        if K > 2*BK:
             if STATE_V_FIRST:
                 p_dh3 = dh + i_t_int64*HV*K*V + o_v[:, None] * K + o_k3[None, :]
                 m_dh3 = m_v[:, None] & m_k3[None, :]
@@ -500,7 +594,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 p_dh3 = dh + i_t_int64*HV*K*V + o_k3[:, None] * V + o_v[None, :]
                 m_dh3 = m_k3[:, None] & m_v[None, :]
             tl.store(p_dh3, b_dh3.to(p_dh3.dtype.element_ty), mask=m_dh3)
-        if K > 192:
+        if K > 3*BK:
             if STATE_V_FIRST:
                 p_dh4 = dh + i_t_int64*HV*K*V + o_v[:, None] * K + o_k4[None, :]
                 m_dh4 = m_v[:, None] & m_k4[None, :]
@@ -520,122 +614,145 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         p_dv2 = dv2 + o_t[:, None] * (HV*V) + o_v[None, :]
         p_do = do + o_t[:, None] * (HV*V) + o_v[None, :]
 
-        b_do = tl.load(p_do, mask=m_t[:, None] & m_v[None, :], other=0.0)
-
         # Update dv
-        p_k = k + o_t[:, None] * (H*K) + o_k1[None, :]
-        b_k = tl.load(p_k, mask=m_t[:, None] & m_k1[None, :], other=0.0)
+        # aiu path only when K tiles exactly into BK-wide blocks -- otherwise the tail
+        # block reaches into the next head (same reason as the fwd kernel above).
+        if USE_AIU and K % BK == 0:
+            b_k = tl.aiu_load(k, (i_t * BT, 0), (BT, BK), (T, H*K), DT_K, (1, 0))
+        else:
+            p_k = k + o_t[:, None] * (H*K) + o_k1[None, :]
+            b_k = tl.load(p_k, mask=m_t[:, None] & m_k1[None, :], other=0.0)
         if USE_GK:
-            o_k1 = tl.arange(0, 64)
+            o_k1 = tl.arange(0, BK)
             b_gk_last1 = tl.load(gk + last_idx * HV*K + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
         if STATE_V_FIRST:
             b_dv = tl.dot(b_k, tl.trans(b_dh1).to(b_k.dtype))
         else:
             b_dv = tl.dot(b_k, b_dh1.to(b_k.dtype))
 
-        if K > 64:
-            p_k = k + o_t[:, None] * (H*K) + o_k2[None, :]
-            b_k = tl.load(p_k, mask=m_t[:, None] & m_k2[None, :], other=0.0)
+        if K > BK:
+            if USE_AIU and K % BK == 0:
+                b_k = tl.aiu_load(k, (i_t * BT, BK), (BT, BK), (T, H*K), DT_K, (1, 0))
+            else:
+                p_k = k + o_t[:, None] * (H*K) + o_k2[None, :]
+                b_k = tl.load(p_k, mask=m_t[:, None] & m_k2[None, :], other=0.0)
             if USE_GK:
                 b_gk_last2 = tl.load(gk + last_idx * HV*K + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
             if STATE_V_FIRST:
-                b_dv += tl.dot(b_k, tl.trans(b_dh2).to(b_k.dtype))
+                b_dv = tl.dot(b_k, tl.trans(b_dh2).to(b_k.dtype), acc=b_dv)
             else:
-                b_dv += tl.dot(b_k, b_dh2.to(b_k.dtype))
+                b_dv = tl.dot(b_k, b_dh2.to(b_k.dtype), acc=b_dv)
 
-        if K > 128:
-            p_k = k + o_t[:, None] * (H*K) + o_k3[None, :]
-            b_k = tl.load(p_k, mask=m_t[:, None] & m_k3[None, :], other=0.0)
+        if K > 2*BK:
+            if USE_AIU and K % BK == 0:
+                b_k = tl.aiu_load(k, (i_t * BT, 2*BK), (BT, BK), (T, H*K), DT_K, (1, 0))
+            else:
+                p_k = k + o_t[:, None] * (H*K) + o_k3[None, :]
+                b_k = tl.load(p_k, mask=m_t[:, None] & m_k3[None, :], other=0.0)
             if USE_GK:
                 b_gk_last3 = tl.load(gk + last_idx * HV*K + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
             if STATE_V_FIRST:
-                b_dv += tl.dot(b_k, tl.trans(b_dh3).to(b_k.dtype))
+                b_dv = tl.dot(b_k, tl.trans(b_dh3).to(b_k.dtype), acc=b_dv)
             else:
-                b_dv += tl.dot(b_k, b_dh3.to(b_k.dtype))
+                b_dv = tl.dot(b_k, b_dh3.to(b_k.dtype), acc=b_dv)
 
-        if K > 192:
-            p_k = k + o_t[:, None] * (H*K) + o_k4[None, :]
-            b_k = tl.load(p_k, mask=m_t[:, None] & m_k4[None, :], other=0.0)
+        if K > 3*BK:
+            if USE_AIU and K % BK == 0:
+                b_k = tl.aiu_load(k, (i_t * BT, 3*BK), (BT, BK), (T, H*K), DT_K, (1, 0))
+            else:
+                p_k = k + o_t[:, None] * (H*K) + o_k4[None, :]
+                b_k = tl.load(p_k, mask=m_t[:, None] & m_k4[None, :], other=0.0)
             if USE_GK:
                 b_gk_last4 = tl.load(gk + last_idx * HV*K + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
             if STATE_V_FIRST:
-                b_dv += tl.dot(b_k, tl.trans(b_dh4).to(b_k.dtype))
+                b_dv = tl.dot(b_k, tl.trans(b_dh4).to(b_k.dtype), acc=b_dv)
             else:
-                b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
+                b_dv = tl.dot(b_k, b_dh4.to(b_k.dtype), acc=b_dv)
 
         if USE_G:
             b_dv *= tl.where(m_t, exp2(bg_last - b_g), 0)[:, None]
-        b_dv += tl.load(p_dv, mask=m_t[:, None] & m_v[None, :], other=0.0)
+        b_dv += tl.load(p_dv, mask=m_t[:, None] & m_v[None, :], other=0.0, eviction_policy='evict_first')
 
         tl.store(p_dv2, b_dv.to(p_dv.dtype.element_ty), mask=m_t[:, None] & m_v[None, :])
         # Update dh
+        # b_do is only consumed here, so load and pre-scale it right before the dh
+        # updates instead of next to the dv loads (shortens register lifetime).
+        # scale and g_exp commute with the reduction over t: pre-multiplying do by
+        # scale*g_exp before the dot matches the original (q*g_exp) @ do * scale.
+        b_do_scaled = tl.load(p_do, mask=m_t[:, None] & m_v[None, :], other=0.0, eviction_policy='evict_first') * scale
+        if USE_G:
+            b_do_scaled *= b_g_exp[:, None]
         p_w = w + o_k1[:, None] + o_t[None, :] * (HV*K)
         p_q = q + o_k1[:, None] + o_t[None, :] * (H*K)
         b_w = tl.load(p_w, mask=m_k1[:, None] & m_t[None, :], other=0.0)
         b_q = tl.load(p_q, mask=m_k1[:, None] & m_t[None, :], other=0.0)
         if USE_G:
             b_dh1 *= bg_last_exp
-            b_q = b_q * b_g_exp[None, :]
         if USE_GK:
             if STATE_V_FIRST:
                 b_dh1 *= exp2(b_gk_last1)[None, :]
             else:
                 b_dh1 *= exp2(b_gk_last1[:, None])
         if STATE_V_FIRST:
-            b_dh1 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype)))
+            # keep the stock transposed subtraction on this path: the two dots already
+            # produce the [K, V] tile and only the final add needs the transpose
+            b_dh1 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do_scaled.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype)))
         else:
-            b_dh1 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
-        if K > 64:
+            # chain both dots onto the fp32 accumulator and fold the w sign into the
+            # operand: removes a full-tile subtraction and one fused-multiply-add scale
+            b_dh1 = tl.dot(b_q, b_do_scaled.to(b_q.dtype), acc=b_dh1)
+            b_dh1 = tl.dot((-b_w), b_dv.to(b_w.dtype), acc=b_dh1)
+        if K > BK:
             p_q = q + o_k2[:, None] + o_t[None, :] * (H*K)
             p_w = w + o_k2[:, None] + o_t[None, :] * (HV*K)
             b_q = tl.load(p_q, mask=m_k2[:, None] & m_t[None, :], other=0.0)
             b_w = tl.load(p_w, mask=m_k2[:, None] & m_t[None, :], other=0.0)
             if USE_G:
                 b_dh2 *= bg_last_exp
-                b_q = b_q * b_g_exp[None, :]
             if USE_GK:
                 if STATE_V_FIRST:
                     b_dh2 *= exp2(b_gk_last2)[None, :]
                 else:
                     b_dh2 *= exp2(b_gk_last2[:, None])
             if STATE_V_FIRST:
-                b_dh2 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype)))
+                b_dh2 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do_scaled.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype)))
             else:
-                b_dh2 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
-        if K > 128:
+                b_dh2 = tl.dot(b_q, b_do_scaled.to(b_q.dtype), acc=b_dh2)
+                b_dh2 = tl.dot((-b_w), b_dv.to(b_w.dtype), acc=b_dh2)
+        if K > 2*BK:
             p_q = q + o_k3[:, None] + o_t[None, :] * (H*K)
             p_w = w + o_k3[:, None] + o_t[None, :] * (HV*K)
             b_q = tl.load(p_q, mask=m_k3[:, None] & m_t[None, :], other=0.0)
             b_w = tl.load(p_w, mask=m_k3[:, None] & m_t[None, :], other=0.0)
             if USE_G:
                 b_dh3 *= bg_last_exp
-                b_q = b_q * b_g_exp[None, :]
             if USE_GK:
                 if STATE_V_FIRST:
                     b_dh3 *= exp2(b_gk_last3)[None, :]
                 else:
                     b_dh3 *= exp2(b_gk_last3[:, None])
             if STATE_V_FIRST:
-                b_dh3 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype)))
+                b_dh3 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do_scaled.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype)))
             else:
-                b_dh3 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
-        if K > 192:
+                b_dh3 = tl.dot(b_q, b_do_scaled.to(b_q.dtype), acc=b_dh3)
+                b_dh3 = tl.dot((-b_w), b_dv.to(b_w.dtype), acc=b_dh3)
+        if K > 3*BK:
             p_q = q + o_k4[:, None] + o_t[None, :] * (H*K)
             p_w = w + o_k4[:, None] + o_t[None, :] * (HV*K)
             b_q = tl.load(p_q, mask=m_k4[:, None] & m_t[None, :], other=0.0)
             b_w = tl.load(p_w, mask=m_k4[:, None] & m_t[None, :], other=0.0)
             if USE_G:
                 b_dh4 *= bg_last_exp
-                b_q = b_q * b_g_exp[None, :]
             if USE_GK:
                 if STATE_V_FIRST:
                     b_dh4 *= exp2(b_gk_last4)[None, :]
                 else:
                     b_dh4 *= exp2(b_gk_last4[:, None])
             if STATE_V_FIRST:
-                b_dh4 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype)))
+                b_dh4 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do_scaled.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype)))
             else:
-                b_dh4 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
+                b_dh4 = tl.dot(b_q, b_do_scaled.to(b_q.dtype), acc=b_dh4)
+                b_dh4 = tl.dot((-b_w), b_dv.to(b_w.dtype), acc=b_dh4)
 
     if USE_INITIAL_STATE:
         if STATE_V_FIRST:
@@ -645,7 +762,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             p_dh0 = dh0 + o_k1[:, None] * V + o_v[None, :]
             m_dh0 = m_k1[:, None] & m_v[None, :]
         tl.store(p_dh0, b_dh1.to(p_dh0.dtype.element_ty), mask=m_dh0)
-        if K > 64:
+        if K > BK:
             if STATE_V_FIRST:
                 p_dh1 = dh0 + o_v[:, None] * K + o_k2[None, :]
                 m_dh1 = m_v[:, None] & m_k2[None, :]
@@ -653,7 +770,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 p_dh1 = dh0 + o_k2[:, None] * V + o_v[None, :]
                 m_dh1 = m_k2[:, None] & m_v[None, :]
             tl.store(p_dh1, b_dh2.to(p_dh1.dtype.element_ty), mask=m_dh1)
-        if K > 128:
+        if K > 2*BK:
             if STATE_V_FIRST:
                 p_dh2 = dh0 + o_v[:, None] * K + o_k3[None, :]
                 m_dh2 = m_v[:, None] & m_k3[None, :]
@@ -661,7 +778,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 p_dh2 = dh0 + o_k3[:, None] * V + o_v[None, :]
                 m_dh2 = m_k3[:, None] & m_v[None, :]
             tl.store(p_dh2, b_dh3.to(p_dh2.dtype.element_ty), mask=m_dh2)
-        if K > 192:
+        if K > 3*BK:
             if STATE_V_FIRST:
                 p_dh3 = dh0 + o_v[:, None] * K + o_k4[None, :]
                 m_dh3 = m_v[:, None] & m_k4[None, :]
@@ -727,6 +844,7 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
+        USE_AIU=USE_AIU,
     )
     return h, v_new, final_state
 
@@ -790,5 +908,6 @@ def chunk_gated_delta_rule_bwd_dhu(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
+        USE_AIU=USE_AIU,
     )
     return dh, dh0, dv2

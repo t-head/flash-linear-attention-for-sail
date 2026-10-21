@@ -23,6 +23,10 @@ from fla.utils import (
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+# Minimum BK value in chunk_bwd_kernel_dqkwg autotune configs.
+# Must match the smallest BK in the autotune configs below.
+# Used to allocate dg with NK_MAX = cdiv(K, BK_MIN) slices.
+_DQKWG_BK_MIN = 64
 
 
 @triton.heuristics({
@@ -32,9 +36,11 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 })
 @fla_cache_autotune(
     configs=[
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 128]
+        for BV in [128]
+        for num_warps in [4, 8]
+        for num_stages in [2, 3, 4]
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
@@ -140,6 +146,95 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 
 
+def _prune_dqkwg_configs(configs, named_args, **kwargs):
+    """For large K (>192) prefer BK=128 to reduce the number of K tiles and
+    the associated bf16 dot accumulation error in dk."""
+    K = kwargs.get('K', 0)
+    if K > 192:
+        return [c for c in configs if c.kwargs.get('BK', 64) >= 128]
+    return configs
+
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@fla_cache_autotune(
+    configs=[
+        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [64, 128]
+        for BV in [32, 64, 128]
+        for num_warps in [4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def chunk_bwd_kernel_dw(
+    dv,
+    h,
+    dw,
+    cu_seqlens,
+    chunk_indices,
+    B: tl.constexpr,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_k, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    i_b, i_h = i_bh // HV, i_bh % HV
+
+    if IS_VARLEN:
+        i_tg = i_t
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        NT = tl.cdiv(T, BT)
+    else:
+        NT = tl.cdiv(T, BT)
+        i_tg = i_b * NT + i_t
+        bos, eos = i_b * T, i_b * T + T
+
+    # offset calculation
+    dv += (bos * HV + i_h) * V
+    h += (i_tg * HV + i_h).to(tl.int64) * K * V
+    dw += (bos * HV + i_h) * K
+
+    b_dw = tl.zeros([BT, BK], dtype=tl.float32)
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
+    o_k = i_k * BK + tl.arange(0, BK)
+    m_k = o_k < K
+    m_qk = m_t[:, None] & m_k[None, :]
+    for i_v in range(tl.cdiv(V, BV)):
+        o_v = i_v * BV + tl.arange(0, BV)
+        m_v = o_v < V
+        m_hv = m_t[:, None] & m_v[None, :]
+        p_dv = dv + o_t[:, None] * (HV*V) + o_v[None, :]
+        if STATE_V_FIRST:
+            p_h = h + o_v[:, None] * K + o_k[None, :]
+        else:
+            p_h = h + o_v[:, None] + o_k[None, :] * V
+        m_h = m_v[:, None] & m_k[None, :]
+        # [BT, BV]
+        b_dv = tl.load(p_dv, mask=m_hv, other=0.0)
+        # [BV, BK]
+        b_h = tl.load(p_h, mask=m_h, other=0.0)
+        # [BT, BV] @ [BV, BK] -> [BT, BK]
+        b_dw += tl.dot(b_dv, b_h.to(b_dv.dtype))
+
+    p_dw = dw + o_t[:, None] * (HV*K) + o_k[None, :]
+    tl.store(p_dw, -b_dw.to(p_dw.dtype.element_ty), mask=m_qk)
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
@@ -148,11 +243,17 @@ def chunk_fwd_kernel_o(
 })
 @fla_cache_autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=ns, maxnreg=mr)
+        for ns in [2, 3, 4, 5, 6]
+        for mr in [128, 192, 255]
+    ] + [
+        triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=ns, maxnreg=mr)
+        for ns in [5, 6]
+        for mr in [192]
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G', 'USE_G_GAMMA', 'USE_DW', 'STATE_V_FIRST'],
+    key=['H', 'HV', 'K', 'V', 'BT', 'USE_G', 'USE_G_GAMMA', 'USE_DW', 'STATE_V_FIRST'],
+    prune_configs_by={'early_config_prune': _prune_dqkwg_configs},
+    restore_value=['dg'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -213,7 +314,7 @@ def chunk_bwd_kernel_dqkwg(
     dq += (bos * HV + i_h) * K
     dk += (bos * HV + i_h) * K
 
-    # for delta rule only
+    # for delta rule only (computed in the dedicated chunk_bwd_kernel_dw)
     if USE_DW:
         dw += (bos * HV + i_h) * K
         dv += (bos * HV + i_h) * V
@@ -235,6 +336,12 @@ def chunk_bwd_kernel_dqkwg(
     o_k = i_k * BK + tl.arange(0, BK)
     m_k = o_k < K
     m_qk = m_t[:, None] & m_k[None, :]
+    # Pre-load q, k before the V loop to overlap their loads with the V-loop MMAs
+    # (they are only consumed in the gated branches after the loop).
+    p_q = q + o_t[:, None] * (H*K) + o_k[None, :]
+    p_k = k + o_t[:, None] * (H*K) + o_k[None, :]
+    b_q = tl.load(p_q, mask=m_qk, other=0.0)
+    b_k = tl.load(p_k, mask=m_qk, other=0.0)
     for i_v in range(tl.cdiv(V, BV)):
         o_v = i_v * BV + tl.arange(0, BV)
         m_v = o_v < V
@@ -249,11 +356,11 @@ def chunk_bwd_kernel_dqkwg(
             p_dh = dh + o_v[:, None] + o_k[None, :] * V
         m_h = m_v[:, None] & m_k[None, :]
         # [BT, BV]
-        b_v = tl.load(p_v, mask=m_hv, other=0.0)
-        b_do = tl.load(p_do, mask=m_hv, other=0.0)
+        b_v = tl.load(p_v, mask=m_hv, other=0.0, cache_modifier='.cg')
+        b_do = tl.load(p_do, mask=m_hv, other=0.0, cache_modifier='.cg')
         # [BV, BK]
-        b_h = tl.load(p_h, mask=m_h, other=0.0)
-        b_dh = tl.load(p_dh, mask=m_h, other=0.0)
+        b_h = tl.load(p_h, mask=m_h, other=0.0, cache_modifier='.cg')
+        b_dh = tl.load(p_dh, mask=m_h, other=0.0, cache_modifier='.cg')
         if USE_G:
             b_dg_last += (tl.sum(b_h * b_dh))
         # [BT, BV] @ [BV, BT] -> [BT, BT]
@@ -264,18 +371,12 @@ def chunk_bwd_kernel_dqkwg(
         b_dk += tl.dot(b_v, b_dh.to(b_v.dtype))
         if USE_DW:
             p_dv = dv + o_t[:, None] * (HV*V) + o_v[None, :]
-            b_dv = tl.load(p_dv, mask=m_hv, other=0.0)
+            b_dv = tl.load(p_dv, mask=m_hv, other=0.0, cache_modifier='.cg')
             b_dw += tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype))
 
     if USE_DW:
         p_dw = dw + o_t[:, None] * (HV*K) + o_k[None, :]
         tl.store(p_dw, -b_dw.to(p_dw.dtype.element_ty), mask=m_qk)
-
-    tl.debug_barrier()
-    p_q = q + o_t[:, None] * (H*K) + o_k[None, :]
-    p_k = k + o_t[:, None] * (H*K) + o_k[None, :]
-    b_q = tl.load(p_q, mask=m_qk, other=0.0)
-    b_k = tl.load(p_k, mask=m_qk, other=0.0)
 
     p_dq = dq + o_t[:, None] * (HV*K) + o_k[None, :]
     p_dk = dk + o_t[:, None] * (HV*K) + o_k[None, :]
@@ -287,18 +388,22 @@ def chunk_bwd_kernel_dqkwg(
         p_g = g + o_t * HV
         b_g = tl.load(p_g, mask=m_t, other=0.0)
         b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * HV)
+        # precompute exp2 values to eliminate redundant exp2() calls
+        b_g_exp = exp2(b_g)
         b_dg_last *= exp2(b_g_last)
-        b_dq = b_dq * exp2(b_g)[:, None] * scale
+
+        b_ds = tl.where(m_A, b_ds * exp2(b_g[:, None] - b_g[None, :]) * scale, 0)
+        b_ds = b_ds.to(b_k.dtype)
+        # MMA1: fold the ds@k term into the scaled dq before the dg reduction
+        b_dq = b_dq * b_g_exp[:, None] * scale + tl.dot(b_ds, b_k)
+        b_dg = tl.sum(b_q * b_dq, axis=1)
+
+        # scale dk and accumulate b_dg_last before MMA2
         b_dk = b_dk * tl.where(m_t, exp2(-b_g + b_g_last), 0)[:, None]
         b_dg_last += tl.sum(b_dk * b_k)
-
-        b_ds = tl.where(m_A, b_ds * exp2(b_g[:, None] - b_g[None, :]), 0) * scale
-        b_ds = b_ds.to(b_k.dtype)
-        # [BT, BK]
-        b_dq += tl.dot(b_ds, b_k)
+        # MMA2
         b_dk += tl.dot(tl.trans(b_ds), b_q)
-
-        b_dg = tl.sum(b_dq * b_q, axis=1) - tl.sum(b_dk * b_k, axis=1)
+        b_dg -= tl.sum(b_k * b_dk, axis=1)
 
         p_dg = dg + o_t * HV
         # (SY 09/21) revcumsum in a separate kernel due to strange triton compiler issue
@@ -441,11 +546,13 @@ def chunk_bwd_kernel_dv(
 })
 @fla_cache_autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
+        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128]
+        for BV in [32, 64, 128]
+        for num_warps in [4]
+        for num_stages in [3]
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G'],
+    key=['H', 'HV', 'K', 'V', 'BT', 'USE_G'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -647,15 +754,6 @@ def chunk_bwd_dv_local(
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    # H100 can have larger block size
-    if check_shared_mem('hopper', k.device.index):
-        CONST_TILING = 128
-    elif check_shared_mem('ada', k.device.index):
-        CONST_TILING = 64
-    else:
-        CONST_TILING = 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     dv = torch.empty_like(do)
@@ -677,8 +775,6 @@ def chunk_bwd_dv_local(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
     )
     return dv
 
@@ -714,21 +810,34 @@ def chunk_bwd_dqkwg(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    if check_shared_mem('hopper', k.device.index):
-        CONST_TILING = 128
-    elif check_shared_mem('ada', k.device.index):
-        CONST_TILING = 64
-    else:
-        CONST_TILING = 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
-    NK = triton.cdiv(K, BK)
+    # BK is autotuned; allocate dg with NK_MAX to accommodate all BK configs.
+    # Dynamic grid: each config uses its own NK = cdiv(K, BK), no extra programs.
+    # restore_value + torch.zeros keeps the extra dg slices zero for configs with NK < NK_MAX.
+    NK_MAX = triton.cdiv(K, _DQKWG_BK_MIN)
     dq = q.new_empty(B, T, HV, K)
     dk = k.new_empty(B, T, HV, K)
-    dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
+    dg = torch.zeros(NK_MAX, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
     dw = torch.empty_like(w) if w is not None else None
 
-    grid = (NK, NT, B * HV)
+    grid = lambda meta: (triton.cdiv(K, meta['BK']), NT, B * HV)
+    # Compute dw in a dedicated kernel to reduce the register pressure of the main
+    # dqkwg kernel (removes the b_dw accumulator and the b_dv load from its V loop).
+    if w is not None:
+        chunk_bwd_kernel_dw[grid](
+            dv=dv,
+            h=h,
+            dw=dw,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            B=B,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BT=BT,
+            STATE_V_FIRST=state_v_first,
+        )
     chunk_bwd_kernel_dqkwg[grid](
         q=q,
         k=k,
@@ -738,10 +847,10 @@ def chunk_bwd_dqkwg(
         h=h,
         do=do,
         dh=dh,
-        dw=dw,
+        dw=None,
         dq=dq,
         dk=dk,
-        dv=dv,
+        dv=None,
         dg=dg,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -753,8 +862,6 @@ def chunk_bwd_dqkwg(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
         STATE_V_FIRST=state_v_first,
     )
 

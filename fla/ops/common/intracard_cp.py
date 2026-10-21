@@ -23,7 +23,7 @@ from typing import NamedTuple
 import torch
 import triton
 
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+from fla.ops.common.chunk_delta_h import USE_AIU, chunk_gated_delta_rule_fwd_kernel_h_blockdim64
 from fla.ops.cp.chunk_delta_h import pre_process_fwd_kernel_merged
 from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_offsets
 from fla.utils import get_multiprocessor_count
@@ -132,6 +132,7 @@ def _raw_chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
+        USE_AIU=USE_AIU,
     )
     return h, v_new, final_state
 

@@ -73,6 +73,9 @@ def causal_conv1d_fwd(
         cu_seqlens=cu_seqlens,
         initial_state=initial_state,
         chunk_indices=chunk_indices,
+        dy=None,
+        dy_eff=None,
+        dw=None,
         B=B,
         T=T,
         D=D,
@@ -83,6 +86,9 @@ def causal_conv1d_fwd(
         stride_x_n=stride_x_n,
         stride_x_t=stride_x_t,
         stride_x_d=stride_x_d,
+        stride_dy_n=0,
+        stride_dy_t=0,
+        stride_dy_d=0,
         ACTIVATION=activation,
     )
     final_state = None
@@ -94,6 +100,70 @@ def causal_conv1d_fwd(
             cu_seqlens=cu_seqlens,
         )
     return y.view(shape), final_state
+
+
+@dispatch('modules')
+@input_guard(no_guard_contiguous=["x"])
+def causal_conv1d_fwd_premul(
+    x: torch.Tensor,
+    dy: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
+    dw: torch.Tensor | None = None,
+    BT: int = 64,
+) -> torch.Tensor:
+    """Fused backward helper: returns dy * silu'(y) in one kernel pass,
+    recomputing the raw conv output without materializing y."""
+    shape = dy.shape
+    if x.shape[-1] != weight.shape[0]:
+        x = rearrange(x, 'b t ... -> b t (...)')
+        dy = rearrange(dy, 'b t ... -> b t (...)')
+    B, T, D = x.shape[0], x.shape[1], weight.shape[0]
+    W = weight.shape[1]
+    stride_x_n, stride_x_t, stride_x_d = x.stride()
+    stride_dy_n, stride_dy_t, stride_dy_d = dy.stride()
+
+    BW = triton.next_power_of_2(W)
+    if cu_seqlens is not None and chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+    NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+    NB = triton.cdiv(B*T, 1024)
+
+    dy_eff = torch.empty_like(dy)
+
+    def grid(meta): return (triton.cdiv(D, meta['BD']), NT, B)
+    causal_conv1d_fwd_kernel[grid](
+        x=x,
+        y=None,
+        weight=weight,
+        bias=bias,
+        residual=None,
+        cu_seqlens=cu_seqlens,
+        initial_state=initial_state,
+        chunk_indices=chunk_indices,
+        dy=dy,
+        dy_eff=dy_eff,
+        dw=dw,
+        B=B,
+        T=T,
+        D=D,
+        W=W,
+        BT=BT,
+        BW=BW,
+        NB=NB,
+        stride_x_n=stride_x_n,
+        stride_x_t=stride_x_t,
+        stride_x_d=stride_x_d,
+        stride_dy_n=stride_dy_n,
+        stride_dy_t=stride_dy_t,
+        stride_dy_d=stride_dy_d,
+        ACTIVATION=None,
+    )
+    return dy_eff.view(shape)
 
 
 @dispatch('modules')
@@ -172,37 +242,48 @@ def causal_conv1d_bwd(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
     NB = triton.cdiv(B*T, 1024)
 
-    y = None
-    if activation is not None:
-        y, _ = causal_conv1d_fwd(
-            x=x,
-            weight=weight,
-            bias=bias,
-            residual=None,
-            initial_state=initial_state,
-            activation=None,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            output_final_state=False,
-            chunk_indices=chunk_indices,
-        )
     dx = torch.empty_like(x)
-    dw = weight.new_empty(B*NT, *weight.shape, dtype=torch.float) if weight is not None else None
+    # dw rides the fused premul kernel when possible (L2-hit x re-reads, zero
+    # extra DRAM); the main bwd kernel keeps it only for initial_state or
+    # activation=None cases
+    dw_ws = weight.new_empty(B*NT, *weight.shape, dtype=torch.float) if weight is not None else None
+    dw_main = dw_ws
+    dw_premul = None
     db = bias.new_empty(B*NT, *bias.shape, dtype=torch.float) if bias is not None else None
     dr = dy if residual is not None else None
 
     stride_dx_n, stride_dx_t, stride_dx_d = dx.stride()
 
     def grid(meta): return (triton.cdiv(D, meta['BD']), NT, B)
+
+    if activation is not None:
+        # fused recompute + pre-multiply; y is never materialized
+        if initial_state is None:
+            dw_main = None
+            dw_premul = dw_ws
+        dy_input = causal_conv1d_fwd_premul(
+            x=x,
+            dy=dy,
+            weight=weight,
+            bias=bias,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_indices=chunk_indices,
+            dw=dw_premul,
+            BT=BT,
+        )
+    else:
+        dy_input = dy
     causal_conv1d_bwd_kernel[grid](
         x=x,
-        y=y,
+        y=None,
         weight=weight,
         initial_state=initial_state,
         dht=dht,
-        dy=dy,
+        dy=dy_input,
         dx=dx,
-        dw=dw,
+        dw=dw_main,
         db=db,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -222,22 +303,24 @@ def causal_conv1d_bwd(
         stride_dy_n=stride_dy_n,
         stride_dy_t=stride_dy_t,
         stride_dy_d=stride_dy_d,
-        ACTIVATION=activation,
+        ACTIVATION=None,
     )
     if weight is not None:
-        dw = dw.sum(0).to(weight)
+        dw = dw_ws.sum(0).to(weight)
     if bias is not None:
         db = db.sum(0).to(bias)
 
     # Compute dh0 using separate Triton kernel to avoid compiler bugs on some architectures (e.g., GB200)
+    # dy_input already carries the silu' factor when activation is fused (y is
+    # then None), so it - not dy - must feed the dh0 kernel
     dh0 = None
     if initial_state is not None:
         dh0 = compute_dh0_triton(
-            dy=dy,
-            y=y,
+            dy=dy_input,
+            y=None,
             weight=weight,
             initial_state=initial_state,
-            activation=activation,
+            activation=None,
             cu_seqlens=cu_seqlens,
         )
 
