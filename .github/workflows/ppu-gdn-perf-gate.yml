@@ -1,0 +1,175 @@
+name: ppu-gdn-perf-gate
+
+# GDN performance gate: PR head vs merge-base(target), per-kernel cold caches,
+# median over paired sweeps.
+#   exit 0 = PASS / exit 2 = regression or shortfall / exit 3 = infra problem
+#
+# Note: GitHub evaluates pull_request workflows from the base branch, so this
+# file must land on main/0.5.2 before it can run on PRs; use workflow_dispatch
+# to validate before that. Keep PERF_TOL=0.05 for two weeks before making the
+# check required.
+
+on:
+  pull_request:
+    branches: ['main', '0.5.2', 'v0.5.2']
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Base branch to compare against (workflow_dispatch only)'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ppu-gdn-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+  # Budget: 2 arms x 2 head sizes x ~110s + 4 points x 3 sweeps, about 8-10 minutes
+  PERF_HEADS: "32,64"
+  PERF_SEQLENS: "8192,16384"
+  PERF_SWEEPS: "3"
+  PERF_TOL: "0.05"
+  PERF_CONTAINER: ""     # already inside the GPU container; no docker exec
+  # Only GDN-related code starts a run:
+  #   fla/ops/gated_delta_rule/  chunk entry and intra-chunk kernels
+  #   fla/ops/common/            chunk_delta_h, chunk_o, chunk_scaled_dot_kkt
+  #   fla/ops/utils/             cumsum, solve_tril, index, cache
+  #   fla/utils/                 autotune_cache_kwargs, input_guard, device flags
+  #   fla/layers/gated_deltanet.py and the gate itself
+  PERF_PATHS: '^(fla/ops/(gated_delta_rule|common|utils)/|fla/utils/|fla/layers/gated_deltanet\.py|\.github/workflows/scripts/perf-gate/|\.github/workflows/ppu-gdn-perf-gate\.yml)'
+
+jobs:
+  gate:
+    name: GDN perf gate (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with fla-ut-test-ppu.yml: same boards, same sizing.
+        include:
+          - runner: ZW-M890P
+            cpus: "31"
+            memory: "256Gi"
+          - runner: OAM-810E
+            cpus: "11"
+            memory: "112Gi"
+    steps:
+      # pull_request checks out the merge commit by default; take the head
+      # explicitly and pair it with merge-base, so the gate reflects only the
+      # PR's own delta rather than unrelated changes on the base branch.
+      # Keep checkout credentials: the next step fetches the base branch, and a
+      # private repo returns 401 without a token.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      # No on.paths filter: a workflow that never triggers leaves its required
+      # check pending forever. Run always, decide internally, exit 0 when the
+      # change set cannot affect the GDN chunk path.
+      - name: Decide scope
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.event.pull_request.base.ref || inputs.base_ref || 'main' }}"
+          BASE_REF="${BASE_REF#origin/}"
+          git fetch --no-tags origin "$BASE_REF"
+          BASE_SHA=$(git merge-base HEAD FETCH_HEAD)
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE_REF@$(git rev-parse --short "$BASE_SHA") head=$(git rev-parse --short HEAD)"
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git log -1 --pretty=%s | grep -qF '[perf]'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::perf gate forced by [perf] in the commit subject"
+          elif git diff --name-only "$BASE_SHA" HEAD | grep -qE "$PERF_PATHS"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no GDN-related changes, perf gate skipped"
+          fi
+          # To gate fork PRs behind a maintainer label, add:
+          #   contains(github.event.pull_request.labels.*.name, 'perf')
+
+      - name: Run gate on PPU
+        if: steps.scope.outputs.run == 'true'
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: 25
+          container_options: |
+            cpus: "${{ matrix.cpus }}"
+            memory: "${{ matrix.memory }}"
+          command: |
+            set -uo pipefail
+            cd /workspace/source
+            source /usr/local/PPU_SDK/envsetup.sh
+            unset PIP_INDEX_URL FLA_CI_ENV
+            pip install -q einops
+            # keep out/ out of git status; repo_dirty only looks at tracked
+            # files, so this is belt-and-suspenders
+            echo 'out/' >> .git/info/exclude
+
+            bash .github/workflows/scripts/perf-gate/ci_perf_gate.sh \
+              /workspace/source "${{ steps.scope.outputs.base_sha }}" \
+              /workspace/source/out/ci
+            rc=$?
+            echo "[ci] gate exit=$rc (0 pass / 2 regression / 3 infra)"
+            # Let the container finish successfully no matter the verdict, so
+            # on_success still reclaims it; the failure evidence (gate.json,
+            # tables.md) is already in the workspace.
+            exit 0
+          cleanup_policy: on_success
+
+      - name: Enforce gate verdict
+        if: always() && steps.scope.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f out/ci/gate.json ]; then
+            echo "::error::gate.json missing - gate crashed before writing a verdict"
+            exit 3
+          fi
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("out/ci/gate.json"))
+          print(f"verdict={d.get('verdict')} pooled={d.get('pooled')}")
+          sys.exit(0 if d.get("verdict") == "pass" else 2)
+          PY
+
+      - name: Job summary
+        if: always() && steps.scope.outputs.run == 'true'
+        shell: bash
+        run: |
+          echo "## Runner: ${{ matrix.runner }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f out/ci/gate.md ]; then
+            cat out/ci/gate.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_gate.md not produced (infra failure)_" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.scope.outputs.run == 'true'
+        with:
+          name: ppu-gdn-gate-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/ci/gate.md
+            out/ci/gate.json
+            out/ci/tables.md
+            out/ci/campaign.log
+          if-no-files-found: ignore
+          retention-days: 30
