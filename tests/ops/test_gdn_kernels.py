@@ -1035,7 +1035,7 @@ def test_prepare_wy_repr_bwd_tile_launch(blackwell, shared_mem, K, V, monkeypatc
     [
         pytest.param(B, T, H, HV, D, use_g, dtype, beta_dtype,
                      id=f"B{B}-T{T}-H{H}-HV{HV}-D{D}-use_g{use_g}-{dtype}"
-                        + ("" if beta_dtype == dtype else f"-beta_{str(beta_dtype).split('.')[-1]}"))
+                     + ("" if beta_dtype == dtype else f"-beta_{str(beta_dtype).split('.')[-1]}"))
         for (B, T, H, HV, D, use_g, dtype, beta_dtype) in [
             (2, 128, 2, 2, 64, True, torch.bfloat16, torch.bfloat16),
             (2, 128, 2, 4, 64, True, torch.bfloat16, torch.bfloat16),
@@ -1138,7 +1138,7 @@ def test_recompute_w_u_fwd_varlen(
     [
         pytest.param(H, HV, D, cu_seqlens, dtype, beta_dtype,
                      id=f"H{H}-HV{HV}-D{D}-cu{cu_seqlens}-{dtype}"
-                        + ("" if beta_dtype == dtype else f"-beta_{str(beta_dtype).split('.')[-1]}"))
+                     + ("" if beta_dtype == dtype else f"-beta_{str(beta_dtype).split('.')[-1]}"))
         for (H, HV, D, cu_seqlens, dtype, beta_dtype) in [
             (2, 2, 64, [0, 64, 128], torch.bfloat16, torch.bfloat16),
             (2, 4, 64, [0, 128, 256], torch.bfloat16, torch.bfloat16),

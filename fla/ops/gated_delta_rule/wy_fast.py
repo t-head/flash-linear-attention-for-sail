@@ -28,7 +28,7 @@ from fla.utils import IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_m
         triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=1),  # H=128
         # --- PPU 890P best configs ---
         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),   # H=8,16,32,48
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=5), # H=64,128
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=5),  # H=64,128
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,
