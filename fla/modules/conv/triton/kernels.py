@@ -31,6 +31,7 @@ def _fast_sigmoid(x):
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
     'PREMULT': lambda args: args['dy'] is not None,
     'EMIT_DW': lambda args: args['dw'] is not None,
+    'EMIT_DB': lambda args: args['db'] is not None,
 })
 @fla_cache_autotune(
     configs=[
@@ -54,6 +55,7 @@ def causal_conv1d_fwd_kernel(
     dy,
     dy_eff,
     dw,
+    db,
     B,
     T,
     stride_x_n,
@@ -71,6 +73,7 @@ def causal_conv1d_fwd_kernel(
     ACTIVATION: tl.constexpr,
     PREMULT: tl.constexpr,
     EMIT_DW: tl.constexpr,
+    EMIT_DB: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
@@ -164,6 +167,10 @@ def causal_conv1d_fwd_kernel(
         b_y = tl.where(m_y, b_y, 0.0)
         b_ys = _fast_sigmoid(b_y)
         b_ye = b_dy * b_ys * (1 + b_y * (1 - b_ys))
+        if EMIT_DB:
+            # db is a plain sum over t, so take it from this fp32 product while
+            # it is still here instead of re-reading the rounded dy_eff
+            tl.store(db + i_tg * D + o_d, tl.sum(b_ye, 0), mask=m_d)
         # round so the dw accumulation below sees the exact value the main
         # kernel would load back
         b_ye = tl.cast(b_ye, dtype=dy_eff.dtype.element_ty, fp_downcast_rounding='rtne')

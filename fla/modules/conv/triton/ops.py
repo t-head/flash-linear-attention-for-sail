@@ -76,6 +76,7 @@ def causal_conv1d_fwd(
         dy=None,
         dy_eff=None,
         dw=None,
+        db=None,
         B=B,
         T=T,
         D=D,
@@ -114,6 +115,7 @@ def causal_conv1d_fwd_premul(
     cu_seqlens_cpu: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     dw: torch.Tensor | None = None,
+    db: torch.Tensor | None = None,
     BT: int = 64,
 ) -> torch.Tensor:
     """Fused backward helper: returns dy * silu'(y) in one kernel pass,
@@ -148,6 +150,7 @@ def causal_conv1d_fwd_premul(
         dy=dy,
         dy_eff=dy_eff,
         dw=dw,
+        db=db,
         B=B,
         T=T,
         D=D,
@@ -248,7 +251,8 @@ def causal_conv1d_bwd(
     dw_ws = weight.new_empty(B*NT, *weight.shape, dtype=torch.float) if weight is not None else None
     dw_main = dw_ws
     dw_premul = None
-    db = bias.new_empty(B*NT, *bias.shape, dtype=torch.float) if bias is not None else None
+    db_ws = bias.new_empty(B*NT, *bias.shape, dtype=torch.float) if bias is not None else None
+    db_main = db_ws
     dr = dy if residual is not None else None
 
     stride_dx_n, stride_dx_t, stride_dx_d = dx.stride()
@@ -260,6 +264,10 @@ def causal_conv1d_bwd(
         if initial_state is None:
             dw_main = None
             dw_premul = dw_ws
+        # db rides the same pass as well: it is a plain sum over t, so the
+        # premul kernel takes it from its fp32 product instead of the bwd
+        # kernel re-reading the rounded dy_eff
+        db_main = None
         dy_input = causal_conv1d_fwd_premul(
             x=x,
             dy=dy,
@@ -270,6 +278,7 @@ def causal_conv1d_bwd(
             cu_seqlens_cpu=cu_seqlens_cpu,
             chunk_indices=chunk_indices,
             dw=dw_premul,
+            db=db_ws,
             BT=BT,
         )
     else:
@@ -284,7 +293,7 @@ def causal_conv1d_bwd(
         dy=dy_input,
         dx=dx,
         dw=dw_main,
-        db=db,
+        db=db_main,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         B=B,
@@ -308,7 +317,9 @@ def causal_conv1d_bwd(
     if weight is not None:
         dw = dw_ws.sum(0).to(weight)
     if bias is not None:
-        db = db.sum(0).to(bias)
+        db = db_ws.sum(0).to(bias)
+    else:
+        db = None
 
     # Compute dh0 using separate Triton kernel to avoid compiler bugs on some architectures (e.g., GB200)
     # dy_input already carries the silu' factor when activation is fused (y is
