@@ -390,7 +390,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
 
 def _prune_dhu_configs(configs, named_args, **kwargs):
-    """四个 K tile 必须覆盖整个 head；K > 192 时保留 BK=128，避免额外的 bf16 dot 累积误差。"""
+    """The kernel splits K into at most four BK-wide tiles, so a config has to cover the
+    whole head; K > 192 keeps BK=128 to avoid the extra bf16 dot error of narrower tiles."""
     K = {**named_args, **kwargs}['K']
     configs = [c for c in configs if 4 * c.kwargs['BK'] >= K]
     if K > 192:

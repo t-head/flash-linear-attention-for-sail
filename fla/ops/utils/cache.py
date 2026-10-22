@@ -382,7 +382,8 @@ class CachedAutotuner(Autotuner):
             named_args = dict(zip(self.arg_names, args))
             candidates = self.configs if cfg in self.configs else [*self.configs, cfg]
             if cfg not in self.early_config_prune(candidates, named_args, **kwargs):
-                # 缓存配置也必须满足当前形状的安全裁剪；不合法时重新调优。
+                # a cached config must pass the safety pruning for the current shape too;
+                # drop the entry so the next call re-tunes from the declared configs
                 del self.cache[key.autotune_key]
         return super().run(*args, **kwargs)
 
@@ -421,7 +422,8 @@ def fla_cache_autotune(configs, key=None, prune_configs_by=None, reset_to_zero=N
     (default: fla/configs/{GPU}/, or FLA_CONFIG_DIR/ when overridden), keyed by kernel
     name from {kernel_name}.json. Lookup behaviour is controlled by FLA_CACHE_MODE.
     Falls back to normal Triton autotuning when no cached config is found.
-    validate_cached_config 为 True 时，缓存配置也必须通过当前调用的 early_config_prune。
+    With validate_cached_config, a cached config must also pass the early_config_prune
+    of the current call.
     """
     # key can be None when we want to use cache only (no fallback autotune)
     if key is None:
