@@ -390,15 +390,18 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
 
 def _prune_dhu_configs(configs, named_args, **kwargs):
-    """For large K (>192) keep BK=128 only: with narrower K tiles the dh/dv K-split
-    accumulates extra bf16 dot error, so PPU keeps the widest tiles for K > 192."""
-    K = kwargs.get('K', 0)
+    """四个 K tile 必须覆盖整个 head；K > 192 时保留 BK=128，避免额外的 bf16 dot 累积误差。"""
+    K = {**named_args, **kwargs}['K']
+    configs = [c for c in configs if 4 * c.kwargs['BK'] >= K]
     if K > 192:
-        return [c for c in configs if c.kwargs.get('BK', 32) >= 128]
+        return [c for c in configs if c.kwargs['BK'] >= 128]
     return configs
 
 
-_DHU_AUTOTUNE_KWARGS = {'prune_configs_by': {'early_config_prune': _prune_dhu_configs}} if IS_PPU else {}
+_DHU_AUTOTUNE_KWARGS = {
+    'prune_configs_by': {'early_config_prune': _prune_dhu_configs},
+    'validate_cached_config': True,
+} if IS_PPU else {}
 
 
 @triton.heuristics({

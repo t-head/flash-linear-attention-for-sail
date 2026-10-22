@@ -234,7 +234,6 @@ def causal_conv1d_bwd(
     W = weight.shape[1] if weight is not None else None
 
     stride_x_n, stride_x_t, stride_x_d = x.stride()
-    stride_dy_n, stride_dy_t, stride_dy_d = dy.stride()
 
     BW = triton.next_power_of_2(W)
     if cu_seqlens is not None and chunk_indices is None:
@@ -275,6 +274,7 @@ def causal_conv1d_bwd(
         )
     else:
         dy_input = dy
+    stride_dy_n, stride_dy_t, stride_dy_d = dy_input.stride()
     causal_conv1d_bwd_kernel[grid](
         x=x,
         y=None,

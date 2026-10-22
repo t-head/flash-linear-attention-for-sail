@@ -16,15 +16,20 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from fla.ops.common.chunk_delta_h import (
+    _prune_dhu_configs,
+    chunk_gated_delta_rule_bwd_dhu,
+    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
+    chunk_gated_delta_rule_fwd_h,
+)
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, wy_fast
 from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from fla.ops.gated_delta_rule.gate import gdn_gate_bwd, gdn_gate_chunk_cumsum, gdn_gate_fwd
 from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.utils.constant import RCP_LN2
-from fla.utils import assert_close, device
+from fla.utils import IS_PPU, assert_close, device
 
 
 def _make_wy_inverse(B: int, T: int, HV: int, BT: int, dtype: torch.dtype) -> torch.Tensor:
@@ -968,22 +973,98 @@ def prepare_wy_repr_bwd_ref(
     return dk.to(k.dtype), dv.to(v.dtype), db
 
 
+@pytest.mark.parametrize('blackwell', [False, True])
+@pytest.mark.parametrize('K', [32, 192, 193, 256])
+def test_prepare_wy_repr_bwd_config_guard(blackwell, K, monkeypatch):
+    monkeypatch.setattr(wy_fast, 'IS_NVIDIA_BLACKWELL', blackwell)
+    options = wy_fast._wy_bwd_autotune_kwargs()
+    configs = options['configs']
+    if blackwell:
+        assert len(configs) == 1
+        assert configs[0].kwargs == {}
+        assert (configs[0].num_warps, configs[0].num_stages) == (2, 4)
+        assert options['key'] == ['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN']
+        assert 'prune_configs_by' not in options
+    else:
+        expected = [
+            (32, 32, 2, 2), (32, 32, 2, 4), (16, 32, 4, 3), (16, 32, 4, 4),
+            (64, 32, 4, 2), (64, 32, 4, 3), (128, 32, 8, 2), (128, 32, 8, 3),
+        ]
+        assert [(c.kwargs['BK'], c.kwargs['BV'], c.num_warps, c.num_stages) for c in configs] == expected
+        assert options['key'] == ['H', 'HV', 'K', 'V', 'BT', 'IS_VARLEN']
+        prune = options['prune_configs_by']['early_config_prune']
+        assert prune is wy_fast._prune_wy_bwd_configs
+        kept = prune(configs, {}, K=K)
+        assert kept == (configs[4:] if K > 192 else configs)
+
+
+@pytest.mark.parametrize('blackwell', [False, True])
+@pytest.mark.parametrize('shared_mem', [False, True])
+@pytest.mark.parametrize(('K', 'V'), [(8, 17), (32, 64), (192, 128), (193, 128), (256, 256)])
+def test_prepare_wy_repr_bwd_tile_launch(blackwell, shared_mem, K, V, monkeypatch):
+    """仅模拟平台选择和 launch 参数，不代表 Blackwell 实机数值验证。"""
+    monkeypatch.setattr(wy_fast, 'IS_NVIDIA_BLACKWELL', blackwell)
+    monkeypatch.setattr(wy_fast, 'check_shared_mem', lambda: shared_mem)
+    launches = []
+
+    class CaptureKernel:
+        def __getitem__(self, grid):
+            assert grid == (1, 1)
+            return lambda **kwargs: launches.append(kwargs)
+
+    monkeypatch.setattr(wy_fast, 'prepare_wy_repr_bwd_kernel', CaptureKernel())
+    k = torch.zeros(1, 64, 1, K, dtype=torch.bfloat16, device=device)
+    v = torch.zeros(1, 64, 1, V, dtype=torch.bfloat16, device=device)
+    beta = torch.ones(1, 64, 1, dtype=torch.bfloat16, device=device)
+    A = torch.zeros(1, 64, 1, 64, dtype=torch.bfloat16, device=device)
+    wy_fast.prepare_wy_repr_bwd(k=k, v=v, beta=beta, A=A, dw=k, du=v)
+    assert len(launches) == 1
+    if blackwell:
+        limit = 64 if shared_mem else 32
+        expected_bk = min(max(1 << (K - 1).bit_length(), 16), limit)
+        expected_bv = min(max(1 << (V - 1).bit_length(), 16), limit)
+        assert launches[0]['BK'] == expected_bk
+        assert launches[0]['BV'] == expected_bv
+    else:
+        assert 'BK' not in launches[0]
+        assert 'BV' not in launches[0]
+
+
 @pytest.mark.parametrize(
-    ('B', 'T', 'H', 'HV', 'D', 'use_g', 'dtype'),
+    ('B', 'T', 'H', 'HV', 'D', 'use_g', 'dtype', 'beta_dtype'),
     [
-        pytest.param(B, T, H, HV, D, use_g, dtype,
-                     id=f"B{B}-T{T}-H{H}-HV{HV}-D{D}-use_g{use_g}-{dtype}")
-        for (B, T, H, HV, D, use_g, dtype) in [
-            (2, 128, 2, 2, 64, True, torch.bfloat16),
-            (2, 128, 2, 4, 64, True, torch.bfloat16),
-            (1, 256, 4, 4, 32, True, torch.float16),
-            (2, 128, 2, 2, 64, False, torch.bfloat16),
-            (2, 128, 2, 4, 64, False, torch.bfloat16),
-            (1, 128, 1, 1, 64, False, torch.bfloat16),
+        pytest.param(B, T, H, HV, D, use_g, dtype, beta_dtype,
+                     id=f"B{B}-T{T}-H{H}-HV{HV}-D{D}-use_g{use_g}-{dtype}"
+                        + ("" if beta_dtype == dtype else f"-beta_{str(beta_dtype).split('.')[-1]}"))
+        for (B, T, H, HV, D, use_g, dtype, beta_dtype) in [
+            (2, 128, 2, 2, 64, True, torch.bfloat16, torch.bfloat16),
+            (2, 128, 2, 4, 64, True, torch.bfloat16, torch.bfloat16),
+            (1, 256, 4, 4, 32, True, torch.float16, torch.float16),
+            (2, 128, 2, 2, 64, False, torch.bfloat16, torch.bfloat16),
+            (2, 128, 2, 4, 64, False, torch.bfloat16, torch.bfloat16),
+            (1, 128, 1, 1, 64, False, torch.bfloat16, torch.bfloat16),
+            # mixed dtype, production layout: beta stays fp32 while k/v/dw/du are low
+            # precision. In the no-g branch `k * beta` promotes to fp32, so that product
+            # must be cast back to the dot operand dtype (16e3b566). Without the cast
+            # tl.dot sees fp32 x bf16/fp16 operands and the kernel no longer compiles.
+            (2, 128, 2, 2, 64, False, torch.bfloat16, torch.float32),
+            (2, 128, 2, 4, 64, False, torch.bfloat16, torch.float32),
+            (1, 256, 4, 4, 32, False, torch.float16, torch.float32),
+            # same mixed layout on the gated branch, so the two branches stay aligned
+            (2, 128, 2, 4, 64, True, torch.bfloat16, torch.float32),
         ]
     ],
 )
-def test_prepare_wy_repr_bwd(B: int, T: int, H: int, HV: int, D: int, use_g: bool, dtype: torch.dtype):
+def test_prepare_wy_repr_bwd(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    use_g: bool,
+    dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+):
     torch.manual_seed(42)
     BT = 64
     k = torch.randn(B, T, H, D, dtype=dtype, device=device)
@@ -992,7 +1073,7 @@ def test_prepare_wy_repr_bwd(B: int, T: int, H: int, HV: int, D: int, use_g: boo
     # the inverse ill-conditioned and blows up autodiff through it.
     k = F.normalize(k, p=2, dim=-1)
     v = torch.randn(B, T, HV, D, dtype=dtype, device=device)
-    beta = torch.rand(B, T, HV, dtype=dtype, device=device).sigmoid()
+    beta = torch.rand(B, T, HV, dtype=beta_dtype, device=device).sigmoid()
     g = torch.randn(B, T, HV, dtype=torch.float32, device=device) * 0.1 if use_g else None
     # the kernel's backward assumes A is the true (I + L)^{-1}; feed the true A so
     # the kernel and the autograd baseline see identical forward values.
@@ -1006,6 +1087,8 @@ def test_prepare_wy_repr_bwd(B: int, T: int, H: int, HV: int, D: int, use_g: boo
     assert_close('dk', dk_ref, dk_tri, 0.006)
     assert_close('dv', dv_ref, dv_tri, 0.006)
     assert_close('db', db_ref, db_tri, 0.006)
+    # each gradient follows its own input dtype: db tracks beta, not k/v
+    assert (dk_tri.dtype, dv_tri.dtype, db_tri.dtype) == (dtype, dtype, beta_dtype)
     if use_g:
         assert dg_tri is not None
     else:
@@ -1051,14 +1134,19 @@ def test_recompute_w_u_fwd_varlen(
 
 
 @pytest.mark.parametrize(
-    ('H', 'HV', 'D', 'cu_seqlens', 'dtype'),
+    ('H', 'HV', 'D', 'cu_seqlens', 'dtype', 'beta_dtype'),
     [
-        pytest.param(H, HV, D, cu_seqlens, dtype,
-                     id=f"H{H}-HV{HV}-D{D}-cu{cu_seqlens}-{dtype}")
-        for (H, HV, D, cu_seqlens, dtype) in [
-            (2, 2, 64, [0, 64, 128], torch.bfloat16),
-            (2, 4, 64, [0, 128, 256], torch.bfloat16),
-            (1, 1, 64, [0, 64, 128], torch.bfloat16),
+        pytest.param(H, HV, D, cu_seqlens, dtype, beta_dtype,
+                     id=f"H{H}-HV{HV}-D{D}-cu{cu_seqlens}-{dtype}"
+                        + ("" if beta_dtype == dtype else f"-beta_{str(beta_dtype).split('.')[-1]}"))
+        for (H, HV, D, cu_seqlens, dtype, beta_dtype) in [
+            (2, 2, 64, [0, 64, 128], torch.bfloat16, torch.bfloat16),
+            (2, 4, 64, [0, 128, 256], torch.bfloat16, torch.bfloat16),
+            (1, 1, 64, [0, 64, 128], torch.bfloat16, torch.bfloat16),
+            # mixed dtype on the varlen path: same no-g k*beta promotion as above
+            (2, 2, 64, [0, 64, 128], torch.bfloat16, torch.float32),
+            (2, 4, 64, [0, 128, 256], torch.bfloat16, torch.float32),
+            (1, 1, 64, [0, 64, 128], torch.float16, torch.float32),
         ]
     ],
 )
@@ -1068,6 +1156,7 @@ def test_prepare_wy_repr_bwd_varlen(
     D: int,
     cu_seqlens: list[int],
     dtype: torch.dtype,
+    beta_dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     BT = 64
@@ -1076,7 +1165,7 @@ def test_prepare_wy_repr_bwd_varlen(
     k = torch.randn(1, T, H, D, dtype=dtype, device=device)
     k = F.normalize(k, p=2, dim=-1)
     v = torch.randn(1, T, HV, D, dtype=dtype, device=device)
-    beta = torch.rand(1, T, HV, dtype=dtype, device=device).sigmoid()
+    beta = torch.rand(1, T, HV, dtype=beta_dtype, device=device).sigmoid()
     A = chunk_kkt_solve_ref(k, None, beta, BT)
     dw = torch.randn(1, T, HV, D, dtype=dtype, device=device)
     du = torch.randn(1, T, HV, D, dtype=dtype, device=device)
@@ -1091,6 +1180,8 @@ def test_prepare_wy_repr_bwd_varlen(
     assert_close('dk', dk_ref, dk_tri, 0.006)
     assert_close('dv', dv_ref, dv_tri, 0.006)
     assert_close('db', db_ref, db_tri, 0.006)
+    # each gradient follows its own input dtype: db tracks beta, not k/v
+    assert (dk_tri.dtype, dv_tri.dtype, db_tri.dtype) == (dtype, dtype, beta_dtype)
     assert dg_tri is None
 
 
@@ -1248,6 +1339,21 @@ def chunk_gated_delta_rule_bwd_dhu_ref(
     return dh, dh0, dv2
 
 
+@pytest.mark.skipif(not IS_PPU, reason='仅 PPU 调优 BK=32/64/128')
+@pytest.mark.parametrize('K', [32, 128, 129, 160, 192, 193, 256])
+@pytest.mark.parametrize('keyword_launch', [False, True])
+def test_chunk_gated_delta_rule_bwd_dhu_prune_configs(K, keyword_launch):
+    configs = chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64.fn.configs
+    if keyword_launch:
+        kept = _prune_dhu_configs(configs, {}, K=K)
+    else:
+        kept = _prune_dhu_configs(configs, {'K': K})
+    expected_bk = {32, 64, 128} if K <= 128 else ({64, 128} if K <= 192 else {128})
+    assert {c.kwargs['BK'] for c in kept} == expected_bk
+    assert kept == [c for c in configs if c.kwargs['BK'] in expected_bk]
+    assert all(4 * c.kwargs['BK'] >= K for c in kept)
+
+
 @pytest.mark.parametrize(
     ('B', 'T', 'H', 'HV', 'D', 'use_h0', 'use_g', 'dtype'),
     [
@@ -1258,6 +1364,10 @@ def chunk_gated_delta_rule_bwd_dhu_ref(
             (2, 128, 2, 4, 64, False, True, torch.bfloat16),
             (1, 256, 4, 4, 32, True, True, torch.float16),
             (2, 128, 2, 2, 64, True, False, torch.bfloat16),
+            (1, 128, 1, 1, 160, True, True, torch.bfloat16),
+            (1, 128, 1, 1, 192, True, True, torch.bfloat16),
+            (1, 128, 1, 1, 160, True, False, torch.bfloat16),
+            (1, 128, 1, 1, 192, True, False, torch.bfloat16),
         ]
     ],
 )
@@ -1270,6 +1380,7 @@ def test_chunk_gated_delta_rule_bwd_dhu(
     use_h0: bool,
     use_g: bool,
     dtype: torch.dtype,
+    monkeypatch,
 ):
     torch.manual_seed(42)
     BT = 64
@@ -1288,11 +1399,21 @@ def test_chunk_gated_delta_rule_bwd_dhu(
     dh_ref, dh0_ref, dv2_ref = chunk_gated_delta_rule_bwd_dhu_ref(
         q, k, w, u, g, h0, do, dht, dv_local, scale, BT,
     )
-    dh_tri, dh0_tri, dv2_tri = chunk_gated_delta_rule_bwd_dhu(
-        q=q, k=k, w=w, g=g, h0=h0, dht=dht, do=do, dv=dv_local, scale=scale, chunk_size=BT,
-    )
+    tuner = chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64.fn
+    # 逐个验证 K=160/192 的保留配置，不能靠 autotune 偶然选中安全配置。
+    configs = _prune_dhu_configs(tuner.configs, {}, K=D) if IS_PPU and D in (160, 192) else [None]
+    for config in configs:
+        with monkeypatch.context() as patch:
+            if config is not None:
+                patch.setattr(tuner, 'configs', [config])
+                patch.setattr(tuner, 'cache', {})
+            dh_tri, dh0_tri, dv2_tri = chunk_gated_delta_rule_bwd_dhu(
+                q=q, k=k, w=w, g=g, h0=h0, dht=dht, do=do, dv=dv_local, scale=scale, chunk_size=BT,
+            )
+            if config is not None:
+                assert tuner.best_config is config
 
-    assert_close('dh', dh_ref.to(dtype), dh_tri, 0.006)
-    assert_close('dv2', dv2_ref.to(dtype), dv2_tri, 0.006)
-    if use_h0:
-        assert_close('dh0', dh0_ref, dh0_tri, 0.006)
+        assert_close('dh', dh_ref.to(dtype), dh_tri, 0.006)
+        assert_close('dv2', dv2_ref.to(dtype), dv2_tri, 0.006)
+        if use_h0:
+            assert_close('dh0', dh0_ref, dh0_tri, 0.006)

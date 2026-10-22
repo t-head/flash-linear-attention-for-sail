@@ -13,7 +13,7 @@ from fla.ops.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs
+from fla.utils import IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_mem
 
 
 @triton.heuristics({
@@ -109,24 +109,46 @@ def _prune_wy_bwd_configs(configs, named_args, **kwargs):
     return configs
 
 
+def _wy_bwd_autotune_kwargs():
+    if IS_NVIDIA_BLACKWELL:
+        # Blackwell guard (#913): use only the upstream B200-validated 2-warps / 4-stages configuration.
+        return {
+            'configs': [triton.Config({}, num_warps=2, num_stages=4)],
+            'key': ['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+        }
+    return {
+        'configs': [
+            triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=2),
+            triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=4),
+            triton.Config({'BK': 16, 'BV': 32}, num_warps=4, num_stages=3),
+            triton.Config({'BK': 16, 'BV': 32}, num_warps=4, num_stages=4),
+            # Large-K hardening tiles; only active when K > 192 via early_config_prune.
+            triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=2),
+            triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=3),
+            triton.Config({'BK': 128, 'BV': 32}, num_warps=8, num_stages=2),
+            triton.Config({'BK': 128, 'BV': 32}, num_warps=8, num_stages=3),
+        ],
+        'key': ['H', 'HV', 'K', 'V', 'BT', 'IS_VARLEN'],
+        'prune_configs_by': {'early_config_prune': _prune_wy_bwd_configs},
+    }
+
+
+def _wy_bwd_tile_kwargs(K, V):
+    if not IS_NVIDIA_BLACKWELL:
+        return {}
+    limit = 64 if check_shared_mem() else 32
+    return {
+        'BK': min(max(triton.next_power_of_2(K), 16), limit),
+        'BV': min(max(triton.next_power_of_2(V), 16), limit),
+    }
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @fla_cache_autotune(
-    configs=[
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=2),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=4),
-        triton.Config({'BK': 16, 'BV': 32}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 16, 'BV': 32}, num_warps=4, num_stages=4),
-        # Large-K hardening tiles; only active when K > 192 via early_config_prune.
-        triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 128, 'BV': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BK': 128, 'BV': 32}, num_warps=8, num_stages=3),
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'IS_VARLEN'],
-    prune_configs_by={'early_config_prune': _prune_wy_bwd_configs},
+    **_wy_bwd_autotune_kwargs(),
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -195,7 +217,7 @@ def prepare_wy_repr_bwd_kernel(
         if USE_G:
             b_kbg = (b_k * b_bg[:, None]).to(b_dw.dtype)
         else:
-            b_kbg = b_k * b_b[:, None]
+            b_kbg = (b_k * b_b[:, None]).to(b_dw.dtype)
 
         # only accumulate dA here; dkbg=A@dw is deferred to loop3
         # to eliminate the dk1 global store/load round-trip
@@ -350,6 +372,7 @@ def prepare_wy_repr_bwd(
         K=K,
         V=V,
         BT=BT,
+        **_wy_bwd_tile_kwargs(K, V),
     )
     if H != HV:
         dk = dk.view(B, T, H, HV // H, K).sum(3)

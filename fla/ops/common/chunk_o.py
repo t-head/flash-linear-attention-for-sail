@@ -819,7 +819,9 @@ def chunk_bwd_dqkwg(
     dg = torch.zeros(NK_MAX, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
     dw = torch.empty_like(w) if w is not None else None
 
-    grid = lambda meta: (triton.cdiv(K, meta['BK']), NT, B * HV)
+    def grid(meta):
+        return (triton.cdiv(K, meta['BK']), NT, B * HV)
+
     # Compute dw in a dedicated kernel to reduce the register pressure of the main
     # dqkwg kernel (removes the b_dw accumulator and the b_dv load from its V loop).
     if w is not None:
