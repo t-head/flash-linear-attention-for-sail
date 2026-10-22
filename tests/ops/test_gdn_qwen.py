@@ -38,6 +38,9 @@ chunk oracle.
 Run notes:
   * ``unset FLA_CI_ENV`` first -- ``fla.utils.assert_close`` downgrades assertions to warnings
     when it is set, which makes a green run meaningless.
+  * CI scope: ``FLA_CI_ENV=1`` also shrinks the matrix to one case per compile path (15 cases
+    instead of 79). ``FLA_TEST_GDN_QWEN_SCOPE=full`` opts back into the cross product; see the
+    "CI scope" block below for which axis each retained case stands in for.
   * long-sequence tier is opt-in: ``FLA_TEST_LONG_SEQ=1 pytest tests/ops/test_gdn_qwen.py``
     (env-var gating follows the existing ``SKIP_TEST_CHUNK_VARLEN`` idiom in this repo).
 """
@@ -61,6 +64,39 @@ from fla.ops.gated_delta_rule import (  # noqa: E402
     naive_recurrent_gated_delta_rule,
 )
 from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device  # noqa: E402
+
+# ---------------------------------------------------------------------------------------------
+# CI scope
+# ---------------------------------------------------------------------------------------------
+# The full matrix is 79 cases and ~53 min cold on one PPU, but the cost is not spread evenly
+# over cases: what hurts is the first touch of each Triton *compile key*, because that first
+# touch re-compiles and re-autotunes the kernel's whole config space from an empty per-pid
+# cache (``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` alone sweeps 27 configs).
+#
+# Reading the ``key=`` / ``@triton.heuristics`` off this path (l2norm -> cumsum -> kkt_solve ->
+# recompute_w_u -> fwd_h -> fwd_o, then dv_local -> dhu -> dqkwg -> wy_bwd -> reverse cumsum)
+# splits the axes in two:
+#
+#   compile axes  H, K (= head dim, which also selects the K > 64/128/192 tile guards),
+#                 IS_VARLEN, USE_INITIAL_STATE / STORE_FINAL_STATE / USE_FINAL_STATE_GRADIENT
+#                 (passing h0, asking for ht, backpropping dht), in-kernel vs external l2norm,
+#                 and dtype (which recompiles without re-sweeping).
+#   value axes    T, gate_logit_normalizer, mask_p. These change numbers, not paths.
+#
+# An untested compile-axis value is an untested kernel binary, so CI keeps one case per value
+# of every compile axis and only the corners of the value axes: T=1000 already exercises the
+# partial-chunk masked loads that T=2048 skips, and a nominal gate without masking is what the
+# dense cases already run. CI buys less than the full matrix even where it does run, because
+# ``FLA_CI_ENV=1`` also makes ``assert_close`` downgrade anything below a 1% error rate to a
+# warning -- the gate there is crashes, NaN and gross divergence.
+#
+# ``FLA_TEST_GDN_QWEN_SCOPE=full`` restores the cross product under CI, ``=ci`` shrinks a local
+# run; anything else is a typo worth failing on. Cutting below 15 cases starts dropping kernel
+# binaries rather than just numbers.
+_SCOPE = (os.getenv('FLA_TEST_GDN_QWEN_SCOPE') or '').strip().lower() or (
+    'ci' if os.getenv('FLA_CI_ENV') == '1' else 'full')
+if _SCOPE not in ('ci', 'full'):
+    raise ValueError(f'FLA_TEST_GDN_QWEN_SCOPE must be "ci" or "full", got {_SCOPE!r}')
 
 # ---------------------------------------------------------------------------------------------
 # Qwen GDN config matrix
@@ -179,8 +215,7 @@ def _compare_fwd_bwd(ref, ref_ht, tri, tri_ht, ref_grads, tri_grads, tol):
         assert_close(name, r, t, tol[name])
 
 
-BF16 = pytest.param(torch.bfloat16, id='bf16')
-FP16 = pytest.param(torch.float16, id='fp16')
+_DTYPE_IDS = ((torch.bfloat16, 'bf16'), (torch.float16, 'fp16'))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -226,17 +261,36 @@ def test_ref_consistency(T: int):
 # ---------------------------------------------------------------------------------------------
 # Tier 1: Qwen x TP head matrix (the main gap)
 # ---------------------------------------------------------------------------------------------
-@pytest.mark.parametrize('dtype', [BF16, FP16])
-@pytest.mark.parametrize('T', [pytest.param(2048, id='T2048'), pytest.param(1000, id='T1000')])
-@pytest.mark.parametrize(
-    'H',
-    [pytest.param(h, id=f'H{h}-{"|".join(src)}') for h, src in LOCAL_HEADS.items()],
-)
+def _matrix_cases() -> list:
+    """``(H, T, dtype)`` cases: the full Qwen x TP cross product, or CI's one-per-path subset."""
+    if _SCOPE == 'full':
+        return [
+            pytest.param(H, T, dtype, id=f'H{H}-{"|".join(LOCAL_HEADS[H])}-T{T}-{tag}')
+            for H in LOCAL_HEADS
+            for T in (2048, 1000)
+            for dtype, tag in _DTYPE_IDS
+        ]
+    return [
+        # off-bucket head count: below the smallest prune bucket (8), and not a power of two
+        pytest.param(6, 1000, torch.bfloat16, id='H6-T1000-bf16-off-bucket'),
+        # mid bucket at the production shape, on a partial trailing chunk (1000 = 15*64 + 40);
+        # also the only case that passes h0 *and* asks for ht *and* backprops dht, i.e. the
+        # USE_INITIAL_STATE / STORE_FINAL_STATE / USE_FINAL_STATE_GRADIENT = True specialization
+        pytest.param(32, 1000, torch.bfloat16, id='H32-T1000-bf16-partial-chunk'),
+        # fp16 anchor -- the only dtype here with an upstream tolerance to regress against
+        pytest.param(32, 1000, torch.float16, id='H32-T1000-fp16'),
+        # top bucket; at TP=1 this is the 128-block grid, where bigger grids measured slower
+        pytest.param(128, 1000, torch.bfloat16, id='H128-T1000-bf16-top-bucket'),
+    ]
+
+
+@pytest.mark.parametrize(('H', 'T', 'dtype'), _matrix_cases())
 def test_chunk_qwen_tp_matrix(H: int, T: int, dtype: torch.dtype):
     """H = linear_num_value_heads / TP for every Qwen GDN config x TP in {1,2,4,8}.
 
     Rationale for varying H at all: grid is B*H, and autotune picks BK/BV/num_warps/num_stages
-    per grid size, so H selects the code path. Upstream never goes past H=8.
+    per grid size, so H selects the code path. Upstream never goes past H=8. The CI subset keeps
+    only the head counts that bracket the autotune prune buckets -- see "CI scope" above.
     """
     B, D, scale = 1, HEAD_DIM, HEAD_DIM ** -0.5
     q, k, v, beta, g, h0 = _make_inputs(B, T, H, D, dtype)
@@ -262,7 +316,13 @@ def test_chunk_qwen_tp_matrix(H: int, T: int, dtype: torch.dtype):
     _compare_fwd_bwd(ref, ref_ht, tri, tri_ht, ref_grads, tri_grads, _tol(dtype, T))
 
 
-@pytest.mark.parametrize('H', [6, 32])
+# The recurrent oracle is an O(T) python-side loop -- the most expensive reference in this
+# file. One head is enough to prove the chunk kernel against it, and H=6's odd-head path is
+# still covered by ``test_chunk_qwen_tp_matrix``.
+_RECURRENT_HEADS = [6, 32] if _SCOPE == 'full' else [32]
+
+
+@pytest.mark.parametrize('H', _RECURRENT_HEADS)
 def test_chunk_qwen_vs_recurrent(H: int):
     """Strictest per-token check against the O(T) fp32 recurrence, on a partial-chunk length.
 
@@ -296,16 +356,23 @@ def test_chunk_qwen_vs_recurrent(H: int):
 # ---------------------------------------------------------------------------------------------
 # Tier 2: head-dim branches and gate extremes
 # ---------------------------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    ('H', 'D'),
-    [
+def _head_dim_cases() -> list:
+    """``(H, D)``: one case per K tile boundary."""
+    cases = [
         pytest.param(8, 60, id='H8-D60-unaligned'),    # K not a multiple of 64 nor 32B in bf16
         pytest.param(8, 64, id='H8-D64-single-block'),
         pytest.param(8, 100, id='H8-D100-unaligned'),
         pytest.param(8, 128, id='H8-D128-two-blocks'),
         pytest.param(4, 256, id='H4-D256-four-blocks'),  # lights up the K>128 / K>192 branches
-    ],
-)
+    ]
+    if _SCOPE == 'full':
+        return cases
+    # D=128 is what every matrix case already runs, and D=64 takes the same K<=64 tile as D=60
+    # minus the misalignment, so CI keeps only the boundaries: K<64, K in (64, 128], K>192.
+    return [c for c in cases if c.id not in ('H8-D64-single-block', 'H8-D128-two-blocks')]
+
+
+@pytest.mark.parametrize(('H', 'D'), _head_dim_cases())
 def test_chunk_head_dim_branches(H: int, D: int):
     """chunk_delta_h.py tiles K in 64-wide blocks behind ``K > 64/128/192`` guards.
 
@@ -338,16 +405,32 @@ def test_chunk_head_dim_branches(H: int, D: int):
     _compare_fwd_bwd(ref, ref_ht, tri, tri_ht, ref_grads, tri_grads, _tol(dtype, T))
 
 
-@pytest.mark.parametrize('mask_p', [0.0, 0.5])
+def _gate_cases() -> list:
+    """``(gate_logit_normalizer, mask_p, use_h0)`` cases."""
+    if _SCOPE == 'full':
+        return [
+            pytest.param(normalizer, mask_p, use_h0, id=f'{use_h0}-{tag}-{mask_p}')
+            for use_h0 in (True, False)
+            for normalizer, tag in (
+                (0.05, 'gate-sharp-decay'),   # g scaled x20 -> exp() underflow pressure
+                (1.0, 'gate-nominal'),
+                (20.0, 'gate-near-identity'),  # g ~ 0 -> no forgetting, state grows
+            )
+            for mask_p in (0.0, 0.5)
+        ]
+    # Only ``use_h0`` picks a compiled flag (USE_INITIAL_STATE, plus STORE_FINAL_STATE and
+    # USE_FINAL_STATE_GRADIENT, since ``use_h0=False`` also drops ht and dht); gate scale and
+    # masking only change values. So CI takes the False side once per gate regime -- the True
+    # side is the dense matrix cases -- and leaves the sharp/near-identity gate at nominal.
+    return [
+        pytest.param(0.05, 0.0, False, id='False-gate-sharp-decay-0.0'),
+        pytest.param(20.0, 0.5, False, id='False-gate-near-identity-0.5'),
+    ]
+
+
 @pytest.mark.parametrize(
-    'gate_logit_normalizer',
-    [
-        pytest.param(0.05, id='gate-sharp-decay'),   # g scaled x20 -> exp() underflow pressure
-        pytest.param(1.0, id='gate-nominal'),
-        pytest.param(20.0, id='gate-near-identity'),  # g ~ 0 -> no forgetting, state grows
-    ],
+    ('gate_logit_normalizer', 'mask_p', 'use_h0'), _gate_cases(),
 )
-@pytest.mark.parametrize('use_h0', [True, False])
 def test_chunk_gate_extremes(gate_logit_normalizer: float, mask_p: float, use_h0: bool):
     """Gate dynamics decide whether the chunkwise ``exp(cumsum(g))`` rescale over/underflows.
 
@@ -388,19 +471,37 @@ def test_chunk_gate_extremes(gate_logit_normalizer: float, mask_p: float, use_h0
 # ---------------------------------------------------------------------------------------------
 # Tier 3: varlen
 # ---------------------------------------------------------------------------------------------
-@pytest.mark.parametrize('use_qk_l2norm_in_kernel', [True, False])
-@pytest.mark.parametrize('H', [6, 8, 32])
-@pytest.mark.parametrize(
-    'cu_seqlens',
-    [
-        # 1-token segment, one-past-chunk (65), exact multiple (128), partial tail.
-        pytest.param([0, 1, 66, 194, 1000], id='cu-adversarial'),
-        # every boundary just short of a chunk multiple
-        pytest.param([0, 63, 127, 255, 4095], id='cu-off-by-one-short'),
-        # realistic long-context packing
-        pytest.param([0, 700, 1500, 4096, 8000], id='cu-realistic-8k'),
-    ],
+_CU_LAYOUTS = (
+    # 1-token segment, one-past-chunk (65), exact multiple (128), partial tail.
+    ([0, 1, 66, 194, 1000], 'cu-adversarial'),
+    # every boundary just short of a chunk multiple
+    ([0, 63, 127, 255, 4095], 'cu-off-by-one-short'),
+    # realistic long-context packing
+    ([0, 700, 1500, 4096, 8000], 'cu-realistic-8k'),
 )
+
+
+def _varlen_cases() -> list:
+    """``(cu_seqlens, H, use_qk_l2norm_in_kernel)`` cases."""
+    if _SCOPE == 'full':
+        return [
+            pytest.param(cu_seqlens, H, l2norm, id=f'{name}-{H}-{l2norm}')
+            for cu_seqlens, name in _CU_LAYOUTS
+            for H in (6, 8, 32)
+            for l2norm in (True, False)
+        ]
+    return [
+        # production path: in-kernel l2norm at H=32 (the varlen *and* normalize flags at once)
+        pytest.param([0, 1, 66, 194, 1000], 32, True, id='cu-adversarial-32-True'),
+        # odd head count on the out-of-kernel normalize path -- the other two axis values at once,
+        # and a second IS_VARLEN compile key
+        pytest.param([0, 1, 66, 194, 1000], 6, False, id='cu-adversarial-6-False'),
+        # the longest buffer the non-opt-in tiers reach
+        pytest.param([0, 700, 1500, 4096, 8000], 32, True, id='cu-realistic-8k-32-True'),
+    ]
+
+
+@pytest.mark.parametrize(('cu_seqlens', 'H', 'use_qk_l2norm_in_kernel'), _varlen_cases())
 @pytest.mark.skipif(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
     reason='Skipping varlen tests because SKIP_TEST_CHUNK_VARLEN is set',

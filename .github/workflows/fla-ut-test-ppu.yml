@@ -58,6 +58,9 @@ jobs:
             export MAX_JOBS=${{ matrix.runner == 'OAM-810E' && '11' || '31' }}
             export OMP_NUM_THREADS=1
             export MKL_NUM_THREADS=1
+            # This suite exports no FLA_CI_ENV, so test_gdn_qwen.py cannot infer a CI scope on
+            # its own: pin it, keeping one case per compiled kernel path instead of all 79.
+            export FLA_TEST_GDN_QWEN_SCOPE=ci
 
             pip install setuptools wheel junit-xml rich
             pip install --upgrade pytest
