@@ -679,13 +679,13 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
 
         tl.store(p_dv2, b_dv.to(p_dv.dtype.element_ty), mask=m_t[:, None] & m_v[None, :])
         # Update dh
-        # b_do is only consumed here, so load and pre-scale it right before the dh
-        # updates instead of next to the dv loads (shortens register lifetime).
-        # scale and g_exp commute with the reduction over t: pre-multiplying do by
-        # scale*g_exp before the dot matches the original (q*g_exp) @ do * scale.
-        b_do_scaled = tl.load(p_do, mask=m_t[:, None] & m_v[None, :], other=0.0, eviction_policy='evict_first') * scale
+        # b_do is only consumed here, so load it right before the dh updates instead of
+        # next to the dv loads (shortens register lifetime). Only g_exp is folded into
+        # the operand: folding `scale` as well rounds do * scale to the operand dtype,
+        # which overflows fp16 for a large custom scale, so it stays on the fp32 result.
+        b_do = tl.load(p_do, mask=m_t[:, None] & m_v[None, :], other=0.0, eviction_policy='evict_first')
         if USE_G:
-            b_do_scaled *= b_g_exp[:, None]
+            b_do *= b_g_exp[:, None]
         p_w = w + o_k1[:, None] + o_t[None, :] * (HV*K)
         p_q = q + o_k1[:, None] + o_t[None, :] * (H*K)
         b_w = tl.load(p_w, mask=m_k1[:, None] & m_t[None, :], other=0.0)
@@ -700,11 +700,11 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         if STATE_V_FIRST:
             # keep the stock transposed subtraction on this path: the two dots already
             # produce the [K, V] tile and only the final add needs the transpose
-            b_dh1 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do_scaled.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype)))
+            b_dh1 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype)))
         else:
-            # chain both dots onto the fp32 accumulator and fold the w sign into the
-            # operand: removes a full-tile subtraction and one fused-multiply-add scale
-            b_dh1 = tl.dot(b_q, b_do_scaled.to(b_q.dtype), acc=b_dh1)
+            # keep `scale` on the q @ do result (see the b_do load above) and chain only
+            # the w @ dv term onto the fp32 accumulator, with the w sign in the operand
+            b_dh1 += tl.dot(b_q, b_do.to(b_q.dtype)) * scale
             b_dh1 = tl.dot((-b_w), b_dv.to(b_w.dtype), acc=b_dh1)
         if K > BK:
             p_q = q + o_k2[:, None] + o_t[None, :] * (H*K)
@@ -719,9 +719,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 else:
                     b_dh2 *= exp2(b_gk_last2[:, None])
             if STATE_V_FIRST:
-                b_dh2 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do_scaled.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype)))
+                b_dh2 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype)))
             else:
-                b_dh2 = tl.dot(b_q, b_do_scaled.to(b_q.dtype), acc=b_dh2)
+                b_dh2 += tl.dot(b_q, b_do.to(b_q.dtype)) * scale
                 b_dh2 = tl.dot((-b_w), b_dv.to(b_w.dtype), acc=b_dh2)
         if K > 2*BK:
             p_q = q + o_k3[:, None] + o_t[None, :] * (H*K)
@@ -736,9 +736,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 else:
                     b_dh3 *= exp2(b_gk_last3[:, None])
             if STATE_V_FIRST:
-                b_dh3 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do_scaled.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype)))
+                b_dh3 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype)))
             else:
-                b_dh3 = tl.dot(b_q, b_do_scaled.to(b_q.dtype), acc=b_dh3)
+                b_dh3 += tl.dot(b_q, b_do.to(b_q.dtype)) * scale
                 b_dh3 = tl.dot((-b_w), b_dv.to(b_w.dtype), acc=b_dh3)
         if K > 3*BK:
             p_q = q + o_k4[:, None] + o_t[None, :] * (H*K)
@@ -753,9 +753,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 else:
                     b_dh4 *= exp2(b_gk_last4[:, None])
             if STATE_V_FIRST:
-                b_dh4 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do_scaled.to(b_q.dtype)) - tl.dot(b_w, b_dv.to(b_w.dtype)))
+                b_dh4 += tl.trans(tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype)))
             else:
-                b_dh4 = tl.dot(b_q, b_do_scaled.to(b_q.dtype), acc=b_dh4)
+                b_dh4 += tl.dot(b_q, b_do.to(b_q.dtype)) * scale
                 b_dh4 = tl.dot((-b_w), b_dv.to(b_w.dtype), acc=b_dh4)
 
     if USE_INITIAL_STATE:
