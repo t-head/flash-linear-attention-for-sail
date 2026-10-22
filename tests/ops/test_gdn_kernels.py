@@ -16,6 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from fla.ops.common import chunk_o
 from fla.ops.common.chunk_delta_h import (
     _prune_dhu_configs,
     chunk_gated_delta_rule_bwd_dhu,
@@ -660,6 +661,56 @@ def test_chunk_bwd_dv_local(B: int, T: int, H: int, HV: int, D: int, use_g: bool
     assert_close('dv', ref, tri, 0.005)
 
 
+def test_chunk_bwd_dv_local_config_guard(monkeypatch):
+    """PPU pins a single launch config with wrapper-side tiling; other platforms keep the BK/BV search space."""
+    monkeypatch.setattr(chunk_o, 'IS_PPU', False)
+    options = chunk_o._dv_local_autotune_kwargs()
+    assert [(c.kwargs['BK'], c.kwargs['BV'], c.num_warps, c.num_stages) for c in options['configs']] == [
+        (BK, BV, 4, 3) for BK in (32, 64, 128) for BV in (32, 64, 128)
+    ]
+    assert options['key'] == ['H', 'HV', 'K', 'V', 'BT', 'USE_G']
+    assert chunk_o._dv_local_tile_kwargs(128, 128) == {}
+
+    monkeypatch.setattr(chunk_o, 'IS_PPU', True)
+    options = chunk_o._dv_local_autotune_kwargs()
+    assert len(options['configs']) == 1
+    assert options['configs'][0].kwargs == {}
+    assert (options['configs'][0].num_warps, options['configs'][0].num_stages) == (2, 3)
+    assert options['key'] == ['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G']
+    # one K tile and two V tiles; a small head collapses into a single 16-wide tile
+    assert chunk_o._dv_local_tile_kwargs(128, 128) == {'BK': 128, 'BV': 64}
+    assert chunk_o._dv_local_tile_kwargs(64, 64) == {'BK': 64, 'BV': 32}
+    assert chunk_o._dv_local_tile_kwargs(8, 17) == {'BK': 16, 'BV': 16}
+    assert chunk_o._dv_local_tile_kwargs(256, 256) == {'BK': 128, 'BV': 64}
+
+
+@pytest.mark.parametrize('ppu', [False, True])
+@pytest.mark.parametrize(('K', 'V'), [(8, 17), (32, 64), (128, 128), (256, 256)])
+def test_chunk_bwd_dv_local_tile_launch(ppu, K, V, monkeypatch):
+    """Only mocks the platform selection and the launch kwargs, not a numeric run on real hardware."""
+    monkeypatch.setattr(chunk_o, 'IS_PPU', ppu)
+    launches = []
+
+    class CaptureKernel:
+        def __getitem__(self, grid):
+            assert grid == (2, 1)
+            return lambda **kwargs: launches.append(kwargs)
+
+    monkeypatch.setattr(chunk_o, 'chunk_bwd_kernel_dv_local', CaptureKernel())
+    q = torch.zeros(1, 128, 1, K, dtype=torch.bfloat16, device=device)
+    k = torch.zeros(1, 128, 1, K, dtype=torch.bfloat16, device=device)
+    do = torch.zeros(1, 128, 1, V, dtype=torch.bfloat16, device=device)
+    chunk_o.chunk_bwd_dv_local(q=q, k=k, do=do, scale=K ** -0.5, chunk_size=64)
+
+    assert len(launches) == 1
+    if ppu:
+        assert launches[0]['BK'] == min(max(1 << (K - 1).bit_length(), 16), 128)
+        assert launches[0]['BV'] == min(max((1 << (V - 1).bit_length()) // 2, 16), 64)
+    else:
+        assert 'BK' not in launches[0]
+        assert 'BV' not in launches[0]
+
+
 def chunk_bwd_dqkwg_ref(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1002,7 +1053,7 @@ def test_prepare_wy_repr_bwd_config_guard(blackwell, K, monkeypatch):
 @pytest.mark.parametrize('shared_mem', [False, True])
 @pytest.mark.parametrize(('K', 'V'), [(8, 17), (32, 64), (192, 128), (193, 128), (256, 256)])
 def test_prepare_wy_repr_bwd_tile_launch(blackwell, shared_mem, K, V, monkeypatch):
-    """仅模拟平台选择和 launch 参数，不代表 Blackwell 实机数值验证。"""
+    """Only mocks the platform selection and the launch kwargs, not a numeric run on real Blackwell hardware."""
     monkeypatch.setattr(wy_fast, 'IS_NVIDIA_BLACKWELL', blackwell)
     monkeypatch.setattr(wy_fast, 'check_shared_mem', lambda: shared_mem)
     launches = []
@@ -1339,7 +1390,7 @@ def chunk_gated_delta_rule_bwd_dhu_ref(
     return dh, dh0, dv2
 
 
-@pytest.mark.skipif(not IS_PPU, reason='仅 PPU 调优 BK=32/64/128')
+@pytest.mark.skipif(not IS_PPU, reason='PPU-only tuning over BK=32/64/128')
 @pytest.mark.parametrize('K', [32, 128, 129, 160, 192, 193, 256])
 @pytest.mark.parametrize('keyword_launch', [False, True])
 def test_chunk_gated_delta_rule_bwd_dhu_prune_configs(K, keyword_launch):
@@ -1400,7 +1451,7 @@ def test_chunk_gated_delta_rule_bwd_dhu(
         q, k, w, u, g, h0, do, dht, dv_local, scale, BT,
     )
     tuner = chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64.fn
-    # 逐个验证 K=160/192 的保留配置，不能靠 autotune 偶然选中安全配置。
+    # checked one by one: autotune must not be trusted to land on a safe config by luck
     configs = _prune_dhu_configs(tuner.configs, {}, K=D) if IS_PPU and D in (160, 192) else [None]
     for config in configs:
         with monkeypatch.context() as patch:

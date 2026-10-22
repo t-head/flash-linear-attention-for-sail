@@ -15,6 +15,7 @@ from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
 from fla.utils import (
     IS_NVIDIA_HOPPER,
+    IS_PPU,
     TRITON_ABOVE_3_4_0,
     TRITON_ABOVE_3_7_1,
     autotune_cache_kwargs,
@@ -538,6 +539,42 @@ def chunk_bwd_kernel_dv(
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 
 
+def _dv_local_autotune_kwargs():
+    """Autotune options for `chunk_bwd_kernel_dv_local`.
+
+    PPU pins one launch config and takes BK/BV from `chunk_bwd_dv_local` instead of benchmarking
+    them: the runtime pick is unstable there (the same H128/T16384 shape lands on configs worth
+    1.44 ms and 1.90 ms in different processes), while the pinned tiling holds at 1.21 ms.
+    """
+    if IS_PPU:
+        # num_warps=2 beats 4 by ~20% on PPU for every tiling of the 32/64/128 sweep
+        return {
+            'configs': [triton.Config({}, num_warps=2, num_stages=3)],
+            'key': ['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G'],
+        }
+    return {
+        'configs': [
+            triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+            for BK in [32, 64, 128]
+            for BV in [32, 64, 128]
+            for num_warps in [4]
+            for num_stages in [3]
+        ],
+        'key': ['H', 'HV', 'K', 'V', 'BT', 'USE_G'],
+    }
+
+
+def _dv_local_tile_kwargs(K, V):
+    """BK/BV for the PPU launch; other devices take their tiling from the autotune configs."""
+    if not IS_PPU:
+        return {}
+    # one K block and two V blocks; the 16-wide floor keeps small heads on a single block
+    return {
+        'BK': min(max(triton.next_power_of_2(K), 16), 128),
+        'BV': min(max(triton.next_power_of_2(V) // 2, 16), 64),
+    }
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
@@ -545,14 +582,7 @@ def chunk_bwd_kernel_dv(
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @fla_cache_autotune(
-    configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for BV in [32, 64, 128]
-        for num_warps in [4]
-        for num_stages in [3]
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'USE_G'],
+    **_dv_local_autotune_kwargs(),
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -775,6 +805,7 @@ def chunk_bwd_dv_local(
         K=K,
         V=V,
         BT=BT,
+        **_dv_local_tile_kwargs(K, V),
     )
     return dv
 
