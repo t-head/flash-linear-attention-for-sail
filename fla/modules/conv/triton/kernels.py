@@ -158,6 +158,10 @@ def causal_conv1d_fwd_kernel(
                        mask=m_y, other=0.0).to(tl.float32)
         # round y to storage precision to match the materialized-y path
         b_y = tl.cast(b_y, dtype=dy_eff.dtype.element_ty, fp_downcast_rounding='rtne').to(tl.float32)
+        # rows past T recompute the convolution from the tail of the sequence and that
+        # value can overflow the storage dtype; their dy is already 0, but inf * 0 keeps
+        # turning the product into NaN inside the dw reduction below
+        b_y = tl.where(m_y, b_y, 0.0)
         b_ys = _fast_sigmoid(b_y)
         b_ye = b_dy * b_ys * (1 + b_y * (1 - b_ys))
         # round so the dw accumulation below sees the exact value the main
