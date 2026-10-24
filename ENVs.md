@@ -106,3 +106,4 @@ they have no effect on the library at runtime.
 | Variable     | Default | Options    | Description                                                                                                  |
 | ------------ | ------- | ---------- | ------------------------------------------------------------------------------------------------------------ |
 | `FLA_CI_ENV` | `0`     | `0` / `1`  | Mark the process as running in CI. Loosens numeric assertions in `assert_close` so flaky GPU runs warn instead of failing. |
+| `FLA_TEST_GDN_QWEN_SCOPE` | `ci` under `FLA_CI_ENV=1`, else `full` | `ci` / `full` | How much of the `tests/ops/test_gdn_qwen.py` matrix to run: `full` is the 79-case Qwen x TP cross product, `ci` keeps one case per compiled code path (15 cases). |
