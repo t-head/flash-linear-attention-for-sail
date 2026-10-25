@@ -19,6 +19,7 @@ from fla.utils import (
     IS_NVIDIA_BLACKWELL,
     IS_NVIDIA_HOPPER,
     IS_PPU,
+    IS_PPU_810E,
     autotune_cache_kwargs,
     check_shared_mem,
 )
@@ -41,7 +42,15 @@ else:
 # tl.load path for A/B timing. The env var is read once at import time and frozen, since
 # the PPU triton fork rejects kernel-level references to plain globals.
 _IS_AIU_ENABLED = IS_PPU and os.environ.get('FLA_PPU_DISABLE_AIU', '0') != '1'
-USE_AIU = tl.constexpr(_IS_AIU_ENABLED)
+
+
+def _aiu_enabled_for(*tensors: torch.Tensor) -> bool:
+    """Only the OAM-810E (PPU0010) AIU is limited to 8/16-bit elements, so a wider element
+    dtype (fp32) aborts `ConvertTritonGPUToLLVMPPU` at compile time there; those inputs
+    keep the plain tl.load path. The ZW-M890P stages every dtype and keeps the AIU."""
+    if _IS_AIU_ENABLED and IS_PPU_810E:
+        return all(t.dtype.itemsize <= 2 for t in tensors if t is not None)
+    return _IS_AIU_ENABLED
 
 
 @triton.heuristics({
@@ -850,7 +859,7 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
-        USE_AIU=USE_AIU,
+        USE_AIU=_aiu_enabled_for(k, w),
     )
     return h, v_new, final_state
 
@@ -914,6 +923,6 @@ def chunk_gated_delta_rule_bwd_dhu(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
-        USE_AIU=USE_AIU,
+        USE_AIU=_aiu_enabled_for(k),
     )
     return dh, dh0, dv2

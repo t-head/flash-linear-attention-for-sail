@@ -136,6 +136,11 @@ IS_NVIDIA_BLACKWELL = (IS_NVIDIA and torch.cuda.get_device_capability()[0] in (1
 # PPU (ZW-series) identification. The parts report through the CUDA backend and their
 # capability tuples collide with real NVIDIA ones ((8, 0) = A100), so match the model name.
 IS_PPU = (IS_NVIDIA and 'ZW' in torch.cuda.get_device_name(0))
+# The two PPU boards differ in what the AIU can stage: the OAM-810E (PPU0010) copies only
+# 8/16-bit elements, the ZW-M890P also copies wider ones. Their capabilities separate them
+# ((8, 0) vs (8, 9)); both tests keep IS_PPU so a real NVIDIA card never matches.
+IS_PPU_810E = (IS_PPU and torch.cuda.get_device_capability() == (8, 0))
+IS_PPU_M890 = (IS_PPU and torch.cuda.get_device_capability() == (8, 9))
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 IS_TF32_SUPPORTED = (IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8)
