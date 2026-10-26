@@ -1478,7 +1478,8 @@ def test_conv_varlen_non_contiguous_qkv(
         ]
     ],
 )
-def test_conv_non_contiguous_dy(B, T, D, W, activation, dtype):
+@pytest.mark.parametrize('use_bias_and_state', [False, True])
+def test_conv_non_contiguous_dy(B, T, D, W, activation, dtype, use_bias_and_state):
     """Test that backward produces correct gradients when dy is non-contiguous.
 
     This simulates the split -> conv -> cat pattern used in fused-QKV attention,
@@ -1488,10 +1489,14 @@ def test_conv_non_contiguous_dy(B, T, D, W, activation, dtype):
 
     weight = torch.randn(D, W, device=device, dtype=dtype).requires_grad_(True)
     weight_ref = weight.detach().clone().requires_grad_(True)
+    bias_ref = torch.randn(D, device=device, dtype=dtype).requires_grad_(True) if use_bias_and_state else None
+    bias_test = bias_ref.detach().clone().requires_grad_(True) if bias_ref is not None else None
+    state_ref = torch.randn(B, D, W, device=device, dtype=dtype).requires_grad_(True) if use_bias_and_state else None
+    state_test = state_ref.detach().clone().requires_grad_(True) if state_ref is not None else None
 
     # --- Reference: contiguous path ---
     x_ref = torch.randn(B, T, D, device=device, dtype=dtype, requires_grad=True)
-    y_ref, _ = causal_conv1d(x_ref, weight_ref, activation=activation)
+    y_ref, _ = causal_conv1d(x_ref, weight_ref, bias_ref, initial_state=state_ref, activation=activation)
     dy = torch.randn_like(y_ref)
     y_ref.backward(dy)
 
@@ -1500,7 +1505,8 @@ def test_conv_non_contiguous_dy(B, T, D, W, activation, dtype):
     weight_test = weight.detach().clone().requires_grad_(True)
 
     # Forward through conv
-    y_test, _ = causal_conv1d(x_test, weight_test, activation=activation)
+    y_test, _ = causal_conv1d(x_test, weight_test, bias_test, initial_state=state_test, activation=activation)
+    assert_close('o', y_ref.detach(), y_test.detach(), 1e-3)
 
     # Simulate non-contiguous dy: cat into [B, T, 3D] then split back
     dummy = torch.zeros_like(dy)
@@ -1514,3 +1520,6 @@ def test_conv_non_contiguous_dy(B, T, D, W, activation, dtype):
 
     assert_close(" dx", x_ref.grad, x_test.grad, 1e-3)
     assert_close(" dw", weight_ref.grad, weight_test.grad, 1e-3)
+    if use_bias_and_state:
+        assert_close('db', bias_ref.grad, bias_test.grad, 1e-3)
+        assert_close('dh0', state_ref.grad, state_test.grad, 1e-3)

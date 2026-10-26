@@ -15,12 +15,6 @@ from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
 from fla.utils import IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_mem
 
-# Blackwell can select unstable Triton configs for prepare_wy_repr_bwd_kernel
-# during autotuning (see #913). Restrict it to the config that has been
-# validated on B200 until the wider config space is re-validated.
-PREPARE_WY_REPR_BWD_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]
-PREPARE_WY_REPR_BWD_NUM_STAGES = [4] if IS_NVIDIA_BLACKWELL else [2, 3, 4]
-
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
@@ -28,11 +22,15 @@ PREPARE_WY_REPR_BWD_NUM_STAGES = [4] if IS_NVIDIA_BLACKWELL else [2, 3, 4]
 })
 @fla_cache_autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        # --- PPU 810E best configs ---
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=4),   # H=8,16,48,64
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=4, num_stages=4),   # H=32
+        triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=1),  # H=128
+        # --- PPU 890P best configs ---
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),   # H=8,16,32,48
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=5),  # H=64,128
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    key=['H', 'HV', 'K', 'V', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -102,17 +100,55 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_k)
 
 
+def _prune_wy_bwd_configs(configs, named_args, **kwargs):
+    """For large K (>192) use larger BK tiles to reduce the number of K splits
+    and the bf16 dot accumulation error in dk."""
+    K = kwargs.get('K', 0)
+    if K > 192:
+        return [c for c in configs if c.kwargs.get('BK', 32) >= 64]
+    return configs
+
+
+def _wy_bwd_autotune_kwargs():
+    if IS_NVIDIA_BLACKWELL:
+        # Blackwell guard (#913): use only the upstream B200-validated 2-warps / 4-stages configuration.
+        return {
+            'configs': [triton.Config({}, num_warps=2, num_stages=4)],
+            'key': ['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+        }
+    return {
+        'configs': [
+            triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=2),
+            triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=4),
+            triton.Config({'BK': 16, 'BV': 32}, num_warps=4, num_stages=3),
+            triton.Config({'BK': 16, 'BV': 32}, num_warps=4, num_stages=4),
+            # Large-K hardening tiles; only active when K > 192 via early_config_prune.
+            triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=2),
+            triton.Config({'BK': 64, 'BV': 32}, num_warps=4, num_stages=3),
+            triton.Config({'BK': 128, 'BV': 32}, num_warps=8, num_stages=2),
+            triton.Config({'BK': 128, 'BV': 32}, num_warps=8, num_stages=3),
+        ],
+        'key': ['H', 'HV', 'K', 'V', 'BT', 'IS_VARLEN'],
+        'prune_configs_by': {'early_config_prune': _prune_wy_bwd_configs},
+    }
+
+
+def _wy_bwd_tile_kwargs(K, V):
+    if not IS_NVIDIA_BLACKWELL:
+        return {}
+    limit = 64 if check_shared_mem() else 32
+    return {
+        'BK': min(max(triton.next_power_of_2(K), 16), limit),
+        'BV': min(max(triton.next_power_of_2(V), 16), limit),
+    }
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @fla_cache_autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in PREPARE_WY_REPR_BWD_NUM_WARPS
-        for num_stages in PREPARE_WY_REPR_BWD_NUM_STAGES
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    **_wy_bwd_autotune_kwargs(),
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -167,32 +203,25 @@ def prepare_wy_repr_bwd_kernel(
         p_g = g + (bos*HV + i_h) + o_t * HV
         b_g = tl.load(p_g, mask=m_t, other=0.0)
         b_g_exp = exp2(b_g)
+        b_bg = b_b * b_g_exp
         b_dg = tl.zeros([BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = m_t[:, None] & (o_k[None, :] < K)
         p_k = k + (bos*H + i_h // (HV // H)) * K + o_t[:, None] * (H*K) + o_k[None, :]
-        p_dk = dk + (bos*HV + i_h) * K + o_t[:, None] * (HV*K) + o_k[None, :]
         p_dw = dw + (bos*HV + i_h) * K + o_t[:, None] * (HV*K) + o_k[None, :]
         # [BT, BK]
         b_k = tl.load(p_k, mask=m_k, other=0.0)
-        if USE_G:
-            b_kbg = b_k * (b_b * b_g_exp)[:, None]
-        else:
-            b_kbg = b_k * b_b[:, None]
         b_dw = tl.load(p_dw, mask=m_k, other=0.0)
-
-        b_dA += tl.dot(b_dw, tl.trans(b_kbg).to(b_dw.dtype))
-        b_dkbg = tl.dot(b_A, b_dw)
         if USE_G:
-            b_dk = b_dkbg * (b_g_exp * b_b)[:, None]
-            b_db += tl.sum(b_dkbg * b_k * b_g_exp[:, None], 1)
-            b_dg += tl.sum(b_dkbg * b_kbg, 1)
+            b_kbg = (b_k * b_bg[:, None]).to(b_dw.dtype)
         else:
-            b_dk = b_dkbg * b_b[:, None]
-            b_db += tl.sum(b_dkbg * b_k, 1)
-        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=m_k)
+            b_kbg = (b_k * b_b[:, None]).to(b_dw.dtype)
+
+        # only accumulate dA here; dkbg=A@dw is deferred to loop3
+        # to eliminate the dk1 global store/load round-trip
+        b_dA = tl.dot(b_dw, tl.trans(b_kbg), acc=b_dA)
 
     for i_v in range(tl.cdiv(V, BV)):
         o_v = i_v * BV + tl.arange(0, BV)
@@ -210,40 +239,55 @@ def prepare_wy_repr_bwd_kernel(
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), mask=m_v)
 
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    b_dA = tl.where(m_A, b_dA, 0)
-    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
+    b_dA = tl.dot(tl.where(m_A, b_dA, 0).to(b_A.dtype), b_A)
     b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
 
     if USE_G:
         b_dA *= exp2(b_g[:, None] - b_g[None, :])
 
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
     b_dA = tl.where(m_A, -b_dA, 0).to(k.dtype.element_ty)
 
+    # hoist (dA*beta)^T out of the i_k loop: reused by all K blocks.
+    # folding beta into dA lets both loop3 dots share the same B operand (b_k)
+    # (dA^T @ (k*beta) == (dA*beta)^T @ k)
+    b_dAbt = tl.trans((b_dA * b_b[:, None]).to(b_dA.dtype))
     tl.debug_barrier()
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = m_t[:, None] & (o_k[None, :] < K)
         p_k = k + (bos*H + i_h // (HV // H)) * K + o_t[:, None] * (H*K) + o_k[None, :]
         p_dk = dk + (bos*HV + i_h) * K + o_t[:, None] * (HV*K) + o_k[None, :]
+        p_dw = dw + (bos*HV + i_h) * K + o_t[:, None] * (HV*K) + o_k[None, :]
         b_k = tl.load(p_k, mask=m_k, other=0.0)
-        b_kt = tl.trans(b_k)
-        b_kb = b_k * b_b[:, None]
+        b_dw = tl.load(p_dw, mask=m_k, other=0.0, eviction_policy="evict_first")
 
-        b_A += tl.dot(b_k, b_kt)
+        # dkb/dAkb share b_k as B-operand; dkbg uses b_dw (evict_first)
         b_dkb = tl.dot(b_dA, b_k)
-        b_db += tl.sum(b_dkb * b_k, 1)
-        b_dk = b_dkb * b_b[:, None] + tl.trans(tl.dot(tl.trans(b_kb).to(b_dA.dtype), b_dA))
-        b_dk += tl.load(p_dk, mask=m_k, other=0.0)
+        b_dAkb = tl.dot(b_dAbt, b_k)
+        b_dkbg = tl.dot(b_A, b_dw)
+
+        if USE_G:
+            b_dk = b_dkb * b_b[:, None] + b_dAkb + b_dkbg * b_bg[:, None]
+            # db/dg from dkbg
+            b_t = b_g_exp * tl.sum(b_dkbg * b_k, 1)
+            b_db += b_t
+            b_dg += b_t * b_b
+            # db/dg from dkb
+            b_t = tl.sum(b_dkb * b_k, 1)
+            b_db += b_t
+            b_dg += b_t * b_b
+            # dg from dAkb
+            b_dg -= tl.sum(b_k * b_dAkb, 1)
+        else:
+            b_dk = b_dkb * b_b[:, None] + b_dAkb + b_dkbg * b_b[:, None]
+            b_db += tl.sum(b_dkb * b_k, 1)
+            b_db += tl.sum(b_dkbg * b_k, 1)
 
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=m_k)
     tl.store(p_db, b_db.to(p_db.dtype.element_ty), mask=m_t)
 
-    b_A *= b_b[:, None]
     if USE_G:
-        b_AdA = b_dA * b_A
         p_dg = dg + (bos*HV + i_h) + o_t * HV
-        b_dg += tl.sum(b_AdA, axis=1) - tl.sum(b_AdA, axis=0)
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), mask=m_t)
 
 
@@ -259,8 +303,6 @@ def recompute_w_u_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[2]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -284,8 +326,6 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
     )
     return w, u
 
@@ -307,9 +347,6 @@ def prepare_wy_repr_bwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    CONST_TILING = 64 if check_shared_mem() else 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
 
     dk = k.new_empty(B, T, HV, K)
     dv = torch.empty_like(v)
@@ -335,8 +372,7 @@ def prepare_wy_repr_bwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
+        **_wy_bwd_tile_kwargs(K, V),
     )
     if H != HV:
         dk = dk.view(B, T, H, HV // H, K).sum(3)
