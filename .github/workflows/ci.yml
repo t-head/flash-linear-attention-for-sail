@@ -62,3 +62,7 @@ jobs:
     needs: [smoke-test, human-review]
     if: ${{ !cancelled() && needs.smoke-test.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.human-review.result == 'success') }}
     uses: ./.github/workflows/fla-ut-test-ppu.yml
+    with:
+      # The suite is GDN-scoped, so it needs the branch to diff the PR against.
+      # Empty on workflow_dispatch, which makes the called workflow run everything.
+      base_ref: ${{ github.event.pull_request.base.ref }}

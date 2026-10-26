@@ -7,6 +7,17 @@ on:
         required: false
         type: string
         default: '["ZW-M890P", "OAM-810E"]'
+      # Base branch of the pull request, stated by the caller. The suite is
+      # GDN-scoped, so it has to know what to diff against, and an input keeps
+      # that a visible contract in the caller's `with:` block instead of relying
+      # on the caller's event payload reaching a called workflow. No default on
+      # purpose: empty means "no PR" (workflow_dispatch) and runs everything,
+      # while a default of 'main' could scope a manual run against the wrong
+      # branch and skip cases quietly.
+      base_ref:
+        required: false
+        type: string
+        default: ''
   workflow_dispatch:
 
 permissions:
@@ -14,6 +25,25 @@ permissions:
 
 env:
   SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+  # Every case in casecmd.list exercises GDN: the chunk/fused-recurrent ops, the
+  # per-kernel tests, context parallelism, the short convolution, the
+  # GatedDeltaNet layer and the intracard cache. So a diff that misses these
+  # paths cannot change a result this suite measures, and the two boards (about
+  # 2.5 h each) are better spent elsewhere.
+  #   fla/ops/__init__, fla/__init__       imported before any case runs
+  #   fla/ops/{gated_delta_rule,common,utils,backends,cp}/
+  #   fla/ops/kda/                          test_intracard_cache imports chunk_kda
+  #   fla/layers/{gated_deltanet,utils}.py the layer case
+  #   fla/modules/{convolution,layernorm,layernorm_gated,l2norm,fused_norm_gate}.py,
+  #                                         conv/ and the backends/ dispatch registry
+  #   fla/utils/                            assert_close, device, autotune cache
+  #   tests/...                             the cases themselves and conftest
+  #   packaging and the CI plumbing: the job builds a wheel before it tests, and
+  #   a broken casecmd.list or runner would look like a test failure.
+  UT_PATHS: '^(fla/(__init__\.py|ops/(__init__\.py|(gated_delta_rule|common|utils|backends|cp|kda)/)|layers/(__init__\.py|gated_deltanet\.py|utils\.py)|modules/(__init__\.py|convolution\.py|layernorm\.py|layernorm_gated\.py|l2norm\.py|fused_norm_gate\.py|conv/|backends/__init__\.py)|utils/)|tests/(conftest\.py|ops/test_(gdn|gdn_kernels|intracard_cache)\.py|context_parallel/test_cp_(gdn|bwd_gk_offset|conv)\.py|modules/test_conv\.py|layers/test_gated_deltanet\.py)|scripts/build_packages\.py|setup\.py|pyproject\.toml|\.github/workflows/(ci|fla-ut-test-ppu)\.yml|\.github/workflows/scripts/(casecmd\.list|pr-fla-ut\.py))'
+  # The triton_ascend backends are Huawei NPU kernels: they never run on PPU, so
+  # a change confined to them cannot move the results this suite reports.
+  UT_EXCLUDE: '(^|/)triton_ascend/|^fla/utils/ascend_ub_manager\.py'
 
 jobs:
   build-test:
@@ -32,8 +62,48 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The suite is the expensive part (a board per matrix entry, hours each),
+      # so decide first whether this diff can change a GDN result. Not an
+      # on.paths filter: a workflow that never triggers leaves its required
+      # check pending forever, while a skipped step still reports a conclusion.
+      - name: Decide scope
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ inputs.base_ref }}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::no PR base ref, so this is a manual run; the whole suite runs"
+            exit 0
+          fi
+          BASE_REF="${{ inputs.base_ref }}"
+          BASE_REF="${BASE_REF#origin/}"
+          # fetch-depth 0 brings every branch head and this job does not persist
+          # credentials, so the base is already here; do not fetch it again.
+          # An unresolvable base runs the suite rather than skipping it: a
+          # scoping problem must never turn into missing coverage.
+          if ! git rev-parse --verify -q "origin/$BASE_REF" >/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::origin/$BASE_REF is not in the checkout, so the diff cannot be scoped; running the whole suite"
+            exit 0
+          fi
+          BASE_SHA=$(git merge-base HEAD "origin/$BASE_REF")
+          echo "base=$BASE_REF@$(git rev-parse --short "$BASE_SHA") head=$(git rev-parse --short HEAD)"
+
+          # --no-renames so moving a file out of a gated directory still counts.
+          changed=$(git diff --name-only --no-renames "$BASE_SHA" HEAD)
+          hits=$(printf '%s\n' "$changed" | grep -E "$UT_PATHS" | grep -vE "$UT_EXCLUDE" || true)
+          if [ -n "$hits" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::GDN-related files: $(printf '%s\n' "$hits" | paste -sd' ')"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no GDN-related changes, GDN suite skipped"
+          fi
+
       - name: Build and Test on PPU
         id: ppu-test
+        if: steps.scope.outputs.run == 'true'
         uses: t-head/ppu-scheduler-action@main
         with:
           image: ${{ env.SAIL_IMAGE }}
@@ -89,7 +159,7 @@ jobs:
           cleanup_policy: on_success
 
       - name: Test summary (${{ matrix.runner }})
-        if: always()
+        if: always() && steps.scope.outputs.run == 'true'
         shell: bash
         run: |
           export NAS_RESULT_DIR="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
