@@ -16,10 +16,42 @@ import triton.language as tl
 
 from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_PPU_810E, autotune_cache_kwargs, check_shared_mem
 
 if TYPE_CHECKING:
     from fla.ops.cp.context import FLACPContext
+
+
+def _prune_fwd_merged_configs(configs, named_args, **kwargs):
+    """Drop BLOCK_SIZE=128 candidates when K or V < 128.
+
+    On PPU the masked-but-out-of-bounds pointer arithmetic in the stage-2
+    m-part (col = arange(0, BLOCK_SIZE) + i_k_col * BLOCK_SIZE with
+    BLOCK_SIZE > K) triggers hggcErrorLaunchFailure.  Pruning here avoids
+    the crash during autotune warmup while keeping BS=128 for K=V=128.
+    """
+    K = kwargs.get('K', 0)
+    V = kwargs.get('V', 0)
+    if K < 128 or V < 128:
+        return [c for c in configs if c.kwargs.get('BLOCK_SIZE', 32) <= 64]
+    return configs
+
+
+# Split+Decompose head lists are per-board: the merged/split crossover flips between the
+# two PPU parts, so one list cannot be optimal for both.
+#
+# ZW-M890P, where the narrow list was originally tuned: merged stays more than 4x ahead
+# of split on the heads that lose out, leaving only H=32/128 with a >5% gain (H=8/48
+# regress, H=16/64 merged faster after the stage2 decomposition).
+# ZW810E, measured here with benchmarks/cp/benchmark_gdn_preprocess.py (T=8192/16384,
+# K=V=128, BT=64, bf16): split wins on every benchmarked bwd head, by 5.4%-38.8%.
+_810E_SPLIT_HEADS = frozenset({8, 16, 32, 48, 64, 128})
+_M890_SPLIT_HEADS = frozenset({32, 128})
+_SPLIT_HEADS = _810E_SPLIT_HEADS if IS_PPU_810E else _M890_SPLIT_HEADS
+
+# FWD split path: empty on both boards, the merged kernel is faster for every
+# benchmarked head, so all FWD go merged.
+_FWD_SPLIT_HEADS = frozenset()
 
 
 @triton.heuristics({
@@ -27,14 +59,32 @@ if TYPE_CHECKING:
     'USE_GK': lambda args: args['gk'] is not None,
     'USE_BG': lambda args: args['bg'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'EVEN_T': lambda args: (
+        args['cu_seqlens'] is None
+        and args['T'] % args['BT'] == 0
+        and args['H'] in (8, 16, 32, 48, 64, 128)
+    ),
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
+        triton.Config({'BLOCK_SIZE': bs}, num_warps=num_warps, num_stages=num_stages)
+        # num_warps=8 added (candidate 1): baseline ACU shows this kernel is
+        # latency-bound on global-load memory_dependency with only ~5-10%
+        # warps_active; extra warps per CTA hide that latency. Configs that do
+        # not fit registers/shared memory are pruned by the autotuner, and the
+        # original [2, 4] configs remain, so the selected winner cannot regress.
+        for bs in [32, 64]
+        for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
+    ] + [
+        # D5: BLOCK_SIZE=128 halves grid columns (V/128+K/128 vs V/64+K/64),
+        # reducing tail-wave overhead. H=128 cold-cache A/B: 1.074x CI95=[1.067,1.082].
+        # nw=8 is the only competitive warp count; s={2,3} bracket the winner.
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=8, num_stages=ns)
+        for ns in [2, 3]
     ],
     key=['H', 'HV', 'K', 'V', 'BT'],
+    prune_configs_by={'early_config_prune': _prune_fwd_merged_configs},
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -61,6 +111,7 @@ def pre_process_fwd_kernel_merged(
     USE_BG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     MULTI_SEQS: tl.constexpr,
+    EVEN_T: tl.constexpr = False,
 ):
     i_col, i_h = tl.program_id(0), tl.program_id(1)
     if MULTI_SEQS:
@@ -130,7 +181,7 @@ def pre_process_fwd_kernel_merged(
         # Main recurrence for h
         for i_t in range(NT):
             o_t = i_t * BT + tl.arange(0, BT)
-            m_t = o_t < T
+            m_t = tl.full([BT], 1, dtype=tl.int1) if EVEN_T else o_t < T
             # Compute decayed v
             p_w = w + o_t[:, None] * stride_w + o_k1[None, :]
             b_w = tl.load(p_w, mask=m_t[:, None] & m_k1[None, :], other=0.0)
@@ -158,7 +209,7 @@ def pre_process_fwd_kernel_merged(
                 # GDN/KDA mode: v_new = v - w @ h
                 b_v = tl.load(p_v, mask=m_t[:, None] & m_vb[None, :], other=0.0) - b_v_decay
 
-            last_idx = min((i_t + 1) * BT, T) - 1
+            last_idx = (i_t + 1) * BT - 1 if EVEN_T else min((i_t + 1) * BT, T) - 1
 
             # Apply g decay
             if USE_G:
@@ -269,7 +320,7 @@ def pre_process_fwd_kernel_merged(
 
         for i_t in range(NT):
             o_t = i_t * BT + tl.arange(0, BT)
-            m_t = o_t < T
+            m_t = tl.full([BT], 1, dtype=tl.int1) if EVEN_T else o_t < T
             # Load k and w with full BK1 rows
             if USE_BG:
                 # DPLR mode: use bg for transition matrix
@@ -281,7 +332,7 @@ def pre_process_fwd_kernel_merged(
             p_w = w + o_t[:, None] * stride_w + row[None, :]
             b_w = tl.load(p_w, mask=m_t[:, None] & (row < K)[None, :], other=0.0)
 
-            last_idx = min((i_t + 1) * BT, T) - 1
+            last_idx = (i_t + 1) * BT - 1 if EVEN_T else min((i_t + 1) * BT, T) - 1
 
             if USE_G:
                 b_g_last = tl.load(g + last_idx * HV).to(tl.float32)
@@ -289,24 +340,22 @@ def pre_process_fwd_kernel_merged(
                 b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
                 b_k = b_k * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
                 b_g_last = exp2(b_g_last)
-                b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
             elif USE_GK:
                 b_gk_last = tl.load(gk + last_idx * HV * K + row, mask=(row < K), other=0.).to(tl.float32)
                 b_gk_last = exp2(b_gk_last)
+
+            if USE_G:
+                b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
+            elif USE_GK:
                 b_diag = tl.where(row[:, None] == row[None, :], b_gk_last[:, None], 0.0)
             else:
                 b_diag = tl.where(row[:, None] == row[None, :], 1.0, 0.0)
-
-            # Compute m update
+            b_kw = tl.dot(tl.trans(b_k.to(b_w.dtype)), b_w)
             if USE_BG:
-                # DPLR mode: M = (diag + bg^T @ w) @ M
-                # bg was already offset at the beginning of the kernel
-                b_kw = tl.dot(tl.trans(b_k.to(b_w.dtype)), b_w)
                 b_m_i = b_diag + b_kw
             else:
-                # GDN/KDA mode: M = (diag - k^T @ w) @ M
-                b_kw = tl.dot(tl.trans(b_k.to(b_w.dtype)), b_w)
                 b_m_i = b_diag - b_kw
+            # Keep the m chain in fp32: casting m to bf16 every chunk compounds along the chain.
             b_m = tl.dot(b_m_i.to(tl.float32), b_m.to(tl.float32))
 
         # Store m result
@@ -464,11 +513,27 @@ def merge_fwd_bwd_kernel(
     'USE_G': lambda args: args['g'] is not None,
     'USE_GK': lambda args: args['gk'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    # Removing the tail mask helps both stages for these target head counts.
+    'EVEN_T': lambda args: (
+        args['cu_seqlens'] is None
+        and args['T'] % args['BT'] == 0
+        and args['H'] in (8, 16, 64)
+    ),
+    # H=32 and H=128 benefit only in stage 2 (candidates 19 and 18).
+    # Stage 1 keeps the generic path for both heads.
+    'STAGE2_EVEN_T': lambda args: (
+        args['cu_seqlens'] is None
+        and args['T'] % args['BT'] == 0
+        and args['H'] in (32, 128)
+    ),
 })
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
+        # num_warps=8 added (candidate 1): same latency-bound / low-occupancy
+        # rationale as the fwd kernel. Original [2, 4] configs are retained and
+        # non-fitting configs are pruned, so the winner cannot regress.
+        for num_warps in [2, 4, 8]
         for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [1])
     ],
     key=['H', 'HV', 'K', 'V', 'BT'],
@@ -498,6 +563,9 @@ def pre_process_bwd_kernel_merged(
     USE_GK: tl.constexpr,
     USE_BG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    EVEN_T: tl.constexpr,
+    STAGE2_EVEN_T: tl.constexpr,
+    G_HEAD_MAJOR: tl.constexpr = False,
 ):
     """
     Merged backward kernel that computes both dh (K x V) and dm (K x K) in a single kernel.
@@ -505,6 +573,9 @@ def pre_process_bwd_kernel_merged(
     Similar to pre_process_fwd_kernel_merged, this kernel uses a unified grid where:
     - Columns [0, V) are for computing dh (stage 1)
     - Columns [V, V+K) are for computing dm (stage 2)
+
+    When G_HEAD_MAJOR=True (POC), g is expected in [HV, T] layout (contiguous in T)
+    instead of the default [total_T, HV] layout.  Token stride becomes 1 vs HV.
     """
     i_col, i_h = tl.program_id(0), tl.program_id(1)
     i_n = 0
@@ -529,7 +600,11 @@ def pre_process_bwd_kernel_merged(
     else:
         w += ((bos * HV + i_h) * K).to(tl.int64)
     if USE_G:
-        g += (bos * HV + i_h).to(tl.int64)
+        if G_HEAD_MAJOR:
+            # POC: g is [HV, T_local], contiguous in T.  Offset to head i_h.
+            g += (i_h * T).to(tl.int64)
+        else:
+            g += (bos * HV + i_h).to(tl.int64)
     if USE_GK:
         gk += ((bos * HV + i_h) * K).to(tl.int64)
     dhm += i_h * K * (V + K)
@@ -565,13 +640,17 @@ def pre_process_bwd_kernel_merged(
 
         # Main recurrence for dh (reverse order)
         for i_t in range(NT - 1, -1, -1):
-            last_idx = min((i_t + 1) * BT, T) - 1
+            last_idx = (i_t + 1) * BT - 1 if EVEN_T else min((i_t + 1) * BT, T) - 1
             o_t = i_t * BT + tl.arange(0, BT)
-            m_t = o_t < T
+            m_t = tl.full([BT], 1, dtype=tl.int1) if EVEN_T else o_t < T
 
             if USE_G:
-                bg_last = tl.load(g + last_idx * HV).to(tl.float32)
-                p_g = g + o_t * HV
+                if G_HEAD_MAJOR:
+                    bg_last = tl.load(g + last_idx).to(tl.float32)
+                    p_g = g + o_t
+                else:
+                    bg_last = tl.load(g + last_idx * HV).to(tl.float32)
+                    p_g = g + o_t * HV
                 b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
                 bg_last_exp = exp2(bg_last)
                 b_g_exp = exp2(b_g)
@@ -704,7 +783,7 @@ def pre_process_bwd_kernel_merged(
             # Reverse order for backward
             i_t = NT - 1 - _i_t
             o_t = i_t * BT + tl.arange(0, BT)
-            m_t = o_t < T
+            m_t = tl.full([BT], 1, dtype=tl.int1) if EVEN_T or STAGE2_EVEN_T else o_t < T
 
             # Load k and w with full BK1 rows
             p_k = k + o_t[:, None] * stride_qk + row[None, :]
@@ -712,36 +791,722 @@ def pre_process_bwd_kernel_merged(
             p_w = w + o_t[:, None] * stride_w + row[None, :]
             b_w = tl.load(p_w, mask=m_t[:, None] & (row < K)[None, :], other=0.0)
 
-            last_idx = min((i_t + 1) * BT, T) - 1
+            last_idx = (i_t + 1) * BT - 1 if EVEN_T or STAGE2_EVEN_T else min((i_t + 1) * BT, T) - 1
 
             if USE_G:
-                b_g_last = tl.load(g + last_idx * HV).to(tl.float32)
-                p_g = g + o_t * HV
+                if G_HEAD_MAJOR:
+                    b_g_last = tl.load(g + last_idx).to(tl.float32)
+                    p_g = g + o_t
+                else:
+                    b_g_last = tl.load(g + last_idx * HV).to(tl.float32)
+                    p_g = g + o_t * HV
                 b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
                 b_k = b_k * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
                 b_g_last = exp2(b_g_last)
-                b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
             elif USE_GK:
                 b_gk_last = tl.load(gk + last_idx * HV * K + row, mask=(row < K), other=0.).to(tl.float32)
                 b_gk_last = exp2(b_gk_last)
+
+            if USE_G:
+                b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
+            elif USE_GK:
                 b_diag = tl.where(row[:, None] == row[None, :], b_gk_last[:, None], 0.0)
             else:
                 b_diag = tl.where(row[:, None] == row[None, :], 1.0, 0.0)
-
-            # Compute dm update for backward
+            # dM = (diag ∓ w^T @ k) @ dM
             b_kw = tl.dot(tl.trans(b_w), b_k.to(b_w.dtype))
             if USE_BG:
-                # DPLR mode: dM = (diag + w^T @ bg) @ dM
                 b_m_i = b_diag + b_kw
             else:
-                # GDN/KDA mode: dM = (diag - w^T @ k) @ dM
                 b_m_i = b_diag - b_kw
-            # Keep m chain in fp32 to avoid precision loss from repeated bf16 casting
+            # Keep the m chain in fp32: casting m to bf16 every chunk compounds along the chain.
             b_m = tl.dot(b_m_i.to(tl.float32), b_m.to(tl.float32))
 
         # Store dm result
         p_m = dhm + V + row[:, None] * (V + K) + col[None, :]
         tl.store(p_m, b_m.to(p_m.dtype.element_ty), mask=(row < K)[:, None] & (col < K)[None, :])
+
+
+# Split BWD Stage 1: dh computation (K x V portion of dhm).
+@triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_GK': lambda args: args['gk'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'EVEN_T': lambda args: (
+        args['cu_seqlens'] is None
+        and args['T'] % args['BT'] == 0
+        and args['H'] in (8, 16, 64)
+    ),
+})
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': bs}, num_warps=nw, num_stages=ns)
+        for bs in [32, 64]
+        for nw in [4, 8]
+        for ns in ([4, 3, 2] if check_shared_mem('ampere') else [1])
+    ],
+    key=['H', 'HV', 'K', 'V', 'BT'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def pre_process_bwd_stage1_dh(
+    q,
+    k,
+    w,
+    g,
+    gk,
+    do,
+    dhm,
+    dv,
+    cu_seqlens,
+    scale,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    USE_G: tl.constexpr,
+    USE_GK: tl.constexpr,
+    USE_BG: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    EVEN_T: tl.constexpr,
+    G_HEAD_MAJOR: tl.constexpr = False,
+):
+    """Stage 1 only: computes dh [K, V] portion of dhm."""
+    i_v, i_h = tl.program_id(0), tl.program_id(1)
+    i_n = 0
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
+        NT = tl.cdiv(T, BT)
+    else:
+        bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
+        NT = tl.cdiv(T, BT)
+
+    q += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    k += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    if USE_BG:
+        w += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    else:
+        w += ((bos * HV + i_h) * K).to(tl.int64)
+    if USE_G:
+        if G_HEAD_MAJOR:
+            g += (i_h * T).to(tl.int64)
+        else:
+            g += (bos * HV + i_h).to(tl.int64)
+    if USE_GK:
+        gk += ((bos * HV + i_h) * K).to(tl.int64)
+    dhm += i_h * K * (V + K)
+    stride_qk = H * K
+    stride_w = H * K if USE_BG else HV * K
+
+    do += ((bos * HV + i_h) * V).to(tl.int64)
+    dv += ((bos * HV + i_h) * V).to(tl.int64)
+    stride_v = HV * V
+
+    # D4-A: capture the pointer element type so that any `.to(in_dtype)` cast
+    # on the dot inputs is stable. Without this, `b_q = b_q * b_g_exp` (fp32)
+    # mutates `b_q.dtype` to fp32 and the downstream `b_q.to(b_q.dtype)` becomes
+    # a no-op, forcing the compiler to emit TF32 MMA (m16n16k8) instead of
+    # bf16 MMA (m16n16k16) at half the FLOP/instr. Mirrors the known FWD
+    # stage2 pitfall for the same `.to(b_k.dtype)` after g-scaling pattern.
+    in_dtype = w.dtype.element_ty
+
+    # Initialize dh accumulators
+    b_dh1 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
+    if K > 64:
+        b_dh2 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
+    if K > 128:
+        b_dh3 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
+    if K > 192:
+        b_dh4 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
+
+    o_vb = i_v * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    m_vb = o_vb < V
+    o_k1 = tl.arange(0, 64)
+    m_k1 = o_k1 < K
+    o_k2 = 64 + o_k1
+    m_k2 = o_k2 < K
+    o_k3 = 128 + o_k1
+    m_k3 = o_k3 < K
+    o_k4 = 192 + o_k1
+    m_k4 = o_k4 < K
+
+    for i_t in range(NT - 1, -1, -1):
+        last_idx = (i_t + 1) * BT - 1 if EVEN_T else min((i_t + 1) * BT, T) - 1
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = tl.full([BT], 1, dtype=tl.int1) if EVEN_T else o_t < T
+
+        if USE_G:
+            if G_HEAD_MAJOR:
+                bg_last = tl.load(g + last_idx).to(tl.float32)
+                p_g = g + o_t
+            else:
+                bg_last = tl.load(g + last_idx * HV).to(tl.float32)
+                p_g = g + o_t * HV
+            b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
+            bg_last_exp = exp2(bg_last)
+            b_g_exp = exp2(b_g)
+
+        p_dv = dv + o_t[:, None] * stride_v + o_vb[None, :]
+        p_do = do + o_t[:, None] * stride_v + o_vb[None, :]
+        b_do = tl.load(p_do, mask=m_t[:, None] & m_vb[None, :], other=0.0)
+
+        # k loads for dv: [BT, 64] row-major blocks.
+        p_k = k + o_t[:, None] * stride_qk + o_k1[None, :]
+        b_k = tl.load(p_k, mask=m_t[:, None] & m_k1[None, :], other=0.0)
+        if USE_GK:
+            p_gk_last = gk + last_idx * HV * K
+            b_gk_last1 = tl.load(p_gk_last + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
+        b_dv = tl.dot(b_k, b_dh1.to(b_k.dtype))
+
+        if K > 64:
+            p_k = k + o_t[:, None] * stride_qk + o_k2[None, :]
+            b_k = tl.load(p_k, mask=m_t[:, None] & m_k2[None, :], other=0.0)
+            if USE_GK:
+                b_gk_last2 = tl.load(p_gk_last + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
+            b_dv += tl.dot(b_k, b_dh2.to(b_k.dtype))
+
+        if K > 128:
+            p_k = k + o_t[:, None] * stride_qk + o_k3[None, :]
+            b_k = tl.load(p_k, mask=m_t[:, None] & m_k3[None, :], other=0.0)
+            if USE_GK:
+                b_gk_last3 = tl.load(p_gk_last + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
+            b_dv += tl.dot(b_k, b_dh3.to(b_k.dtype))
+
+        if K > 192:
+            p_k = k + o_t[:, None] * stride_qk + o_k4[None, :]
+            b_k = tl.load(p_k, mask=m_t[:, None] & m_k4[None, :], other=0.0)
+            if USE_GK:
+                b_gk_last4 = tl.load(p_gk_last + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
+            b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
+
+        if USE_G:
+            b_dv *= tl.where(m_t, exp2(bg_last - b_g), 0)[:, None]
+        b_dv += tl.load(p_dv, mask=m_t[:, None] & m_vb[None, :], other=0.0)
+
+        # Update dh: w and q are in [64, BT] column-major layout.
+        p_w = w + o_k1[:, None] + o_t[None, :] * stride_w
+        p_q = q + o_k1[:, None] + o_t[None, :] * stride_qk
+        b_w = tl.load(p_w, mask=m_k1[:, None] & m_t[None, :], other=0.0)
+        b_q = tl.load(p_q, mask=m_k1[:, None] & m_t[None, :], other=0.0)
+        if USE_G:
+            b_dh1 *= bg_last_exp
+            b_q = b_q * b_g_exp[None, :]
+        if USE_GK:
+            b_dh1 *= exp2(b_gk_last1[:, None])
+        if USE_BG:
+            b_dh1 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) + tl.dot(b_w, b_dv.to(in_dtype))
+        else:
+            b_dh1 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) * scale - tl.dot(b_w, b_dv.to(in_dtype))
+
+        if K > 64:
+            p_q = q + o_k2[:, None] + o_t[None, :] * stride_qk
+            p_w = w + o_k2[:, None] + o_t[None, :] * stride_w
+            b_q = tl.load(p_q, mask=m_k2[:, None] & m_t[None, :], other=0.0)
+            b_w = tl.load(p_w, mask=m_k2[:, None] & m_t[None, :], other=0.0)
+            if USE_G:
+                b_dh2 *= bg_last_exp
+                b_q = b_q * b_g_exp[None, :]
+            if USE_GK:
+                b_dh2 *= exp2(b_gk_last2[:, None])
+            if USE_BG:
+                b_dh2 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) + tl.dot(b_w, b_dv.to(in_dtype))
+            else:
+                b_dh2 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) * scale - tl.dot(b_w, b_dv.to(in_dtype))
+
+        if K > 128:
+            p_q = q + o_k3[:, None] + o_t[None, :] * stride_qk
+            p_w = w + o_k3[:, None] + o_t[None, :] * stride_w
+            b_q = tl.load(p_q, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+            b_w = tl.load(p_w, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+            if USE_G:
+                b_dh3 *= bg_last_exp
+                b_q = b_q * b_g_exp[None, :]
+            if USE_GK:
+                b_dh3 *= exp2(b_gk_last3[:, None])
+            if USE_BG:
+                b_dh3 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) + tl.dot(b_w, b_dv.to(in_dtype))
+            else:
+                b_dh3 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) * scale - tl.dot(b_w, b_dv.to(in_dtype))
+
+        if K > 192:
+            p_q = q + o_k4[:, None] + o_t[None, :] * stride_qk
+            p_w = w + o_k4[:, None] + o_t[None, :] * stride_w
+            b_q = tl.load(p_q, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+            b_w = tl.load(p_w, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+            if USE_G:
+                b_dh4 *= bg_last_exp
+                b_q = b_q * b_g_exp[None, :]
+            if USE_GK:
+                b_dh4 *= exp2(b_gk_last4[:, None])
+            if USE_BG:
+                b_dh4 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) + tl.dot(b_w, b_dv.to(in_dtype))
+            else:
+                b_dh4 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) * scale - tl.dot(b_w, b_dv.to(in_dtype))
+
+    # Store dh results
+    p_dh1 = dhm + o_k1[:, None] * (V + K) + o_vb[None, :]
+    tl.store(p_dh1, b_dh1.to(p_dh1.dtype.element_ty), mask=m_k1[:, None] & m_vb[None, :])
+    if K > 64:
+        p_dh2 = dhm + o_k2[:, None] * (V + K) + o_vb[None, :]
+        tl.store(p_dh2, b_dh2.to(p_dh2.dtype.element_ty), mask=m_k2[:, None] & m_vb[None, :])
+    if K > 128:
+        p_dh3 = dhm + o_k3[:, None] * (V + K) + o_vb[None, :]
+        tl.store(p_dh3, b_dh3.to(p_dh3.dtype.element_ty), mask=m_k3[:, None] & m_vb[None, :])
+    if K > 192:
+        p_dh4 = dhm + o_k4[:, None] * (V + K) + o_vb[None, :]
+        tl.store(p_dh4, b_dh4.to(p_dh4.dtype.element_ty), mask=m_k4[:, None] & m_vb[None, :])
+
+
+# Split BWD Stage 2: dm computation (K x K portion of dhm) with matrix decomposition.
+# Decomposes M = decay*M ∓ w^T @ (k @ M), halving FLOPs vs the merged kernel.
+@triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_GK': lambda args: args['gk'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'EVEN_T': lambda args: (
+        args['cu_seqlens'] is None
+        and args['T'] % args['BT'] == 0
+        and args['H'] in (8, 16, 32, 64, 128)
+    ),
+})
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': bs}, num_warps=nw, num_stages=ns)
+        for bs in [32, 64]
+        for nw in [4, 8]
+        for ns in ([3, 2, 1] if check_shared_mem('ampere') else [1])
+    ],
+    key=['H', 'HV', 'K', 'V', 'BT'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def pre_process_bwd_stage2_dm_v2(
+    k,
+    w,
+    g,
+    gk,
+    dhm,
+    cu_seqlens,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BK1: tl.constexpr,
+    USE_G: tl.constexpr,
+    USE_GK: tl.constexpr,
+    USE_BG: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    EVEN_T: tl.constexpr,
+    G_HEAD_MAJOR: tl.constexpr = False,
+):
+    """Stage 2 only: computes dm [K, K] portion of dhm via the fp32 m chain."""
+    i_k_col, i_h = tl.program_id(0), tl.program_id(1)
+    i_n = 0
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
+        NT = tl.cdiv(T, BT)
+    else:
+        bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
+        NT = tl.cdiv(T, BT)
+
+    k += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    if USE_BG:
+        w += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    else:
+        w += ((bos * HV + i_h) * K).to(tl.int64)
+    if USE_G:
+        if G_HEAD_MAJOR:
+            g += (i_h * T).to(tl.int64)
+        else:
+            g += (bos * HV + i_h).to(tl.int64)
+    if USE_GK:
+        gk += ((bos * HV + i_h) * K).to(tl.int64)
+    dhm += i_h * K * (V + K)
+    stride_qk = H * K
+    stride_w = H * K if USE_BG else HV * K
+
+    row = tl.arange(0, BK1)
+    col = tl.arange(0, BLOCK_SIZE) + i_k_col * BLOCK_SIZE
+
+    # Initialize as identity: M_0 = I
+    b_m = tl.where(row[:, None] == col[None, :], 1.0, 0.0)
+
+    for _i_t in range(NT):
+        # Reverse order for backward
+        i_t = NT - 1 - _i_t
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = tl.full([BT], 1, dtype=tl.int1) if EVEN_T else o_t < T
+
+        # Load k and w with full BK1 rows.
+        p_k = k + o_t[:, None] * stride_qk + row[None, :]
+        b_k = tl.load(p_k, mask=m_t[:, None] & (row < K)[None, :], other=0.0)
+        p_w = w + o_t[:, None] * stride_w + row[None, :]
+        b_w = tl.load(p_w, mask=m_t[:, None] & (row < K)[None, :], other=0.0)
+
+        last_idx = (i_t + 1) * BT - 1 if EVEN_T else min((i_t + 1) * BT, T) - 1
+
+        if USE_G:
+            if G_HEAD_MAJOR:
+                b_g_last = tl.load(g + last_idx).to(tl.float32)
+                p_g = g + o_t
+            else:
+                b_g_last = tl.load(g + last_idx * HV).to(tl.float32)
+                p_g = g + o_t * HV
+            b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
+            b_k = b_k * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
+            b_g_last = exp2(b_g_last)
+        elif USE_GK:
+            b_gk_last = tl.load(gk + last_idx * HV * K + row, mask=(row < K), other=0.).to(tl.float32)
+            b_gk_last = exp2(b_gk_last)
+
+        if USE_G:
+            b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
+        elif USE_GK:
+            b_diag = tl.where(row[:, None] == row[None, :], b_gk_last[:, None], 0.0)
+        else:
+            b_diag = tl.where(row[:, None] == row[None, :], 1.0, 0.0)
+        # dM = (diag ∓ w^T @ k) @ dM
+        b_kw = tl.dot(tl.trans(b_w), b_k.to(b_w.dtype))
+        if USE_BG:
+            b_m_i = b_diag + b_kw
+        else:
+            b_m_i = b_diag - b_kw
+        # Keep the m chain in fp32: casting m to bf16 every chunk compounds along the chain.
+        b_m = tl.dot(b_m_i.to(tl.float32), b_m.to(tl.float32))
+
+    # Store dm result
+    p_m = dhm + V + row[:, None] * (V + K) + col[None, :]
+    tl.store(p_m, b_m.to(p_m.dtype.element_ty), mask=(row < K)[:, None] & (col < K)[None, :])
+
+
+# ---------------------------------------------------------------------------
+# Split FWD Stage 1: h computation (K x V portion of hm).
+# Standalone extraction of the is_h_part branch from merged FWD kernel.
+# ---------------------------------------------------------------------------
+@triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_GK': lambda args: args['gk'] is not None,
+    'USE_BG': lambda args: args['bg'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': bs}, num_warps=nw, num_stages=ns)
+        for bs in [32, 64]
+        for nw in [4, 8]
+        for ns in ([4, 3, 2] if check_shared_mem('ampere') else [1])
+    ],
+    key=['H', 'HV', 'K', 'V', 'BT'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def pre_process_fwd_stage1_h(
+    k,
+    v,
+    w,
+    g,
+    gk,
+    bg,
+    u,
+    hm,
+    cu_seqlens,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    USE_G: tl.constexpr,
+    USE_GK: tl.constexpr,
+    USE_BG: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Stage 1 only: computes h [K, V] portion of hm (forward recurrence)."""
+    i_v, i_h = tl.program_id(0), tl.program_id(1)
+    i_n = 0
+    hm += i_h * K * (K + V)
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
+        NT = tl.cdiv(T, BT)
+    else:
+        bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
+        NT = tl.cdiv(T, BT)
+
+    k += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    if USE_BG:
+        w += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+        bg += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    else:
+        w += ((bos * HV + i_h) * K).to(tl.int64)
+    if USE_G:
+        g += (bos * HV + i_h).to(tl.int64)
+    if USE_GK:
+        gk += ((bos * HV + i_h) * K).to(tl.int64)
+    stride_k = H * K
+    stride_w = H * K if USE_BG else HV * K
+
+    v += ((bos * HV + i_h) * V).to(tl.int64)
+    if USE_BG:
+        u += ((bos * HV + i_h) * V).to(tl.int64)
+    stride_v = HV * V
+
+    # Initialize h accumulators
+    b_h1 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
+    if K > 64:
+        b_h2 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
+    if K > 128:
+        b_h3 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
+    if K > 192:
+        b_h4 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
+
+    o_vb = i_v * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    m_vb = o_vb < V
+    o_k1 = tl.arange(0, 64)
+    m_k1 = o_k1 < K
+    o_k2 = 64 + o_k1
+    m_k2 = o_k2 < K
+    o_k3 = 128 + o_k1
+    m_k3 = o_k3 < K
+    o_k4 = 192 + o_k1
+    m_k4 = o_k4 < K
+
+    for i_t in range(NT):
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = o_t < T
+        # Compute decayed v
+        p_w = w + o_t[:, None] * stride_w + o_k1[None, :]
+        b_w = tl.load(p_w, mask=m_t[:, None] & m_k1[None, :], other=0.0)
+        b_v_decay = tl.dot(b_w, b_h1.to(b_w.dtype))
+        if K > 64:
+            p_w = w + o_t[:, None] * stride_w + o_k2[None, :]
+            b_w = tl.load(p_w, mask=m_t[:, None] & m_k2[None, :], other=0.0)
+            b_v_decay += tl.dot(b_w, b_h2.to(b_w.dtype))
+        if K > 128:
+            p_w = w + o_t[:, None] * stride_w + o_k3[None, :]
+            b_w = tl.load(p_w, mask=m_t[:, None] & m_k3[None, :], other=0.0)
+            b_v_decay += tl.dot(b_w, b_h3.to(b_w.dtype))
+        if K > 192:
+            p_w = w + o_t[:, None] * stride_w + o_k4[None, :]
+            b_w = tl.load(p_w, mask=m_t[:, None] & m_k4[None, :], other=0.0)
+            b_v_decay += tl.dot(b_w, b_h4.to(b_w.dtype))
+
+        p_v = v + o_t[:, None] * stride_v + o_vb[None, :]
+        if USE_BG:
+            b_v_orig = tl.load(p_v, mask=m_t[:, None] & m_vb[None, :], other=0.0)
+            p_u = u + o_t[:, None] * stride_v + o_vb[None, :]
+            b_v = b_v_decay + tl.load(p_u, mask=m_t[:, None] & m_vb[None, :], other=0.0)
+        else:
+            b_v = tl.load(p_v, mask=m_t[:, None] & m_vb[None, :], other=0.0) - b_v_decay
+
+        last_idx = min((i_t + 1) * BT, T) - 1
+
+        if USE_G:
+            b_g_last = tl.load(g + last_idx * HV).to(tl.float32)
+            p_g = g + o_t * HV
+            b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
+            b_v = b_v * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
+            b_g_last = exp2(b_g_last)
+            b_h1 *= b_g_last
+            if K > 64:
+                b_h2 *= b_g_last
+            if K > 128:
+                b_h3 *= b_g_last
+            if K > 192:
+                b_h4 *= b_g_last
+
+        if USE_GK:
+            o_k1 = tl.arange(0, 64)
+            p_gk_last = gk + last_idx * HV * K
+            b_gk_last1 = tl.load(p_gk_last + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
+            b_h1 *= exp2(b_gk_last1)[:, None]
+            if K > 64:
+                o_k2 = 64 + o_k1
+                b_gk_last2 = tl.load(p_gk_last + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
+                b_h2 *= exp2(b_gk_last2)[:, None]
+            if K > 128:
+                o_k3 = 128 + o_k1
+                b_gk_last3 = tl.load(p_gk_last + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
+                b_h3 *= exp2(b_gk_last3)[:, None]
+            if K > 192:
+                o_k4 = 192 + o_k1
+                b_gk_last4 = tl.load(p_gk_last + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
+                b_h4 *= exp2(b_gk_last4)[:, None]
+        b_v = b_v.to(k.dtype.element_ty)
+
+        p_k = k + o_k1[:, None] + o_t[None, :] * stride_k
+        b_k = tl.load(p_k, mask=m_k1[:, None] & m_t[None, :], other=0.0)
+        if USE_BG:
+            p_bg = bg + o_k1[:, None] + o_t[None, :] * stride_k
+            b_bg = tl.load(p_bg, mask=m_k1[:, None] & m_t[None, :], other=0.0)
+            b_h1 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg, b_v)
+            if K > 64:
+                p_k = k + o_k2[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
+                p_bg = bg + o_k2[:, None] + o_t[None, :] * stride_k
+                b_bg = tl.load(p_bg, mask=m_k2[:, None] & m_t[None, :], other=0.0)
+                b_h2 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg, b_v)
+            if K > 128:
+                p_k = k + o_k3[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+                p_bg = bg + o_k3[:, None] + o_t[None, :] * stride_k
+                b_bg = tl.load(p_bg, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+                b_h3 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg, b_v)
+            if K > 192:
+                p_k = k + o_k4[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+                p_bg = bg + o_k4[:, None] + o_t[None, :] * stride_k
+                b_bg = tl.load(p_bg, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+                b_h4 += tl.dot(b_k, b_v_orig.to(b_k.dtype)) + tl.dot(b_bg, b_v)
+        else:
+            b_h1 += tl.dot(b_k, b_v)
+            if K > 64:
+                p_k = k + o_k2[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
+                b_h2 += tl.dot(b_k, b_v)
+            if K > 128:
+                p_k = k + o_k3[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+                b_h3 += tl.dot(b_k, b_v)
+            if K > 192:
+                p_k = k + o_k4[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+                b_h4 += tl.dot(b_k, b_v)
+
+    # Store h results
+    stride_hm_kv = K + V
+    p_h1 = hm + o_k1[:, None] * stride_hm_kv + o_vb[None, :]
+    tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), mask=m_k1[:, None] & m_vb[None, :])
+    if K > 64:
+        p_h2 = hm + o_k2[:, None] * stride_hm_kv + o_vb[None, :]
+        tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), mask=m_k2[:, None] & m_vb[None, :])
+    if K > 128:
+        p_h3 = hm + o_k3[:, None] * stride_hm_kv + o_vb[None, :]
+        tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), mask=m_k3[:, None] & m_vb[None, :])
+    if K > 192:
+        p_h4 = hm + o_k4[:, None] * stride_hm_kv + o_vb[None, :]
+        tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), mask=m_k4[:, None] & m_vb[None, :])
+
+
+# ---------------------------------------------------------------------------
+# Split FWD Stage 2: m computation (K x K portion of hm) with matrix decomposition.
+# Decomposes M = decay*M ∓ k^T @ (w @ M), halving FLOPs vs the merged kernel.
+# Uses transposed dot (Variant A) for bank-conflict-free shared memory access.
+# ---------------------------------------------------------------------------
+@triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_GK': lambda args: args['gk'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': bs}, num_warps=nw, num_stages=ns)
+        for bs in [32, 64]
+        for nw in [4, 8]
+        for ns in ([4, 3, 2] if check_shared_mem('ampere') else [1])
+    ],
+    key=['H', 'HV', 'K', 'V', 'BT'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def pre_process_fwd_stage2_m(
+    k,
+    w,
+    g,
+    gk,
+    hm,
+    cu_seqlens,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BK1: tl.constexpr,
+    USE_G: tl.constexpr,
+    USE_GK: tl.constexpr,
+    USE_BG: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Stage 2 only: computes m [K, K] portion of hm via the fp32 m chain (forward)."""
+    i_k_col, i_h = tl.program_id(0), tl.program_id(1)
+    i_n = 0
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
+        NT = tl.cdiv(T, BT)
+    else:
+        bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
+        NT = tl.cdiv(T, BT)
+
+    # k_param is bg when USE_BG (set by wrapper), always uses H-stride
+    k += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    if USE_BG:
+        w += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    else:
+        w += ((bos * HV + i_h) * K).to(tl.int64)
+    if USE_G:
+        g += (bos * HV + i_h).to(tl.int64)
+    if USE_GK:
+        gk += ((bos * HV + i_h) * K).to(tl.int64)
+    hm += i_h * K * (V + K)
+    stride_k = H * K
+    stride_w = H * K if USE_BG else HV * K
+
+    row = tl.arange(0, BK1)
+    col = tl.arange(0, BLOCK_SIZE) + i_k_col * BLOCK_SIZE
+
+    # Initialize as identity: M_0 = I
+    b_m = tl.where(row[:, None] == col[None, :], 1.0, 0.0)
+
+    for i_t in range(NT):
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = o_t < T
+
+        # Load k (or bg) and w
+        p_k = k + o_t[:, None] * stride_k + row[None, :]
+        b_k = tl.load(p_k, mask=m_t[:, None] & (row < K)[None, :], other=0.0)
+        p_w = w + o_t[:, None] * stride_w + row[None, :]
+        b_w = tl.load(p_w, mask=m_t[:, None] & (row < K)[None, :], other=0.0)
+
+        last_idx = min((i_t + 1) * BT, T) - 1
+
+        if USE_G:
+            b_g_last = tl.load(g + last_idx * HV).to(tl.float32)
+            p_g = g + o_t * HV
+            b_g = tl.load(p_g, mask=m_t, other=0.0).to(tl.float32)
+            b_k = b_k * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
+            b_g_last = exp2(b_g_last)
+            b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
+        elif USE_GK:
+            b_gk_last = tl.load(gk + last_idx * HV * K + row, mask=(row < K), other=0.).to(tl.float32)
+            b_gk_last = exp2(b_gk_last)
+            b_diag = tl.where(row[:, None] == row[None, :], b_gk_last[:, None], 0.0)
+        else:
+            b_diag = tl.where(row[:, None] == row[None, :], 1.0, 0.0)
+
+        b_kw = tl.dot(tl.trans(b_k.to(b_w.dtype)), b_w)
+        if USE_BG:
+            b_m_i = b_diag + b_kw
+        else:
+            b_m_i = b_diag - b_kw
+        # Keep the m chain in fp32: casting m to bf16 every chunk compounds along the chain.
+        b_m = tl.dot(b_m_i.to(tl.float32), b_m.to(tl.float32))
+
+    # Store m result
+    stride_hm_kv = K + V
+    p_m = hm + V + row[:, None] * stride_hm_kv + col[None, :]
+    tl.store(p_m, b_m.to(p_m.dtype.element_ty), mask=(row < K)[:, None] & (col < K)[None, :])
 
 
 def chunk_gated_delta_rule_fwd_h_pre_process(
@@ -780,30 +1545,72 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     else:
         initial_state = k.new_zeros(N, HV, K, V, dtype=torch.float32)
     if not context.is_last_rank:
-        BLOCK_SIZE = 32 if K <= 64 else 64
-        grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
-        # For DPLR, v provides the original v for computing h contributions,
-        # while u remains the WY-processed values (A_ab @ A_ak @ v) for v_new = w @ h + u.
-        pre_process_fwd_kernel_merged[grid](
-            k=k,
-            v=u if v is None else v,
-            w=w,
-            g=g,
-            gk=gk,
-            bg=bg,
-            u=u,
-            hm=hm,
-            cu_seqlens=cu_seqlens[-2:],
-            T=T,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BT=BT,
-            BK1=BK,
-            BLOCK_SIZE=BLOCK_SIZE,
-            MULTI_SEQS=False,
-        )
+        # Split+Decompose: stage1(h) + stage2(m) for verified heads.
+        # g=None: fall back to merged (fp32 dot) to avoid bf16 rounding in m-chain
+        if H in _FWD_SPLIT_HEADS and cu_seqlens is None and g is not None:
+            v_param = u if v is None else v
+            # Stage 1: compute h (K x V portion of hm)
+            def grid_s1(meta): return (triton.cdiv(V, meta['BLOCK_SIZE']), HV)
+            pre_process_fwd_stage1_h[grid_s1](
+                k=k,
+                v=v_param,
+                w=w,
+                g=g,
+                gk=gk,
+                bg=bg,
+                u=u,
+                hm=hm,
+                cu_seqlens=None,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=BT,
+                USE_BG=bg is not None,
+            )
+            # Stage 2: compute m (K x K portion of hm) with decomposition
+            k_param = k if bg is None else bg
+            def grid_s2(meta): return (triton.cdiv(K, meta['BLOCK_SIZE']), HV)
+            pre_process_fwd_stage2_m[grid_s2](
+                k=k_param,
+                w=w,
+                g=g,
+                gk=gk,
+                hm=hm,
+                cu_seqlens=None,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=BT,
+                BK1=BK,
+                USE_BG=bg is not None,
+            )
+        else:
+            def grid(meta): return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), HV)
+            # For DPLR, v provides the original v for computing h contributions,
+            # while u remains the WY-processed values (A_ab @ A_ak @ v) for v_new = w @ h + u.
+            pre_process_fwd_kernel_merged[grid](
+                k=k,
+                v=u if v is None else v,
+                w=w,
+                g=g,
+                gk=gk,
+                bg=bg,
+                u=u,
+                hm=hm,
+                cu_seqlens=cu_seqlens[-2:] if cu_seqlens is not None else None,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=BT,
+                BK1=BK,
+                MULTI_SEQS=False,
+            )
     ag_hm, _ = all_gather_into_tensor(hm, group=context.group)
     if not context.is_first_rank:
         def grid(meta): return (triton.cdiv(V, meta['BV']), HV)
@@ -844,6 +1651,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     initial_state: torch.Tensor | None = None,
     context: FLACPContext | None = None,
     chunk_size: int = 64,
+    _poc_g_head_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if context is None or context.group is None:
         return dht, initial_state
@@ -867,30 +1675,91 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     else:
         dht = q.new_zeros(N, HV, K, V, dtype=torch.float32)
 
+    # POC: head-major g layout —— transpose g from [total_T, HV] to [HV, T_local]
+    g_kernel = g
+    g_head_major = False
+    if _poc_g_head_major and g is not None and not context.is_first_rank:
+        if cu_seqlens is not None:
+            bos_py = cu_seqlens[0].item()
+            eos_py = cu_seqlens[1].item()
+        else:
+            bos_py, eos_py = 0, T
+        g_flat = g.reshape(-1, HV) if g.dim() > 2 else g
+        g_seq = g_flat[bos_py:eos_py]        # [T_local, HV]
+        g_kernel = g_seq.t().contiguous()     # [HV, T_local], contiguous in T
+        g_head_major = True
+
     if not context.is_first_rank:
-        BLOCK_SIZE = 32 if K <= 64 else 64
-        grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
-        pre_process_bwd_kernel_merged[grid](
-            q=q,
-            k=k if bg is None else bg,
-            w=w,
-            g=g,
-            gk=gk,
-            do=do,
-            dhm=dhm,
-            dv=dv,
-            cu_seqlens=cu_seqlens[:2],
-            scale=scale,
-            T=T,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BT=BT,
-            BK1=BK,
-            BLOCK_SIZE=BLOCK_SIZE,
-            USE_BG=bg is not None,
-        )
+        # Split+Decompose: stage1(dh) + stage2(dm) for verified heads.
+        # g=None: fall back to merged (fp32 dot) to avoid bf16 rounding in m-chain
+        if H in _SPLIT_HEADS and cu_seqlens is None and g is not None:
+            k_param = k if bg is None else bg
+            # Stage 1: compute dh (K x V portion of dhm)
+            def grid_s1(meta): return (triton.cdiv(V, meta['BLOCK_SIZE']), HV)
+            pre_process_bwd_stage1_dh[grid_s1](
+                q=q,
+                k=k_param,
+                w=w,
+                g=g_kernel,
+                gk=gk,
+                do=do,
+                dhm=dhm,
+                dv=dv,
+                cu_seqlens=None,
+                scale=scale,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=BT,
+                USE_BG=bg is not None,
+                G_HEAD_MAJOR=g_head_major,
+            )
+            # Stage 2: compute dm (K x K portion of dhm) with decomposition
+            def grid_s2(meta): return (triton.cdiv(K, meta['BLOCK_SIZE']), HV)
+            pre_process_bwd_stage2_dm_v2[grid_s2](
+                k=k_param,
+                w=w,
+                g=g_kernel,
+                gk=gk,
+                dhm=dhm,
+                cu_seqlens=None,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=BT,
+                BK1=BK,
+                USE_BG=bg is not None,
+                G_HEAD_MAJOR=g_head_major,
+            )
+        else:
+            BLOCK_SIZE = 32 if K <= 64 else 64
+            grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
+            pre_process_bwd_kernel_merged[grid](
+                q=q,
+                k=k if bg is None else bg,
+                w=w,
+                g=g_kernel,
+                gk=gk,
+                do=do,
+                dhm=dhm,
+                dv=dv,
+                cu_seqlens=cu_seqlens[:2] if cu_seqlens is not None else None,
+                scale=scale,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=BT,
+                BK1=BK,
+                BLOCK_SIZE=BLOCK_SIZE,
+                USE_BG=bg is not None,
+                G_HEAD_MAJOR=g_head_major,
+            )
 
     ag_dhm, _ = all_gather_into_tensor(dhm, group=context.group)
 
