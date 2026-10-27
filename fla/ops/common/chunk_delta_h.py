@@ -45,7 +45,7 @@ _IS_AIU_ENABLED = IS_PPU and os.environ.get('FLA_PPU_DISABLE_AIU', '0') != '1'
 
 
 def _aiu_enabled_for(*tensors: torch.Tensor) -> bool:
-    """Only the OAM-810E (PPU0010) AIU is limited to 8/16-bit elements, so a wider element
+    """Only the ZW810E AIU is limited to 8/16-bit elements, so a wider element
     dtype (fp32) aborts `ConvertTritonGPUToLLVMPPU` at compile time there; those inputs
     keep the plain tl.load path. The ZW-M890P stages every dtype and keeps the AIU."""
     if _IS_AIU_ENABLED and IS_PPU_810E:
