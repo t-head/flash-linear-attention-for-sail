@@ -25,13 +25,15 @@ Two modes:
               pre-process and the bwd pre-process/merge, validating that
               micro-kernel gains reach the real pipeline.
 
-Two variants per phase (kernel mode, --variants):
+Two variants per phase (--variants, both modes):
   * merged : one kernel covering both the h[K,V] and the m[K,K] part of the
               state. BLOCK_SIZE is a hand-set constant on the pre-split trees
               and an autotuned constexpr once the merged kernel gained
               {BLOCK_SIZE} configs, so the launcher detects which applies.
   * split  : stage1 (h or dh) + stage2 (m or dm) on disjoint write regions,
-              which is what the CP wrapper runs for its enable-listed heads.
+              which is what the CP wrapper runs whenever its gate clears (any
+              head on the ZW810E, once there is enough work in the rank
+              boundary sequence).
               Skipped with a notice on trees that predate the split kernels.
 
 Frozen contract: this is a NEW benchmark only. It does not touch the kernels,
@@ -137,20 +139,34 @@ def _chunked_cumsum_gate(T, HV, device):
     return g
 
 
-def build_kernel_inputs(T, H, dtype, device):
-    """Construct GDN pre-process kernel tensors (H == HV, USE_G=True, no gk/bg)."""
+def build_kernel_inputs(T, H, dtype, device, seq_lens=None):
+    """Construct GDN pre-process kernel tensors (H == HV, USE_G=True, no gk/bg).
+
+    With ``seq_lens`` the tensors hold several sequences and the launches take the same
+    cu_seqlens slice the CP wrapper passes: the last sequence for fwd (its end state is
+    what travels to the next rank) and the first for bwd (its start dht travels back).
+    """
     K = V = HEAD_DIM
     HV = H
     scale = K ** -0.5
     k = torch.randn(T, H, K, device=device, dtype=dtype) * 0.1
     v = torch.randn(T, HV, V, device=device, dtype=dtype) * 0.1
     w = torch.randn(T, HV, K, device=device, dtype=dtype) * 0.1
-    g = _chunked_cumsum_gate(T, HV, device)
+    if seq_lens is None:
+        g = _chunked_cumsum_gate(T, HV, device)
+        cu_fwd = cu_bwd = None
+    else:
+        # each sequence resets its own chunked cumsum, as the wrapper's inputs do
+        g = torch.cat([_chunked_cumsum_gate(length, HV, device) for length in seq_lens], dim=0)
+        cu_all = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
+                              device=device, dtype=torch.long)
+        cu_fwd, cu_bwd = cu_all[-2:], cu_all[:2]
     # backward-only tensors
     q = torch.randn(T, H, K, device=device, dtype=dtype) * 0.1
     do = torch.randn(T, HV, V, device=device, dtype=dtype) * 0.1
     dv = torch.randn(T, HV, V, device=device, dtype=dtype) * 0.1
-    return dict(k=k, v=v, w=w, g=g, q=q, do=do, dv=dv, K=K, V=V, HV=HV, scale=scale)
+    return dict(k=k, v=v, w=w, g=g, q=q, do=do, dv=dv, K=K, V=V, HV=HV, scale=scale,
+                cu_fwd=cu_fwd, cu_bwd=cu_bwd)
 
 
 def _autotuner_attr(kernel, name):
@@ -189,6 +205,7 @@ def make_fwd_launch(inp, T, H, variant="merged"):
     BT = CHUNK
     BK = triton.next_power_of_2(K)
     hm = inp["k"].new_zeros(HV, K, V + K, dtype=torch.float32)
+    cu = inp["cu_fwd"]
 
     if variant == "split":
         stages = _split_stage_kernels("fwd")
@@ -202,11 +219,11 @@ def make_fwd_launch(inp, T, H, variant="merged"):
         def launch():
             stage1[stage1_grid](
                 k=inp["k"], v=inp["v"], w=inp["w"], g=inp["g"], gk=None, bg=None,
-                u=inp["v"], hm=hm, cu_seqlens=None, T=T, H=H, HV=HV, K=K, V=V,
+                u=inp["v"], hm=hm, cu_seqlens=cu, T=T, H=H, HV=HV, K=K, V=V,
                 BT=BT, USE_BG=False,
             )
             stage2[stage2_grid](
-                k=inp["k"], w=inp["w"], g=inp["g"], gk=None, hm=hm, cu_seqlens=None,
+                k=inp["k"], w=inp["w"], g=inp["g"], gk=None, hm=hm, cu_seqlens=cu,
                 T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK1=BK, USE_BG=False,
             )
         return launch, (stage1, stage2), hm
@@ -218,7 +235,7 @@ def make_fwd_launch(inp, T, H, variant="merged"):
         def launch():
             pre_process_fwd_kernel_merged[grid](
                 k=inp["k"], v=inp["v"], w=inp["w"], g=inp["g"], gk=None, bg=None,
-                u=inp["v"], hm=hm, cu_seqlens=None, T=T, H=H, HV=HV, K=K, V=V,
+                u=inp["v"], hm=hm, cu_seqlens=cu, T=T, H=H, HV=HV, K=K, V=V,
                 BT=BT, BK1=BK, MULTI_SEQS=False,
             )
         return launch, pre_process_fwd_kernel_merged, hm
@@ -229,7 +246,7 @@ def make_fwd_launch(inp, T, H, variant="merged"):
     def launch():
         pre_process_fwd_kernel_merged[static_grid](
             k=inp["k"], v=inp["v"], w=inp["w"], g=inp["g"], gk=None, bg=None,
-            u=inp["v"], hm=hm, cu_seqlens=None, T=T, H=H, HV=HV, K=K, V=V,
+            u=inp["v"], hm=hm, cu_seqlens=cu, T=T, H=H, HV=HV, K=K, V=V,
             BT=BT, BLOCK_SIZE=BLOCK_SIZE, BK1=BK, MULTI_SEQS=False,
         )
     return launch, pre_process_fwd_kernel_merged, hm
@@ -241,6 +258,7 @@ def make_bwd_launch(inp, T, H, variant="merged"):
     BT = CHUNK
     BK = triton.next_power_of_2(K)
     dhm = inp["q"].new_zeros(HV, K, V + K, dtype=torch.float32)
+    cu = inp["cu_bwd"]
 
     if variant == "split":
         stages = _split_stage_kernels("bwd")
@@ -254,11 +272,11 @@ def make_bwd_launch(inp, T, H, variant="merged"):
         def launch():
             stage1[stage1_grid](
                 q=inp["q"], k=inp["k"], w=inp["w"], g=inp["g"], gk=None,
-                do=inp["do"], dhm=dhm, dv=inp["dv"], cu_seqlens=None,
+                do=inp["do"], dhm=dhm, dv=inp["dv"], cu_seqlens=cu,
                 scale=inp["scale"], T=T, H=H, HV=HV, K=K, V=V, BT=BT, USE_BG=False,
             )
             stage2[stage2_grid](
-                k=inp["k"], w=inp["w"], g=inp["g"], gk=None, dhm=dhm, cu_seqlens=None,
+                k=inp["k"], w=inp["w"], g=inp["g"], gk=None, dhm=dhm, cu_seqlens=cu,
                 T=T, H=H, HV=HV, K=K, V=V, BT=BT, BK1=BK, USE_BG=False,
             )
         return launch, (stage1, stage2), dhm
@@ -269,7 +287,7 @@ def make_bwd_launch(inp, T, H, variant="merged"):
     def launch():
         pre_process_bwd_kernel_merged[grid](
             q=inp["q"], k=inp["k"], w=inp["w"], g=inp["g"], gk=None,
-            do=inp["do"], dhm=dhm, dv=inp["dv"], cu_seqlens=None,
+            do=inp["do"], dhm=dhm, dv=inp["dv"], cu_seqlens=cu,
             scale=inp["scale"], T=T, H=H, HV=HV, K=K, V=V,
             BT=BT, BLOCK_SIZE=BLOCK_SIZE, BK1=BK, USE_BG=False,
         )
@@ -348,6 +366,13 @@ def time_launch(launch, warmup, repeats, single_launch):
 # ---------------------------------------------------------------------------
 # kernel mode
 # ---------------------------------------------------------------------------
+def _profiles(args):
+    """(total_T, seq_lens) pairs; seq_lens=None keeps the dense single-sequence layout."""
+    if args.varlen_lengths:
+        return [(sum(args.varlen_lengths), args.varlen_lengths)]
+    return [(T, None) for T in args.seq_lens]
+
+
 def run_kernel_mode(args, device, dtype):
     results = []
     phases = []
@@ -356,8 +381,8 @@ def run_kernel_mode(args, device, dtype):
     if args.phase in ("bwd", "both"):
         phases.append("bwd")
     for H in args.heads:
-        for T in args.seq_lens:
-            inp = build_kernel_inputs(T, H, dtype, device)
+        for T, seq_lens in _profiles(args):
+            inp = build_kernel_inputs(T, H, dtype, device, seq_lens)
             for phase in phases:
                 for variant in args.variants:
                     if phase == "fwd":
@@ -377,13 +402,14 @@ def run_kernel_mode(args, device, dtype):
                         "mode": "kernel", "phase": phase, "variant": variant,
                         "H": H, "HV": H,
                         "K": HEAD_DIM, "V": HEAD_DIM, "T": T, "BT": CHUNK,
-                        "dtype": str(dtype),
+                        "dtype": str(dtype), "varlen_lengths": seq_lens,
                         "autotune": winner,
                         "stats": {k: v for k, v in stats.items() if k != "raw"},
                         "raw_ms": stats["raw"],
                     }
                     results.append(rec)
-                    print(f"[kernel] phase={phase:3s} variant={variant:6s} H={H:3d} T={T:6d}  "
+                    layout = f"len_seq={seq_lens[-1] if phase == 'fwd' else seq_lens[0]:5d}" if seq_lens else "dense        "
+                    print(f"[kernel] phase={phase:3s} variant={variant:6s} H={H:3d} T={T:6d} {layout}  "
                           f"median={stats['median']:.4f}ms  ci95=[{stats['ci95_lo']:.4f},{stats['ci95_hi']:.4f}]  "
                           f"min={stats['min']:.4f}  std={stats['std']:.4f}")
     return results
@@ -392,7 +418,18 @@ def run_kernel_mode(args, device, dtype):
 # ---------------------------------------------------------------------------
 # cp-e2e mode (torch.distributed, default CP4)
 # ---------------------------------------------------------------------------
-def _cp_worker(rank, world_size, T_local, H, dtype_str, warmup, repeats, port, ret_path):
+def _select_variant(variant, H):
+    """Pin the CP pre-process gates so one arm of the A/B can be measured."""
+    from fla.ops.cp import chunk_delta_h as ck
+    ck._SPLIT_HEADS = frozenset() if variant == "merged" else frozenset({H})
+    # The split arm also has to clear the work test, otherwise the gate quietly measures
+    # merged again for short boundary segments.
+    ck._SPLIT_MIN_HEAD_TOKENS = 0
+    ck._FWD_SPLIT_HEADS = frozenset()
+
+
+def _cp_worker(rank, world_size, T_local, H, dtype_str, warmup, repeats, port, ret_path,
+               variants=("merged",)):
     import torch.distributed as dist
     import torch.nn.functional as F
     from fla.ops.cp import build_cp_context
@@ -455,35 +492,46 @@ def _cp_worker(rank, world_size, T_local, H, dtype_str, warmup, repeats, port, r
             bwd_ms = mid.elapsed_time(en)
         return fwd_ms, bwd_ms
 
-    for _ in range(warmup):
-        one_iter(False)
-    dist.barrier()
-    torch.cuda.synchronize()
+    def measure_variant(variant):
+        _select_variant(variant, H)
+        for _ in range(warmup):
+            one_iter(False)
+        dist.barrier()
+        torch.cuda.synchronize()
 
-    fwd_samples, bwd_samples = [], []
-    for _ in range(repeats):
-        f, b = one_iter(True)
-        fwd_samples.append(f)
-        bwd_samples.append(b)
-    dist.barrier()
+        fwd_samples, bwd_samples = [], []
+        for _ in range(repeats):
+            f, b = one_iter(True)
+            fwd_samples.append(f)
+            bwd_samples.append(b)
+        dist.barrier()
 
-    fwd_med = _percentile(sorted(fwd_samples), 50)
-    bwd_med = _percentile(sorted(bwd_samples), 50)
-    # gather medians to rank 0 (max latency across ranks is the real cost)
-    gather_f = [torch.zeros(1, device=device) for _ in range(world_size)]
-    gather_b = [torch.zeros(1, device=device) for _ in range(world_size)]
-    dist.all_gather(gather_f, torch.tensor([fwd_med], device=device))
-    dist.all_gather(gather_b, torch.tensor([bwd_med], device=device))
-    if rank == 0:
-        per_rank = []
-        for r in range(world_size):
-            per_rank.append({"rank": r, "fwd_ms": gather_f[r].item(), "bwd_ms": gather_b[r].item()})
-        payload = {
-            "mode": "cp-e2e", "world_size": world_size, "T_local": T_local,
-            "T_global": T_global, "H": H, "D": D, "dtype": dtype_str,
+        fwd_med = _percentile(sorted(fwd_samples), 50)
+        bwd_med = _percentile(sorted(bwd_samples), 50)
+        # gather medians to rank 0 (max latency across ranks is the real cost)
+        gather_f = [torch.zeros(1, device=device) for _ in range(world_size)]
+        gather_b = [torch.zeros(1, device=device) for _ in range(world_size)]
+        dist.all_gather(gather_f, torch.tensor([fwd_med], device=device))
+        dist.all_gather(gather_b, torch.tensor([bwd_med], device=device))
+        per_rank = [
+            {"rank": r, "fwd_ms": gather_f[r].item(), "bwd_ms": gather_b[r].item()}
+            for r in range(world_size)
+        ]
+        return {
             "per_rank": per_rank,
             "max_fwd_ms": max(p["fwd_ms"] for p in per_rank),
             "max_bwd_ms": max(p["bwd_ms"] for p in per_rank),
+            "min_fwd_ms": min(p["fwd_ms"] for p in per_rank),
+            "min_bwd_ms": min(p["bwd_ms"] for p in per_rank),
+        }
+
+    measured = {variant: measure_variant(variant) for variant in variants}
+
+    if rank == 0:
+        payload = {
+            "mode": "cp-e2e", "world_size": world_size, "T_local": T_local,
+            "T_global": T_global, "H": H, "D": D, "dtype": dtype_str,
+            "variants": measured,
             "middle_rank": world_size // 2,
         }
         with open(ret_path, "w") as fh:
@@ -506,7 +554,8 @@ def run_cp_e2e_mode(args, dtype):
             mp.start_processes(
                 _cp_worker,
                 args=(world_size, T, H, str(dtype).replace("torch.", ""),
-                      args.warmup, args.repeats, args.master_port, ret_path),
+                      args.warmup, args.repeats, args.master_port, ret_path,
+                      tuple(args.variants)),
                 nprocs=world_size, join=True, start_method="spawn",
             )
             if os.path.exists(ret_path):
@@ -515,10 +564,16 @@ def run_cp_e2e_mode(args, dtype):
                 os.remove(ret_path)
                 results.append(rec)
                 mr = rec["middle_rank"]
-                pr = rec["per_rank"][mr]
-                print(f"[cp-e2e] CP{world_size} H={H:3d} T_local={T:6d}  "
-                      f"mid-rank{mr} fwd={pr['fwd_ms']:.3f}ms bwd={pr['bwd_ms']:.3f}ms  "
-                      f"max_fwd={rec['max_fwd_ms']:.3f} max_bwd={rec['max_bwd_ms']:.3f}")
+                for variant, m in rec["variants"].items():
+                    pm = m["per_rank"][mr]
+                    print(f"[cp-e2e] CP{world_size} variant={variant:6s} H={H:3d} T_local={T:6d}  "
+                          f"mid-rank{mr} fwd={pm['fwd_ms']:.3f}ms bwd={pm['bwd_ms']:.3f}ms  "
+                          f"max_fwd={m['max_fwd_ms']:.3f} max_bwd={m['max_bwd_ms']:.3f}")
+                merged, split = rec["variants"].get("merged"), rec["variants"].get("split")
+                if merged and split:
+                    print(f"[cp-e2e] ratio H={H:3d} T_local={T:6d}  "
+                          f"fwd split/merged={split['max_fwd_ms'] / merged['max_fwd_ms']:.3f}x  "
+                          f"bwd split/merged={split['max_bwd_ms'] / merged['max_bwd_ms']:.3f}x")
     return results
 
 
@@ -550,9 +605,14 @@ def main():
     p.add_argument("--heads", type=parse_int_list, default=[8, 16, 32, 48, 64, 128])
     p.add_argument("--seq-lens", type=parse_int_list, default=[4096, 8192, 16384],
                    help="LOCAL sequence length T per rank")
+    p.add_argument("--varlen-lengths", type=parse_int_list, default=None,
+                   help="Run the varlen layout: lengths of the sequences this rank holds. "
+                        "The launches then take cu_seqlens[-2:] (fwd) / cu_seqlens[:2] (bwd) "
+                        "exactly like the CP wrapper, and --seq-lens is ignored.")
     p.add_argument("--phase", choices=["fwd", "bwd", "both"], default="both")
     p.add_argument("--variants", type=parse_str_list, default=["merged"],
-                   help="Comma list of merged,split (kernel mode only).")
+                   help="Comma list of merged,split; in cp-e2e mode these are the arms "
+                        "the A/B runs, with the gate pinned to each arm.")
     p.add_argument("--mode", choices=["kernel", "cp-e2e"], default="kernel")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--repeats", type=int, default=100)
