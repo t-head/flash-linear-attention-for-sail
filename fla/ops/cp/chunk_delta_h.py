@@ -16,7 +16,7 @@ import triton.language as tl
 
 from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.op import exp2
-from fla.utils import IS_PPU_810E, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_PPU_810E, IS_PPU_M890, autotune_cache_kwargs, check_shared_mem
 
 if TYPE_CHECKING:
     from fla.ops.cp.context import FLACPContext
@@ -43,11 +43,26 @@ def _prune_fwd_merged_configs(configs, named_args, **kwargs):
 # ZW-M890P, where the narrow list was originally tuned: merged stays more than 4x ahead
 # of split on the heads that lose out, leaving only H=32/128 with a >5% gain (H=8/48
 # regress, H=16/64 merged faster after the stage2 decomposition).
-# ZW810E, measured here with benchmarks/cp/benchmark_gdn_preprocess.py (T=8192/16384,
-# K=V=128, BT=64, bf16): split wins on every benchmarked bwd head, by 5.4%-38.8%.
-_810E_SPLIT_HEADS = frozenset({8, 16, 32, 48, 64, 128})
+# ZW810E: the crossover is a head count, not a work count. Measured with
+# benchmarks/cp/benchmark_gdn_preprocess.py, split wins the bwd pre-process by 1%-16% from
+# H=16 up, while H=4 loses 15%-30% and H=8 loses 1%-15%: below 16 heads the stage grid is
+# too narrow to amortize the second launch, however long the boundary segment is (512 to
+# 16384 tokens, dense and varlen).
+#
+# Neither list transfers to another part: the empty set keeps every non-PPU device on the
+# merged kernel it was tuned for, since nothing here measures split on those boards.
+_810E_SPLIT_HEADS = frozenset({16, 32, 64, 128})
 _M890_SPLIT_HEADS = frozenset({32, 128})
-_SPLIT_HEADS = _810E_SPLIT_HEADS if IS_PPU_810E else _M890_SPLIT_HEADS
+_SPLIT_HEADS = (_810E_SPLIT_HEADS if IS_PPU_810E else
+                _M890_SPLIT_HEADS if IS_PPU_M890 else
+                frozenset())
+
+# Split pays for a second launch with lower register pressure, so it also needs enough work
+# to amortize that launch: the floor is `HV * boundary_seg` head-tokens. Measured end to end
+# in CP2 at H=16/32, split loses up to 8% at 8k-16k head-tokens, breaks even at 32k and wins
+# 3%-5% above it, while the kernel alone crosses over as low as 8k: the launch is what eats
+# the gain. The end-to-end number is what users see, so it sets the floor.
+_SPLIT_MIN_HEAD_TOKENS = 32768
 
 # FWD split path: empty on both boards, the merged kernel is faster for every
 # benchmarked head, so all FWD go merged.
@@ -1545,9 +1560,12 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     else:
         initial_state = k.new_zeros(N, HV, K, V, dtype=torch.float32)
     if not context.is_last_rank:
-        # Split+Decompose: stage1(h) + stage2(m) for verified heads.
-        # g=None: fall back to merged (fp32 dot) to avoid bf16 rounding in m-chain
-        if H in _FWD_SPLIT_HEADS and cu_seqlens is None and g is not None:
+        # Split+Decompose: stage1(h) + stage2(m) where it beats the merged kernel.
+        # g=None: fall back to merged (fp32 dot) to avoid bf16 rounding in m-chain.
+        # The stages take cu_seqlens[-2:] only, mirroring the merged kernel's slicing: the
+        # state carried to the next rank is the one at this rank's end, which is where the
+        # last sequence ends. Both stages index sequence 0, so the slice must stay single.
+        if H in _FWD_SPLIT_HEADS and g is not None:
             v_param = u if v is None else v
             # Stage 1: compute h (K x V portion of hm)
             def grid_s1(meta): return (triton.cdiv(V, meta['BLOCK_SIZE']), HV)
@@ -1560,7 +1578,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
                 bg=bg,
                 u=u,
                 hm=hm,
-                cu_seqlens=None,
+                cu_seqlens=cu_seqlens[-2:] if cu_seqlens is not None else None,
                 T=T,
                 H=H,
                 HV=HV,
@@ -1578,7 +1596,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
                 g=g,
                 gk=gk,
                 hm=hm,
-                cu_seqlens=None,
+                cu_seqlens=cu_seqlens[-2:] if cu_seqlens is not None else None,
                 T=T,
                 H=H,
                 HV=HV,
@@ -1633,6 +1651,21 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
             STATE_V_FIRST=state_v_first,
         )
     return initial_state
+
+
+def _bwd_split_worth_it(HV: int, context: FLACPContext) -> bool:
+    """Whether the split backward pre-process is the faster choice for this rank.
+
+    The stages parallelize over value heads, so `HV` times the length of this rank's first
+    local sequence (all `dht` covers) is the work available to amortize the second launch.
+    The context's CPU copy of `cu_seqlens` is read so the gate stays off the device sync path.
+    """
+    if _SPLIT_HEADS is not None and HV not in _SPLIT_HEADS:
+        return False
+    cu_seqlens_cpu = context.cu_seqlens_cpu
+    if cu_seqlens_cpu is None:
+        return True
+    return HV * int(cu_seqlens_cpu[1] - cu_seqlens_cpu[0]) >= _SPLIT_MIN_HEAD_TOKENS
 
 
 def chunk_gated_delta_rule_bwd_dhu_pre_process(
@@ -1690,9 +1723,13 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
         g_head_major = True
 
     if not context.is_first_rank:
-        # Split+Decompose: stage1(dh) + stage2(dm) for verified heads.
-        # g=None: fall back to merged (fp32 dot) to avoid bf16 rounding in m-chain
-        if H in _SPLIT_HEADS and cu_seqlens is None and g is not None:
+        # Split+Decompose: stage1(dh) + stage2(dm) where it beats the merged kernel.
+        # g=None: fall back to merged (fp32 dot) to avoid bf16 rounding in m-chain.
+        # The stages take cu_seqlens[:2] only, mirroring the merged kernel's slicing: the
+        # dht carried back to the previous rank is the one at this rank's start, which is
+        # where the first sequence starts. Both stages index sequence 0, so the slice must
+        # stay single.
+        if _bwd_split_worth_it(HV, context) and g is not None:
             k_param = k if bg is None else bg
             # Stage 1: compute dh (K x V portion of dhm)
             def grid_s1(meta): return (triton.cdiv(V, meta['BLOCK_SIZE']), HV)
@@ -1705,7 +1742,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
                 do=do,
                 dhm=dhm,
                 dv=dv,
-                cu_seqlens=None,
+                cu_seqlens=cu_seqlens[:2] if cu_seqlens is not None else None,
                 scale=scale,
                 T=T,
                 H=H,
@@ -1724,7 +1761,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
                 g=g_kernel,
                 gk=gk,
                 dhm=dhm,
-                cu_seqlens=None,
+                cu_seqlens=cu_seqlens[:2] if cu_seqlens is not None else None,
                 T=T,
                 H=H,
                 HV=HV,
