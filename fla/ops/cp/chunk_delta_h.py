@@ -641,6 +641,10 @@ def pre_process_bwd_kernel_merged(
         dv += ((bos * HV + i_h) * V).to(tl.int64)
         stride_v = HV * V
         i_v = i_col
+        # `b_q = b_q * b_g_exp` promotes b_q to fp32, so `b_q.to(b_q.dtype)` below is a
+        # no-op and the q^T@do dot runs on the fp32/TF32 path.  Pin the dot inputs to the
+        # tensor dtype, as pre_process_bwd_stage1_dh already does.
+        in_dtype = w.dtype.element_ty
 
         # Initialize dh accumulators
         b_dh1 = tl.zeros([64, BLOCK_SIZE], dtype=tl.float32)
@@ -728,9 +732,9 @@ def pre_process_bwd_kernel_merged(
                 b_dh1 *= exp2(b_gk_last1[:, None])
             if USE_BG:
                 # DPLR mode: dh += q^T @ do + w^T @ dv2 (no scale)
-                b_dh1 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) + tl.dot(b_w, b_dv.to(b_w.dtype))
+                b_dh1 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) + tl.dot(b_w, b_dv.to(b_w.dtype))
             else:
-                b_dh1 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
+                b_dh1 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
 
             if K > 64:
                 p_q = q + o_k2[:, None] + o_t[None, :] * stride_qk
@@ -743,9 +747,9 @@ def pre_process_bwd_kernel_merged(
                 if USE_GK:
                     b_dh2 *= exp2(b_gk_last2[:, None])
                 if USE_BG:
-                    b_dh2 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) + tl.dot(b_w, b_dv.to(b_w.dtype))
+                    b_dh2 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) + tl.dot(b_w, b_dv.to(b_w.dtype))
                 else:
-                    b_dh2 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
+                    b_dh2 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
 
             if K > 128:
                 p_q = q + o_k3[:, None] + o_t[None, :] * stride_qk
@@ -758,9 +762,9 @@ def pre_process_bwd_kernel_merged(
                 if USE_GK:
                     b_dh3 *= exp2(b_gk_last3[:, None])
                 if USE_BG:
-                    b_dh3 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) + tl.dot(b_w, b_dv.to(b_w.dtype))
+                    b_dh3 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) + tl.dot(b_w, b_dv.to(b_w.dtype))
                 else:
-                    b_dh3 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
+                    b_dh3 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
 
             if K > 192:
                 p_q = q + o_k4[:, None] + o_t[None, :] * stride_qk
@@ -773,9 +777,9 @@ def pre_process_bwd_kernel_merged(
                 if USE_GK:
                     b_dh4 *= exp2(b_gk_last4[:, None])
                 if USE_BG:
-                    b_dh4 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) + tl.dot(b_w, b_dv.to(b_w.dtype))
+                    b_dh4 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) + tl.dot(b_w, b_dv.to(b_w.dtype))
                 else:
-                    b_dh4 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
+                    b_dh4 += tl.dot(b_q.to(in_dtype), b_do.to(in_dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
 
         # Store dh results
         p_dh1 = dhm + o_k1[:, None] * (V + K) + o_vb[None, :]
