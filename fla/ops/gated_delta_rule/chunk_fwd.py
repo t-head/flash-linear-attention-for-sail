@@ -331,6 +331,23 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     tl.store(p_A32, b_Ai32.to(A.dtype.element_ty), mask=m_A32)
     tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), mask=m_A33)
 
+    # The six upper-triangular blocks are exactly zero ((I+A)^{-1} of a lower-triangular
+    # A is lower triangular). Writing them here lets the caller allocate A with
+    # torch.empty instead of paying a separate full-tensor zero fill.
+    b_zero = tl.zeros([BC, BC], dtype=A.dtype.element_ty)
+    p_A01 = A + (i_tc0 + o_i)[:, None] * (HV*BT) + (BC + o_i)[None, :]
+    p_A02 = A + (i_tc0 + o_i)[:, None] * (HV*BT) + (2*BC + o_i)[None, :]
+    p_A03 = A + (i_tc0 + o_i)[:, None] * (HV*BT) + (3*BC + o_i)[None, :]
+    p_A12 = A + (i_tc1 + o_i)[:, None] * (HV*BT) + (2*BC + o_i)[None, :]
+    p_A13 = A + (i_tc1 + o_i)[:, None] * (HV*BT) + (3*BC + o_i)[None, :]
+    p_A23 = A + (i_tc2 + o_i)[:, None] * (HV*BT) + (3*BC + o_i)[None, :]
+    tl.store(p_A01, b_zero, mask=m_tc0[:, None])
+    tl.store(p_A02, b_zero, mask=m_tc0[:, None])
+    tl.store(p_A03, b_zero, mask=m_tc0[:, None])
+    tl.store(p_A12, b_zero, mask=m_tc1[:, None])
+    tl.store(p_A13, b_zero, mask=m_tc1[:, None])
+    tl.store(p_A23, b_zero, mask=m_tc2[:, None])
+
 
 @dispatch('gated_delta_rule')
 def chunk_gated_delta_rule_fwd_intra(
@@ -383,7 +400,7 @@ def chunk_gated_delta_rule_fwd_intra(
         # Step 1: fused kkt + solve_tril
         BC = 16
         NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-        A = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
+        A = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
         chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * HV)](
             k=k,
             g=g,
