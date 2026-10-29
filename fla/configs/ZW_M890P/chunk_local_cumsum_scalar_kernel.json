@@ -1,0 +1,37 @@
+{
+  "kernel_name": "chunk_local_cumsum_scalar_kernel",
+  "triton_version": "3.6.0",
+  "default_config": {
+    "kwargs": {},
+    "num_warps": 2,
+    "num_ctas": 1,
+    "num_stages": 3
+  },
+  "autotune_entries": {
+    "aa56d2ae57077b18e94cb2c216e2d8ab": {
+      "autotune_key": [
+        1,
+        96,
+        64,
+        false,
+        false,
+        "torch.float32",
+        "torch.float32"
+      ],
+      "config": {
+        "kwargs": {},
+        "num_warps": 2,
+        "num_ctas": 1,
+        "num_stages": 3,
+        "maxnreg": null,
+        "pre_hook": null,
+        "ir_override": null
+      },
+      "best_timing": [
+        0.04114999994635582,
+        0.04092999920248985,
+        0.041370000690221786
+      ]
+    }
+  }
+}
