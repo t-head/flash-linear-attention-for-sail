@@ -56,9 +56,10 @@ def _tril_inverse_neumann(b_A, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
 })
 @fla_cache_autotune(
     configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
+        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128]
+        for num_warps in [1, 2]
+        for num_stages in [2, 3, 4]
     ],
     key=['H', 'HV', 'K', 'BC'],
     **autotune_cache_kwargs,
