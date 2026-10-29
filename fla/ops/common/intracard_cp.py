@@ -263,11 +263,13 @@ def intracard_pre_scan(
 ):
     H, K, V, HV = kg.shape[2], kg.shape[3], u.shape[3], u.shape[2]
     BK = triton.next_power_of_2(K)
-    BLOCK_SIZE = 32 if K <= 64 else 64
 
     hm = kg.new_empty(S_split, HV, K, V + K, dtype=torch.float32)
 
-    grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV, S_split)
+    # BLOCK_SIZE is an autotuned constexpr of the merged pre-process kernel, so
+    # the grid has to be derived from the selected config instead of a fixed one.
+    def grid(meta):
+        return (triton.cdiv(V, meta['BLOCK_SIZE']) + triton.cdiv(K, meta['BLOCK_SIZE']), HV, S_split)
     pre_process_fwd_kernel_merged[grid](
         k=kg,
         v=u,
@@ -284,7 +286,6 @@ def intracard_pre_scan(
         K=K,
         V=V,
         BT=chunk_size,
-        BLOCK_SIZE=BLOCK_SIZE,
         BK1=BK,
         MULTI_SEQS=True,
     )
