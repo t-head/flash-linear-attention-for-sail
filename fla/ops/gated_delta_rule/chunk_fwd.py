@@ -22,6 +22,33 @@ if IS_TF32_SUPPORTED:
 else:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('ieee')
 
+# The diagonal-block inverse is the base of every later term, and its rounding error
+# is amplified by each doubling level. Plain tf32 there costs ~1e-2 on the solved
+# matrix; tf32x3 (3-pass) matches fp32 to ~1e-7 for a third of the fp32 FMA cost.
+SOLVE_TRIL_DIAG_PRECISION = tl.constexpr('tf32x3' if IS_TF32_SUPPORTED else 'ieee')
+
+
+@triton.jit
+def _tril_inverse_neumann(b_A, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
+    """(I + A)^-1 for strictly-lower-triangular A, by nilpotent doubling.
+
+    A^BC == 0, so (I + A)^-1 = sum_k (-A)^k = prod_j (I + N^(2^j)), N = -A,
+    with log2(BC) factors. Every step is a [BC, BC] matmul, so the whole
+    inversion runs on tensor cores instead of BC-2 serial row eliminations.
+    """
+    b_N = -b_A
+    b_P = b_N + m_I
+    b_N2 = tl.dot(b_N, b_N, input_precision=PRECISION)
+    b_P = b_P + tl.dot(b_P, b_N2, input_precision=PRECISION)
+    if BC > 4:
+        b_N4 = tl.dot(b_N2, b_N2, input_precision=PRECISION)
+        b_P = b_P + tl.dot(b_P, b_N4, input_precision=PRECISION)
+    if BC > 8:
+        b_N8 = tl.dot(b_N4, b_N4, input_precision=PRECISION)
+        b_P = b_P + tl.dot(b_P, b_N8, input_precision=PRECISION)
+    return b_P
+
+
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
@@ -63,7 +90,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     Steps:
     1. Compute all 10 lower-triangular [BC, BC] blocks of beta * K @ K^T in registers
     2. Apply gate and beta scaling
-    3. Forward substitution on diagonal blocks
+    3. Invert the diagonal blocks by nilpotent doubling (all matmul)
     4. Block merge to get full (I+A)^{-1}
     5. Write result to A (output)
     """
@@ -177,7 +204,6 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     # m_tc: boundary mask to prevent NaN from 0 * inf (IEEE 754) when
     #   out-of-bounds g loads as 0 via boundary_check and exp2(0 - g_inbounds) overflows
     m_d = o_i[:, None] > o_i[None, :]
-    m_I = o_i[:, None] == o_i[None, :]
 
     if USE_G:
         b_A00 *= tl.where(m_d & m_tc0[:, None] & m_tc0[None, :], exp2(b_g0[:, None] - b_g0[None, :]), 0.)
@@ -212,43 +238,20 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     b_A32 = b_A32 * b_b3[:, None]
 
     ############################################################################
-    # Step 3: forward substitution on diagonal blocks -> (I + A_diag)^{-1}
+    # Step 3: invert the diagonal blocks -> (I + A_diag)^{-1}
     #
-    # Same algorithm as solve_tril, but rows are extracted from in-register
-    # [BC, BC] tensor via tl.sum(tl.where(mask, tensor, 0), 0) instead of
-    # tl.load from HBM.
+    # Nilpotent doubling: A_diag^BC == 0, so the inverse is the finite series
+    # sum_k (-A_diag)^k, evaluated as log2(BC) matmul factors. Rows past T are
+    # zero, which makes their inverse rows the identity, so the partial-chunk
+    # case needs no extra handling.
     ############################################################################
 
-    b_Ai00 = -b_A00
-    b_Ai11 = -b_A11
-    b_Ai22 = -b_A22
-    b_Ai33 = -b_A33
+    m_I = o_i[:, None] == o_i[None, :]
 
-    for i in range(2, min(BC, T - i_tc0)):
-        b_a00 = tl.sum(tl.where((o_i == i)[:, None], -b_A00, 0.), 0)
-        b_a00 = tl.where(o_i < i, b_a00, 0.)
-        b_a00 = b_a00 + tl.sum(b_a00[:, None] * b_Ai00, 0)
-        b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
-    for i in range(2, min(BC, T - i_tc1)):
-        b_a11 = tl.sum(tl.where((o_i == i)[:, None], -b_A11, 0.), 0)
-        b_a11 = tl.where(o_i < i, b_a11, 0.)
-        b_a11 = b_a11 + tl.sum(b_a11[:, None] * b_Ai11, 0)
-        b_Ai11 = tl.where((o_i == i)[:, None], b_a11, b_Ai11)
-    for i in range(2, min(BC, T - i_tc2)):
-        b_a22 = tl.sum(tl.where((o_i == i)[:, None], -b_A22, 0.), 0)
-        b_a22 = tl.where(o_i < i, b_a22, 0.)
-        b_a22 = b_a22 + tl.sum(b_a22[:, None] * b_Ai22, 0)
-        b_Ai22 = tl.where((o_i == i)[:, None], b_a22, b_Ai22)
-    for i in range(2, min(BC, T - i_tc3)):
-        b_a33 = tl.sum(tl.where((o_i == i)[:, None], -b_A33, 0.), 0)
-        b_a33 = tl.where(o_i < i, b_a33, 0.)
-        b_a33 = b_a33 + tl.sum(b_a33[:, None] * b_Ai33, 0)
-        b_Ai33 = tl.where((o_i == i)[:, None], b_a33, b_Ai33)
-
-    b_Ai00 += m_I
-    b_Ai11 += m_I
-    b_Ai22 += m_I
-    b_Ai33 += m_I
+    b_Ai00 = _tril_inverse_neumann(b_A00, m_I, BC, SOLVE_TRIL_DIAG_PRECISION)
+    b_Ai11 = _tril_inverse_neumann(b_A11, m_I, BC, SOLVE_TRIL_DIAG_PRECISION)
+    b_Ai22 = _tril_inverse_neumann(b_A22, m_I, BC, SOLVE_TRIL_DIAG_PRECISION)
+    b_Ai33 = _tril_inverse_neumann(b_A33, m_I, BC, SOLVE_TRIL_DIAG_PRECISION)
 
     ############################################################################
     # Step 4: block merge -> full (I + A)^{-1}
