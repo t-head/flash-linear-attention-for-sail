@@ -19,9 +19,8 @@ from fla.utils import (
     check_shared_mem,
 )
 
-# Curated PPU set rather than the full BV x warps x stages grid: a 24-config space costs
-# ~6x the first-call tuning time for no measured win, and these five cover every winner
-# observed on the GDN shapes (K in {64, 128, 256}, V in {64, 128, 256}).
+# Curated PPU set: the full 24-config space costs ~6x first-call tuning for no measured
+# win, and these five cover every winner seen (K in {64, 128, 256}, V in {64, 128, 256}).
 _HO_PPU_CONFIGS = [
     ({'BV': 32}, 4, 2),
     ({'BV': 32}, 8, 2),
@@ -53,8 +52,8 @@ USE_AIU = tl.constexpr(_IS_AIU_ENABLED)
         triton.Config(kwargs, num_warps=num_warps, num_stages=num_stages)
         for kwargs, num_warps, num_stages in (_HO_PPU_CONFIGS if IS_PPU else _HO_GENERIC_CONFIGS)
     ],
-    # T is part of the key: this kernel walks all chunks of a sequence serially, so the
-    # best BV/warps/stages trade-off depends on the per-sequence chunk count.
+    # T is in the key: the kernel walks chunks serially, so the best config depends on the
+    # per-sequence chunk count.
     key=['H', 'HV', 'K', 'V', 'BT', 'T'],
     **autotune_cache_kwargs,
 )
