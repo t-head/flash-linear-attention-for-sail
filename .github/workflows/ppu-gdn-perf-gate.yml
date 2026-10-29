@@ -20,6 +20,8 @@ name: ppu-gdn-perf-gate
 #   refactor(...) / [refactor]  - blocking; same rule, no regression allowed
 # The title, any commit subject, or a label can carry the declaration. A plain
 # fix is advisory: it may cost speed, and the number still lands on the record.
+# The report is published as one PR comment per board (rewritten in place) and
+# kept as a job artifact; only the comment is readable without a login.
 #
 # A declaration does not by itself put a PR on the boards. It names a perf or
 # refactor change, and the diff then has to land on code this gate measures:
@@ -70,8 +72,10 @@ on:
 
 permissions:
   contents: read
-  # the fork guard reads the PR's reviews and the reviewer's repo permission
-  pull-requests: read
+  # write: the verdict is posted as one PR comment per board, because the job
+  # summary and the artifact both need a login; read is all the fork guard
+  # needs for the PR's reviews and the reviewer's repo permission.
+  pull-requests: write
 
 concurrency:
   group: ppu-gdn-gate-${{ github.event.pull_request.number || github.ref }}
@@ -775,6 +779,119 @@ jobs:
           fi
           python3 .github/workflows/scripts/perf-gate/verdict.py \
             "$SRC.gate.json" "$BLOCK"
+
+      # The report lives in the job summary and the artifact, both of which need
+      # a login, so a reader of the PR only sees a check. Post the same gate.md
+      # as one comment per board, rewritten on every run instead of piling up
+      # stale ones, and put the headline numbers on the checks page: a green
+      # blocking run has no failing point to annotate, and without this it looks
+      # like the gate produced nothing.
+      - name: Publish verdict
+        if: always() && steps.scope.outputs.run == 'true'
+        shell: bash
+        env:
+          BOARD: ${{ matrix.runner }}
+          TIER: ${{ steps.scope.outputs.tier }}
+          BLOCK: ${{ steps.scope.outputs.block }}
+          POLICY: ${{ steps.scope.outputs.policy }}
+          ARTIFACT: ppu-gdn-gate-${{ steps.scope.outputs.tier }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ ! -f "$NAS_OUT/gate.json" ] || [ ! -f "$NAS_OUT/gate.md" ]; then
+            echo "::notice::$BOARD published no gate.md; nothing to report"
+            exit 0
+          fi
+          python3 - <<'PY' || true
+          import json, os, urllib.error, urllib.request
+
+          nas = os.environ["NAS_OUT"]
+          board = os.environ["BOARD"]
+          tier = os.environ.get("TIER", "")
+
+          with open(os.path.join(nas, "gate.json")) as fh:
+              gate = json.load(fh)
+          with open(os.path.join(nas, "gate.md")) as fh:
+              report = fh.read()
+
+          verdict = (gate.get("verdict") or "unknown").upper()
+          pooled = gate.get("pooled") or {}
+          gain = gate.get("kernel_gain") or {}
+          best = gain.get("best") or {}
+
+          # A blocking run annotates only what regressed, so a pass is silent;
+          # the notice is what carries the numbers to the checks page. Advisory
+          # runs already print their own line in "Report advisory result".
+          if os.environ.get("BLOCK") == "true":
+              pooled_s = ", ".join("%s %.3fx" % kv for kv in pooled.items())
+              best_s = ("%s %s %.3fx" % (best.get("kernel"), best.get("phase"),
+                                         best.get("speedup", 0.0))
+                        if best else "none")
+              print("::notice::gate %s on %s (%s tier): pooled %s | best kernel %s | "
+                    "%d phase, %d kernel regression(s)"
+                    % (verdict, board, tier, pooled_s, best_s,
+                       len(gate.get("failing") or []),
+                       len(gain.get("regressions") or [])))
+
+          # One marker per board: the next run of this board patches its own
+          # comment, a push adds a verdict instead of a wall of old reports.
+          marker = "<!-- ppu-gdn-gate:%s -->" % board
+          body = ("%s\n%s\n\n" % (marker, report.rstrip())
+                  + "- board `%s`, tier `%s`, policy `%s`, verdict `%s`\n"
+                    % (board, tier, os.environ.get("POLICY", ""), verdict)
+                  + "- artifact `%s` (gate.md, tables.md, gate.json, campaign.log)\n"
+                    % os.environ["ARTIFACT"]
+                  + "- run %s\n" % os.environ["RUN_URL"])
+          if len(body) > 60000:
+              body = body[:60000] + "\n\n(truncated; the artifact holds the full report)\n"
+
+          token = os.environ.get("GH_TOKEN") or ""
+          num = os.environ.get("PR_NUM") or ""
+          if not token or not num:
+              print("::notice::no pull request here; the report stays in the job summary")
+              raise SystemExit(0)
+
+          api = "https://api.github.com/repos/" + os.environ["REPO"]
+          headers = {"Authorization": "Bearer " + token,
+                     "Accept": "application/vnd.github+json",
+                     "User-Agent": "ppu-gdn-perf-gate"}
+          payload = json.dumps({"body": body}).encode()
+
+
+          def call(url, data=None, method=None):
+              req = urllib.request.Request(url, data=data, headers=headers,
+                                           method=method)
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+
+          try:
+              found, page = 0, 1
+              while True:
+                  batch = call("%s/issues/%s/comments?per_page=100&page=%d"
+                               % (api, num, page))
+                  for item in batch:
+                      if marker in (item.get("body") or ""):
+                          found = item["id"]
+                  if len(batch) < 100:
+                      break
+                  page += 1
+              if found:
+                  call("%s/issues/comments/%s" % (api, found), payload, "PATCH")
+                  print("::notice::updated the gate comment on PR #%s (%s)" % (num, board))
+              else:
+                  call("%s/issues/%s/comments" % (api, num), payload, "POST")
+                  print("::notice::posted the gate report to PR #%s (%s)" % (num, board))
+          except urllib.error.HTTPError as exc:
+              # A fork run carries a read-only token; the summary still has it.
+              print("::warning::cannot comment on PR #%s: HTTP %d; the report stays "
+                    "in the job summary and the artifact" % (num, exc.code))
+          except (urllib.error.URLError, ValueError) as exc:
+              print("::warning::cannot comment on PR #%s: %s" % (num, exc))
+          PY
 
       - name: Job summary
         if: always() && steps.scope.outputs.run == 'true'
