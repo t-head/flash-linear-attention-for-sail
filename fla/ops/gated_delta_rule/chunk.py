@@ -5,6 +5,7 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
 import warnings
 
 import torch
@@ -12,6 +13,7 @@ import torch
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.backends import dispatch
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from fla.ops.common.chunk_h_o import chunk_gated_delta_rule_fwd_h_o
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from fla.ops.common.gate import fused_beta_sigmoid, fused_beta_sigmoid_bwd
 from fla.ops.cp import FLACPContext
@@ -92,34 +94,61 @@ def chunk_gated_delta_rule_fwd(
             chunk_size=chunk_size,
         )
 
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        state_v_first=state_v_first,
-        chunk_size=chunk_size,
+    # h and v_new are fwd-internal only (bwd recomputes both), so the two kernels can be
+    # fused when nothing else needs the intermediate tensors. FLA_PPU_DISABLE_FUSED_HO=1
+    # restores the two-kernel path for A/B timing. K > 128 stays unfused: four 64-row
+    # state tiles plus the four k tiles held for the state update no longer fit, and the
+    # fused kernel measures ~4% slower than the pair at K=256.
+    use_fused_ho = (
+        g is not None
+        and not state_v_first
+        and cp_context is None
+        and k.shape[-1] <= 128
+        and os.environ.get('FLA_PPU_DISABLE_FUSED_HO', '0') != '1'
     )
 
-    if cp_context is not None:
-        initial_state = compress_h0(initial_state, context=cp_context)
+    if use_fused_ho:
+        o, final_state = chunk_gated_delta_rule_fwd_h_o(
+            q=q,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+        )
+    else:
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            state_v_first=state_v_first,
+            chunk_size=chunk_size,
+        )
 
-    o = chunk_fwd_o(
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        state_v_first=state_v_first,
-        chunk_size=chunk_size,
-    )
+        if cp_context is not None:
+            initial_state = compress_h0(initial_state, context=cp_context)
+
+        o = chunk_fwd_o(
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            state_v_first=state_v_first,
+            chunk_size=chunk_size,
+        )
     return g, o, A, final_state, initial_state, g_input
 
 
