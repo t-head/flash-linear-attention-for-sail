@@ -1,0 +1,49 @@
+{
+  "kernel_name": "recompute_w_u_fwd_kernel",
+  "triton_version": "3.6.0",
+  "default_config": {
+    "kwargs": {
+      "BK": 64,
+      "BV": 64
+    },
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3
+  },
+  "autotune_entries": {
+    "9b12f4688a0905da77e89594b9fe3f31": {
+      "autotune_key": [
+        96,
+        96,
+        128,
+        128,
+        64,
+        false,
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.bfloat16",
+        "torch.float32"
+      ],
+      "config": {
+        "kwargs": {
+          "BK": 64,
+          "BV": 64
+        },
+        "num_warps": 4,
+        "num_ctas": 1,
+        "num_stages": 3,
+        "maxnreg": null,
+        "pre_hook": null,
+        "ir_override": null
+      },
+      "best_timing": [
+        0.5161750018596649,
+        0.5151960015296936,
+        0.5171180129051208
+      ]
+    }
+  }
+}
