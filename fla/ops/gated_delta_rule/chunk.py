@@ -32,6 +32,24 @@ from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 
+def fused_ho_pays_off(k, v, cu_seqlens, chunk_size=64):
+    # The fused kernel keeps fwd_h's grid (cdiv(V, BV), N*HV) and walks the chunk axis
+    # inside each CTA, so it gives up chunk_o's NT-way parallelism and only pays back
+    # where the h tensor it no longer writes and reads back is large, i.e. B*NT*HV*K*V
+    # elements: the win grows with the chunk count, not with the token count.
+    # Frontier calibrated on ZW_M890P over 35 shapes (H 4..256, B 1..8, T 2k..32k,
+    # D 64/128, MHA and GQA), best config against best config, +-0.5% noise, BV=64.
+    # Nothing inside it lost more than 0.5%; outside it the pair wins by up to 18%.
+    if cu_seqlens is not None:  # packing was not in the sweep, keep the old default
+        return True
+    NT = -(-v.shape[1] // chunk_size)
+    grid = k.shape[0] * v.shape[2] * (-(-v.shape[-1] // 64))
+    return (NT >= 256
+            or (NT >= 160 and grid >= 192)
+            or (NT >= 128 and grid >= 384)
+            or (NT >= 64 and grid >= 512))
+
+
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -95,15 +113,15 @@ def chunk_gated_delta_rule_fwd(
         )
 
     # h and v_new are fwd-internal only (bwd recomputes both), so the two kernels can be
-    # fused when nothing else needs the intermediate tensors. FLA_PPU_DISABLE_FUSED_HO=1
-    # restores the two-kernel path for A/B timing. K > 128 stays unfused: four 64-row
-    # state tiles plus the four k tiles held for the state update no longer fit, and the
-    # fused kernel measures ~4% slower than the pair at K=256.
+    # fused when nothing else needs the intermediate tensors. K > 128 stays unfused: four
+    # 64-row state tiles plus the four k tiles held for the state update no longer fit,
+    # and the fused kernel measures ~4% slower than the pair at K=256.
     use_fused_ho = (
         g is not None
         and not state_v_first
         and cp_context is None
         and k.shape[-1] <= 128
+        and fused_ho_pays_off(k, v, cu_seqlens, chunk_size=chunk_size)
         and os.environ.get('FLA_PPU_DISABLE_FUSED_HO', '0') != '1'
     )
 
