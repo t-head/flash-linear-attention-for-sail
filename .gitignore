@@ -6,6 +6,8 @@ data
 
 # bash scripts
 *.sh
+# CI entry points are part of the repo, not local scratch scripts
+!.github/workflows/scripts/perf-gate/ci_perf_gate.sh
 
 # docs
 docs/_build

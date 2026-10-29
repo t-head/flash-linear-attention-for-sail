@@ -6,7 +6,7 @@ on:
       matrix:
         required: false
         type: string
-        default: '["ZW-M890P", "OAM-810E"]'
+        default: '["ZW-M890P", "ZW-810E"]'
       # Base branch of the pull request, stated by the caller. The suite is
       # GDN-scoped, so it has to know what to diff against, and an input keeps
       # that a visible contract in the caller's `with:` block instead of relying
@@ -55,9 +55,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "OAM-810E"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -104,7 +104,7 @@ jobs:
       - name: Build and Test on PPU
         id: ppu-test
         if: steps.scope.outputs.run == 'true'
-        uses: t-head/ppu-scheduler-action@main
+        uses: t-head/ci-infra/cluster-run@main
         with:
           image: ${{ env.SAIL_IMAGE }}
           nnodes: 0
@@ -113,8 +113,8 @@ jobs:
           namespace: ppu-sched
           timeout_minutes: 300
           container_options: |
-            cpus: "${{ matrix.runner == 'OAM-810E' && '11' || '31' }}"
-            memory: "${{ matrix.runner == 'OAM-810E' && '112Gi' || '256Gi' }}"
+            cpus: "${{ matrix.runner == 'ZW-810E' && '11' || '31' }}"
+            memory: "${{ matrix.runner == 'ZW-810E' && '112Gi' || '256Gi' }}"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -125,7 +125,7 @@ jobs:
 
             # PPU SDK and torch are pre-installed in the docker image.
             source /usr/local/PPU_SDK/envsetup.sh
-            export MAX_JOBS=${{ matrix.runner == 'OAM-810E' && '11' || '31' }}
+            export MAX_JOBS=${{ matrix.runner == 'ZW-810E' && '11' || '31' }}
             export OMP_NUM_THREADS=1
             export MKL_NUM_THREADS=1
             # This suite exports no FLA_CI_ENV, so test_gdn_qwen.py cannot infer a CI scope on

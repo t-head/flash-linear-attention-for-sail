@@ -1,0 +1,805 @@
+name: ppu-gdn-perf-gate
+
+# GDN performance gate: PR head vs merge-base(target), per-kernel cold caches,
+# median over paired sweeps.
+#   exit 0 = PASS / exit 2 = regression or shortfall / exit 3 = infra problem
+#
+# Tiers follow the declaration. A perf or refactor claim is judged on the full
+# grid -- four head counts at T=16384 -- because that claim is the reason the
+# gate exists and one (H,T) point cannot carry a blocking verdict. Every other
+# change runs the fast grid (H=32, T=16384) once and gets the report without a
+# block. The `perf-full` label, a [perf-full] subject, or the dispatch input can
+# still ask for the full grid on an undeclared run.
+#
+# Verdict: the report is produced for every GDN change. The check only fails
+# when the PR declares what it is:
+#   perf(...) / [perf]          - blocking; every kernel has to hold its own
+#                                 speed. No gain is demanded: a PR that keeps
+#                                 the kernels where they were is a pass, and the
+#                                 numbers still land on the record
+#   refactor(...) / [refactor]  - blocking; same rule, no regression allowed
+# The title, any commit subject, or a label can carry the declaration. A plain
+# fix is advisory: it may cost speed, and the number still lands on the record.
+#
+# A declaration does not by itself put a PR on the boards. It names a perf or
+# refactor change, and the diff then has to land on code this gate measures:
+# that second check is what keeps a `perf` label added to a KDA change from
+# being scored against GDN numbers it cannot move. A declaration that names
+# another kernel (perf(kda):) is not a claim here at all. A declared change
+# that only touches a shared module GDN reads (a norm, a rotary, a short conv)
+# does run, which is the case the declaration exists for.
+#
+# Note: GitHub evaluates pull_request workflows from the base branch, so this
+# file must land on the release branch (vX.Y.Z) before it can run on PRs; use
+# workflow_dispatch to validate before that. Keep PERF_TOL=0.05 for two weeks
+# before making the check required.
+#
+# Untrusted heads: a pull request from a fork runs its own benchmark script and
+# fla tree on our boards, with write access to the shared NAS. GitHub also runs
+# this workflow file from the PR itself, so a fork head is only admitted when it
+# leaves .github/workflows untouched -- an edited guard cannot vouch for itself
+# -- and when a reviewer with write access approved this exact head. Approvals
+# are read from the whole review list, not just the triggering event, so a
+# comment-only review cannot revoke a standing one. Same-repo heads are trusted
+# and run as usual.
+
+on:
+  pull_request:
+    # A release branch only (vX.Y.Z). The base is checked again in Decide
+    # scope, because pull_request_review cannot filter on it.
+    branches: ['v*']
+    # edited/unlabeled: the blocking policy reads the title and the labels, so a
+    # retitled or relabelled PR has to be re-decided instead of keeping whatever
+    # the previous run reported.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
+  # An approval on the current head is the only thing that opens the gate for a
+  # fork, so the review event needs a run of its own.
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Base branch to compare against (workflow_dispatch only)'
+        required: false
+        default: 'main'
+      tier:
+        description: 'Grid to run: fast = H=32/T=16384 only, full = H=16/32/64/128 at T=16384'
+        type: choice
+        options: ['full', 'fast']
+        default: 'full'
+
+permissions:
+  contents: read
+  # the fork guard reads the PR's reviews and the reviewer's repo permission
+  pull-requests: read
+
+concurrency:
+  group: ppu-gdn-gate-${{ github.event.pull_request.number || github.ref }}
+  # A policy-only event (title or label edit) must not kill a campaign that is
+  # already measuring the same head; it only re-reads the policy inputs. A
+  # submitted review is excluded for the same reason: it may only add an
+  # approval, and cancelling the authorized campaign for it would trade a real
+  # measurement for a no-op.
+  #
+  # GitHub keeps one running and one pending run per group and drops the older
+  # pending one, so a campaign can be cancelled before its pod starts. Decide
+  # scope therefore reuses a stored result only when it was made under the same
+  # policy and grid; an event that dropped a campaign measures again instead of
+  # replaying a verdict it never asked for.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'edited' && github.event.action != 'unlabeled' && github.event.action != 'labeled' }}
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+  # Two tiers, decided in "Decide scope":
+  #   full - four head counts at T=16384, for a declared perf/refactor change
+  #          (a declared verdict blocks) and for any run that asks for it
+  #   fast - one (H,T) point, for every other change: one report, no block
+  # The grid and the pod budget follow the tier. Profiling runs in both: the
+  # verdict judges each kernel on its own time, which needs the per-kernel
+  # timings from the same pass. Both knobs are spelled out here instead of
+  # leaning on the wrapper's defaults, so the workflow is the one place the
+  # policy lives.
+  # The pod budget also has to cover the scheduler queue: timeout_minutes is
+  # measured from pod creation, and a run that never gets a board burns it.
+  PERF_TOL: "0.05"
+  PERF_PROFILE_ITERS: "5"
+  # Judge every kernel's own time instead of the e2e sum: a kernel that gets
+  # slower is a real loss even when another kernel's gain hides it in the total.
+  PERF_GATE_LEVEL: "kernel"
+  # 1 = only run the environment probe (fast) instead of the campaign
+  PERF_PROBE: "0"
+  PERF_CONTAINER: ""     # already inside the GPU container; no docker exec
+  # Only GDN-related code starts a run:
+  #   fla/ops/gated_delta_rule/  chunk entry and intra-chunk kernels
+  #   fla/ops/common/            chunk_delta_h, chunk_o, chunk_scaled_dot_kkt
+  #   fla/ops/utils/             cumsum, solve_tril, index, cache
+  #   fla/ops/backends/          dispatch registry: picks the backend per op
+  #   fla/utils/                 autotune_cache_kwargs, input_guard, device flags
+  #   fla/layers/gated_deltanet.py and the gate itself
+  # fla/ops/cp holds the context-parallel pre-process kernels. They only run
+  # behind chunk_gated_delta_rule(cp_context=...), so they never show up in the
+  # e2e grid and are judged through the cp_fwd/cp_bwd phases instead; without
+  # this path a CP-only PR would skip the gate entirely.
+  PERF_PATHS: '^(fla/ops/(gated_delta_rule|common|cp|utils|backends)/|fla/utils/|fla/layers/gated_deltanet\.py|\.github/workflows/scripts/perf-gate/|\.github/workflows/ppu-gdn-perf-gate\.yml)'
+  # The triton_ascend backends are Huawei NPU kernels: they never run on PPU, so
+  # a change confined to them cannot move the numbers this gate measures.
+  PERF_EXCLUDE: '(^|/)triton_ascend/'
+  # A PR declares itself with [perf] / [perf:810e] (or [refactor]) in any commit
+  # subject or in the title, or with a maintainer `perf` / `refactor` label. A
+  # declared PR whose diff misses the code this gate measures has nothing to
+  # prove here, so the claim does not force a run. [perf-full] is a grid request
+  # and deliberately does not match.
+  PERF_DECLARE: '(\[perf(:[^]]*)?\]|^perf\([^)]*\)?!?:)'
+  # The files GDN reads that PERF_PATHS leaves out on purpose: every layer
+  # shares them, so listing them above would put an unrelated PR on the boards.
+  # A perf or refactor declaration opens this scope and nothing wider, so a
+  # KDA-only diff stays off these boards while a change to the norm GDN reads
+  # can be measured.
+  PERF_FORCE_PATHS: '^(fla/modules/(layernorm_gated|rotary)\.py|fla/modules/conv/)'
+  # A refactor claims behaviour-preserving code, so it is held to "no slower
+  # than base". A fix is deliberately not matched: trading speed for
+  # correctness is allowed, and the number stays advisory.
+  REFACTOR_DECLARE: '(\[refactor(:[^]]*)?\]|^refactor(\([^)]*\))?!?:)'
+
+jobs:
+  gate:
+    name: GDN perf gate (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    # Must stay above the largest pod budget plus the checkout and verdict
+    # steps; the pod budget itself follows the tier.
+    timeout-minutes: 200
+    env:
+      # The scheduler runs the code in a pod whose filesystem is discarded when
+      # the pod ends, so nothing written under /workspace/source reaches this
+      # runner. Results travel over the shared NAS instead (same convention as
+      # fla-ut-test-ppu.yml): container side /mnt/wl_nas, runner side /wl_nas.
+      NAS_OUT: /wl_nas/devops/fla-ci/perf/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with fla-ut-test-ppu.yml: same boards, same sizing.
+        include:
+          - runner: ZW-M890P
+            cpus: "31"
+            memory: "256Gi"
+          - runner: ZW-810E
+            cpus: "11"
+            memory: "112Gi"
+    steps:
+      # pull_request checks out the merge commit by default; take the head
+      # explicitly and pair it with merge-base, so the gate reflects only the
+      # PR's own delta rather than unrelated changes on the base branch.
+      # Keep checkout credentials: the next step fetches the base branch, and a
+      # private repo returns 401 without a token.
+      - uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      # No on.paths filter: a workflow that never triggers leaves its required
+      # check pending forever. Run always, decide internally, exit 0 when the
+      # change set cannot affect the GDN chunk path.
+      #
+      # scope.run      - start the PPU job at all: a GDN path changed
+      # scope.replay   - no campaign, but a stored verdict exists for this head
+      #                  under the same policy and grid: judge that one
+      # scope.block    - let a non-pass verdict fail this check. A declared
+      #                  perf or refactor change is blocked, and a claim on
+      #                  paths this gate cannot measure never reaches this stage
+      # scope.policy   - enforced | perf | refactor | advisory, for the summary
+      - name: Decide scope
+        id: scope
+        shell: bash
+        env:
+          # A fork's head is untrusted code that would run on our boards with
+          # write access to the shared NAS. Its approval is resolved from the
+          # PR's review list below instead of the triggering event, so a later
+          # comment-only review neither revokes an approval that still stands
+          # nor cancels the campaign it authorized.
+          IS_FORK: ${{ github.event_name != 'workflow_dispatch' && github.event.pull_request.head.repo.full_name != github.repository }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PR-controlled strings reach bash through env, never through `${{ }}`
+          # interpolation inside the script, so a title cannot inject shell code.
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          BOARD: ${{ matrix.runner }}
+        run: |
+          set -euo pipefail
+          # Label and title text is data: disable pathname expansion so an
+          # unquoted list expansion below can only split words, never match a
+          # file or expand a `*` from a label name.
+          set -f
+          BASE_REF="${{ github.event.pull_request.base.ref || inputs.base_ref || 'main' }}"
+          BASE_REF="${BASE_REF#origin/}"
+          git fetch --no-tags origin "$BASE_REF"
+          BASE_SHA=$(git merge-base HEAD FETCH_HEAD)
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE_REF@$(git rev-parse --short "$BASE_SHA") head=$(git rev-parse --short HEAD)"
+
+          # The scheduler hands this workspace, including .git, to a pod that
+          # runs PR-head code; drop the checkout credential now that the base
+          # branch is fetched. Nothing later needs authentication.
+          git config --local --unset-all 'http.https://github.com/.extraheader' 2>/dev/null || true
+          if git config --local --get-regexp '^http\..*extraheader$' >/dev/null 2>&1; then
+            echo "::error::checkout credential still stored in .git/config"
+            exit 1
+          fi
+
+          # A verdict belongs to a release branch: that is where a version is
+          # cut from, and a PR to main or to a topic branch is not held to this
+          # board's numbers. pull_request_review cannot filter on the base, so
+          # the rule is checked here for every event but a manual dispatch,
+          # which names its own base and exists to validate the gate.
+          if [ "$EVENT" != "workflow_dispatch" ] \
+             && ! printf '%s' "$BASE_REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "replay=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::base branch '$BASE_REF' is not a release branch (vX.Y.Z);" \
+                 "perf gate skipped"
+            exit 0
+          fi
+
+          # --no-renames so moving a file out of a gated directory still counts.
+          changed=$(git diff --name-only --no-renames "$BASE_SHA" HEAD)
+          hits=$(printf '%s\n' "$changed" | grep -E "$PERF_PATHS" | grep -vE "$PERF_EXCLUDE" || true)
+
+          # GitHub runs this workflow file from the PR merge ref, so a fork head
+          # that edits it would rewrite the guard on its way in. Refuse such a
+          # head outright; a maintainer can still measure it with
+          # workflow_dispatch or from a branch inside this repository.
+          wf_changed=$(printf '%s\n' "$changed" | grep -E '^\.github/(workflows|actions)/' || true)
+          if [ "${IS_FORK}" = "true" ] && [ -n "$wf_changed" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "replay=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::fork head $(git rev-parse --short HEAD) edits its own workflow ($(printf '%s' "$wf_changed" | paste -sd,)); refusing to run a guard it can rewrite"
+            exit 0
+          fi
+
+          # One regex for commit subjects and the title: a fork PR has no label
+          # rights, so the title has to be able to declare it too. A maintainer
+          # label is an exact token instead of free-form text.
+          decls=""
+          refs=""
+          # A declaration is the run request for a file the GDN path reads but
+          # PERF_PATHS does not list (a norm, a rotary, a short conv): a
+          # maintainer can ask for the measurement without widening the filter
+          # for every PR that touches that file. The declaration alone is not
+          # enough; the scope check below decides whether it applies.
+          force=0
+          claimed=0
+          claim=""
+          soft=""
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            decls=$( { git log --format=%s "$BASE_SHA"..HEAD
+                       printf '%s\n' "${PR_TITLE:-}"; } | grep -oiE "$PERF_DECLARE" || true )
+            refs=$( { git log --format=%s "$BASE_SHA"..HEAD
+                      printf '%s\n' "${PR_TITLE:-}"; } | grep -oiE "$REFACTOR_DECLARE" || true )
+            # Every matching label counts: taking the first made the policy
+            # depend on label ordering, so a `refactor` label next to `perf`
+            # silently dropped one of the two claims.
+            for label in $(printf '%s\n' ${PR_LABELS:-} | tr '[:upper:]' '[:lower:]' \
+                             | grep -xE 'perf(:[a-z0-9]+)?|refactor' || true); do
+              case "$label" in
+                refactor) refs="${refs:+$refs }[$label]" ;;
+                *) decls="${decls:+$decls }[$label]" ;;
+              esac
+            done
+            # A declaration that names another kernel (`perf(kda):`,
+            # `refactor(kda):`) is not a claim on this gate -- those changes get
+            # their own pipeline -- so it neither forces a run nor claims
+            # anything here. A bare [perf], a board suffix (perf:m890p) and
+            # [refactor] do: they name no other kernel.
+            keep=""
+            for tok in $decls $refs; do
+              qual=$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]' \
+                     | sed -E 's/^\[?(perf|refactor)//; s/^\(//; s/[][)(!:]//g')
+              case "$qual" in
+                ""|gdn|*810e*|*890p*) keep="${keep:+$keep }$tok" ;;
+              esac
+            done
+            decls=""
+            refs=""
+            for tok in $keep; do
+              case "$tok" in
+                [Rr]efactor*|\[[Rr]efactor*) refs="${refs:+$refs }$tok" ;;
+                *) decls="${decls:+$decls }$tok" ;;
+              esac
+            done
+            claim="$decls"
+            if [ -n "$refs" ]; then claim="${claim:+$claim }$refs"; fi
+            # The declaration widens the scope to the shared modules GDN reads
+            # and no further, so a `perf` label on a KDA or Ascend change still
+            # has nothing here to measure and stays skipped.
+            soft=$(printf '%s\n' "$changed" | grep -E "$PERF_FORCE_PATHS" \
+                   | grep -vE "$PERF_EXCLUDE" || true)
+            if [ -n "$claim" ] && [ -n "$soft" ]; then
+              force=1
+            elif [ -n "$claim" ]; then
+              claimed=1
+            fi
+          fi
+
+          # The GDN paths decide whether this gate applies: on a KDA or Ascend
+          # change there is nothing here to measure, so a plain fix on them is
+          # reported and merged. Two things add to that -- a dispatch, and a
+          # declaration whose diff reaches the shared modules GDN reads (both
+          # halves, never the claim alone).
+          #
+          # A skip also stops the replay below: a PR that is no longer a perf
+          # or refactor change is not held to the verdict it carried then, so
+          # dropping the label lifts the red instead of re-posting it.
+          if [ "$EVENT" != "workflow_dispatch" ] && [ -z "$hits" ] \
+             && [ "$force" != "1" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "replay=false" >> "$GITHUB_OUTPUT"
+            if [ "$claimed" = "1" ]; then
+              echo "::notice::'$claim' declares a perf or refactor change, but the diff is outside the code this gate measures; skipped (a KDA or other-kernel change needs its own gate)"
+            else
+              echo "::notice::no GDN-related changes, perf gate skipped"
+            fi
+            exit 0
+          fi
+          if [ -n "$hits" ]; then
+            echo "::notice::GDN-related files: $(printf '%s\n' "$hits" | paste -sd' ')"
+          elif [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "::notice::manual dispatch: measuring this head on request"
+          else
+            echo "::notice::no GDN path changed; running because '$claim' declares a change on a shared module GDN reads: $(printf '%s\n' "$soft" | paste -sd' ')"
+          fi
+
+          # Whether this event earns a campaign is decided further down, once
+          # the policy and the grid are known: a stored result is reused only
+          # when it was measured under the same two, so a title or label edit
+          # that changes either one measures again while a description edit or
+          # an unrelated label replays what is on record.
+
+          # A fork head stays untrusted: its benchmark script and fla tree would
+          # run on our boards. It needs an approval on this exact commit from
+          # someone who can already push here; a review of an older head says
+          # nothing about the code we are about to run.
+          approved=false
+          if [ "${IS_FORK}" = "true" ]; then
+            cat > /tmp/ppu_approval.py <<'PY'
+          import json, os, sys, urllib.error, urllib.parse, urllib.request
+
+          repo, num, head = sys.argv[1], sys.argv[2], sys.argv[3]
+          token = os.environ.get("GH_TOKEN", "")
+          api = "https://api.github.com/repos/%s" % repo
+          if not token or not num:
+              print("no token or PR number; cannot resolve an approval")
+              sys.exit(1)
+
+
+          def get(url):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "ppu-gdn-perf-gate"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+
+          reviews, page = [], 1
+          while True:
+              batch = get("%s/pulls/%s/reviews?per_page=100&page=%d" % (api, num, page))
+              reviews += batch
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          trusted = {"admin", "maintain", "write"}
+
+          # One verdict per reviewer: the list is chronological, so a later
+          # changes-requested or dismissal replaces the approval it supersedes.
+          # A COMMENTED review is not a verdict, and letting it into this map
+          # would let a comment posted after an approval erase that approval.
+          latest = {}
+          verdicts = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
+          for review in reviews:
+              user = review.get("user") or {}
+              login = user.get("login") or ""
+              state = review.get("state")
+              if not login or user.get("type") == "Bot" or state not in verdicts:
+                  continue
+              latest[login] = review
+
+          for login, review in latest.items():
+              if review.get("state") != "APPROVED" or review.get("commit_id") != head:
+                  continue
+              association = review.get("author_association") or "NONE"
+              try:
+                  perm = get("%s/collaborators/%s/permission"
+                             % (api, urllib.parse.quote(login))).get("permission", "none")
+              except urllib.error.HTTPError as exc:
+                  # Fail closed: an unverified permission is not a permission.
+                  # `author_association` says where the reviewer sits in the
+                  # organisation, not what they may push, and a fork head runs
+                  # on our boards with write access to the shared NAS.
+                  print("cannot verify write permission for %s: HTTP %d "
+                        "(association=%s); not trusting an unverified review"
+                        % (login, exc.code, association))
+                  continue
+              print("review by %s: permission=%s association=%s"
+                    % (login, perm, association))
+              if perm in trusted:
+                  print("approved by %s" % login)
+                  sys.exit(0)
+          sys.exit(1)
+          PY
+            if python3 /tmp/ppu_approval.py "$REPO" "$PR_NUM" "$(git rev-parse HEAD)"; then
+              approved=true
+            fi
+          fi
+          if [ "${IS_FORK}" = "true" ] && [ "$approved" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "replay=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::fork head $(git rev-parse --short HEAD) has no verified approval from a reviewer with write access; refusing to run it on the boards (a head pushed to a branch in this repository, or a manual dispatch, avoids the permission lookup)"
+            exit 0
+          fi
+
+          # Advisory unless the PR declares what it is. A perf or refactor claim
+          # blocks: both say the change is about speed, so every kernel has to
+          # hold its own time. No gain is demanded -- a PR that leaves the
+          # kernels where they were is a pass, and the measurement still lands
+          # on the record. A plain fix may cost speed and still merges. A manual
+          # run is always enforced: that is how the gate is validated.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            policy="enforced"
+            echo "::notice::workflow_dispatch run, verdict is enforced"
+          elif [ -n "$decls" ]; then
+            policy="perf"
+            echo "::notice::performance change '$decls': $BOARD must hold every kernel's speed, no gain required"
+          elif [ -n "$refs" ]; then
+            policy="refactor"
+            echo "::notice::refactor '$refs': $BOARD must hold every kernel's speed"
+          else
+            policy="advisory"
+            echo "::notice::not a performance change; reporting only, a regression does not block the merge"
+          fi
+          case "$policy" in
+            advisory) echo "block=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "block=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "policy=$policy" >> "$GITHUB_OUTPUT"
+
+          # Tier follows the declaration. A perf or refactor claim is judged on
+          # the full grid: that claim is the reason this gate exists, and one
+          # (H,T) point cannot carry a blocking verdict. Every other change runs
+          # the fast grid once and gets the report without a block. `perf-full`,
+          # [perf-full] and the dispatch input can still ask for the full grid.
+          FULL=0
+          why=""
+          case "$policy" in
+            perf|refactor) FULL=1; why="declared change" ;;
+          esac
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ "${{ inputs.tier || 'full' }}" != "fast" ]; then
+            FULL=1; why="${why:-dispatch}"
+          fi
+          if git log -1 --pretty=%s | grep -qF '[perf-full]'; then
+            FULL=1; why="${why:-explicit request}"
+          fi
+          if printf '%s\n' "${PR_LABELS:-}" | tr '[:upper:]' '[:lower:]' \
+               | tr -s '[:space:]' '\n' | grep -qx 'perf-full'; then
+            FULL=1; why="${why:-explicit request}"
+          fi
+          if [ "$FULL" = "1" ]; then
+            echo "tier=full" >> "$GITHUB_OUTPUT"
+            echo "heads=16,32,64,128" >> "$GITHUB_OUTPUT"
+            echo "seqlens=16384" >> "$GITHUB_OUTPUT"
+            echo "sweeps=4" >> "$GITHUB_OUTPUT"
+            echo "pod_timeout=180" >> "$GITHUB_OUTPUT"
+            echo "::notice::full tier ($why): H=16/32/64/128 at T=16384, pod budget 180 min"
+          else
+            echo "tier=fast" >> "$GITHUB_OUTPUT"
+            echo "heads=32" >> "$GITHUB_OUTPUT"
+            echo "seqlens=16384" >> "$GITHUB_OUTPUT"
+            echo "sweeps=4" >> "$GITHUB_OUTPUT"
+            echo "pod_timeout=60" >> "$GITHUB_OUTPUT"
+            echo "::notice::fast tier: H=32 T=16384 only, pod budget 60 min; a perf or refactor declaration runs the full grid instead"
+          fi
+
+          # One campaign answers one head, under one policy, on one grid, and
+          # the marker left next to the stored verdict says which. An event
+          # that asks the same question -- a description edit, a review, a
+          # reopened PR, an unrelated label -- replays that verdict instead of
+          # paying for another campaign. A marker that does not match means the
+          # stored numbers answer something else (a label added the block, a
+          # request widened the grid), so measure: this is also what keeps a
+          # campaign that GitHub dropped from being replaced by a stale replay.
+          STORED="/wl_nas/devops/fla-ci/perf/heads/$(git rev-parse HEAD)/$BOARD.policy"
+          case "$policy" in advisory) cur_block=false ;; *) cur_block=true ;; esac
+          case "$FULL" in 1) cur_tier=full ;; *) cur_tier=fast ;; esac
+          if [ "$EVENT" != "workflow_dispatch" ] && [ -f "$STORED" ]; then
+            stored=$(sed -n '1p' "$STORED" | tr -d '\r')
+            s_block=$(printf '%s' "$stored" | sed -n 's/.*block=\([a-z]*\).*/\1/p')
+            s_tier=$(printf '%s' "$stored" | sed -n 's/.*tier=\([a-z]*\).*/\1/p')
+            if [ "$s_block" = "$cur_block" ] && [ "$s_tier" = "$cur_tier" ]; then
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "replay=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::$BOARD already measured this head with block=$cur_block" \
+                   "on the $cur_tier grid; replaying that verdict"
+              exit 0
+            fi
+            echo "::notice::stored $BOARD result is block=${s_block:-unknown}" \
+                 "tier=${s_tier:-unknown}, this event needs block=$cur_block" \
+                 "tier=$cur_tier; measuring again"
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "replay=false" >> "$GITHUB_OUTPUT"
+
+      - name: Run gate on PPU
+        if: steps.scope.outputs.run == 'true'
+        # An advisory run must not turn a scheduler hiccup (the pod never
+        # starts, or the queue eats the budget) into a red check: the report
+        # step below publishes the missing result as a warning instead. A
+        # blocking run still fails when the scheduler does.
+        continue-on-error: ${{ steps.scope.outputs.block != 'true' }}
+        uses: t-head/ci-infra/cluster-run@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: ${{ fromJSON(steps.scope.outputs.pod_timeout) }}
+          container_options: |
+            cpus: "${{ matrix.cpus }}"
+            memory: "${{ matrix.memory }}"
+          command: |
+            set -uo pipefail
+            cd /workspace/source
+            source /usr/local/PPU_SDK/envsetup.sh
+            unset PIP_INDEX_URL FLA_CI_ENV
+            # fla.ops pulls einops at import time; the base image ships it, so
+            # only reach for the network when it is actually missing (installing
+            # transformers here could drag in a newer numpy and break the
+            # image's torch ABI). One CPU thread keeps the host-side helpers
+            # from skewing the paired comparison on the 11-core board.
+            export OMP_NUM_THREADS=1
+            export MKL_NUM_THREADS=1
+            python3 -c 'import einops' 2>/dev/null || pip install -q einops
+
+            # Keep the worktree and the cold Triton caches on the pod's local
+            # disk; only the published results go to NAS.
+            OUT=/tmp/gdn-perf-out
+            NAS_OUT="/mnt/wl_nas/devops/fla-ci/perf/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_OUT"
+            # Probe the NAS before spending an hour on the campaign: a pod that
+            # cannot publish is useless, and the annotation below is visible
+            # from the run page without downloading anything.
+            if ! touch "$NAS_OUT/.probe" 2>/dev/null; then
+              echo "::error::NAS not writable: $NAS_OUT"
+              ls -ld /mnt /mnt/wl_nas 2>&1 || true
+              exit 0
+            fi
+            rm -f "$NAS_OUT/.probe"
+
+            if [ "${PERF_PROBE:-0}" = "1" ]; then
+              # Collect the facts that decide the budget: how slow is the checkout
+              # filesystem, and how long do the fla imports and the base worktree
+              # actually take?
+              {
+                echo "date: $(date -u +%FT%TZ)"
+                echo "py: $(python3 -V 2>&1)"
+                echo "df_src: $(df -T /workspace/source 2>/dev/null | tail -1)"
+                echo "git_dir: $(test -d /workspace/source/.git && echo present || echo missing)"
+                python3 -c "import time;t=time.time();import einops;print('einops_s=%.1f' % (time.time()-t))" 2>&1 | tail -2
+                python3 -c "import time;t=time.time();import fla.ops;print('import_fla_ops_s=%.1f' % (time.time()-t))" 2>&1 | tail -3
+                git config --global --add safe.directory /workspace/source 2>/dev/null || true
+                t0=$(date +%s)
+                git -C /workspace/source worktree add --detach /tmp/wt-probe \
+                  "${{ steps.scope.outputs.base_sha }}" >/tmp/wt-probe.log 2>&1
+                echo "worktree_rc=$? worktree_s=$(( $(date +%s) - t0 ))"
+                tail -3 /tmp/wt-probe.log 2>/dev/null
+                git -C /workspace/source worktree remove --force /tmp/wt-probe 2>/dev/null || true
+              } > "$NAS_OUT/probe.txt" 2>&1
+              exit 0
+            fi
+            echo "::notice::NAS writable: $NAS_OUT"
+
+            # Grid comes from the tier decided above.
+            PERF_HEADS="${{ steps.scope.outputs.heads }}"
+            PERF_SEQLENS="${{ steps.scope.outputs.seqlens }}"
+            PERF_SWEEPS="${{ steps.scope.outputs.sweeps }}"
+            export PERF_HEADS PERF_SEQLENS PERF_SWEEPS
+            echo "::notice::tier=${{ steps.scope.outputs.tier }} H=$PERF_HEADS T=$PERF_SEQLENS sweeps=$PERF_SWEEPS"
+
+            # Mirror the campaign log every 20s: if the pod is killed at the
+            # timeout we still learn which point it died on.
+            ( while sleep 20; do
+                cp -f "$OUT/campaign.log" "$NAS_OUT/campaign.log.partial" 2>/dev/null
+              done ) &
+            SYNC_PID=$!
+
+            # An advisory run keeps the regression-only verdict but annotates
+            # warnings, so a fix that costs speed still merges with the number
+            # on the record.
+            if [ "${{ steps.scope.outputs.block }}" != "true" ]; then
+              export PERF_ANNOTATION=warning
+            fi
+
+            bash .github/workflows/scripts/perf-gate/ci_perf_gate.sh \
+              /workspace/source "${{ steps.scope.outputs.base_sha }}" "$OUT"
+            rc=$?
+            kill "$SYNC_PID" 2>/dev/null || true
+            echo "[ci] gate exit=$rc (0 pass / 2 regression / 3 infra)"
+
+            # Publish before exiting: the pod is reclaimed right after this step.
+            for f in "$OUT/gate.json" "$OUT/gate.md" "$OUT/tables.md" \
+                     "$OUT/campaign.log" "$OUT"/grid_*.json; do
+              [ -f "$f" ] && cp -f "$f" "$NAS_OUT/"
+            done
+            echo "[ci] published to $NAS_OUT:"
+            ls -l "$NAS_OUT" || true
+            # Remember the verdict for this exact head. A later event that asks
+            # the same question replays it, and without this the fresh green
+            # check would quietly replace a failing one for the same commit.
+            # The policy and the grid travel with it: a replay only stands when
+            # both still match, so a label that makes the gate blocking (or a
+            # request that widens the grid) measures instead of replaying.
+            HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+            if [ -f "$OUT/gate.json" ]; then
+              mkdir -p "/mnt/wl_nas/devops/fla-ci/perf/heads/$HEAD_SHA"
+              cp -f "$OUT/gate.json" \
+                "/mnt/wl_nas/devops/fla-ci/perf/heads/$HEAD_SHA/${{ matrix.runner }}.gate.json"
+              printf 'block=%s tier=%s\n' "${{ steps.scope.outputs.block }}" \
+                "${{ steps.scope.outputs.tier }}" \
+                > "/mnt/wl_nas/devops/fla-ci/perf/heads/$HEAD_SHA/${{ matrix.runner }}.policy"
+            fi
+            # Keep the tail in the job log too, so a crash is diagnosable even
+            # without the artifact.
+            [ -f "$OUT/campaign.log" ] && tail -40 "$OUT/campaign.log" || true
+            # Let the container finish successfully no matter the verdict, so
+            # on_success still reclaims it; the verdict is enforced by the next
+            # step from the NAS copy.
+            exit 0
+          cleanup_policy: on_success
+
+      - name: Show probe
+        if: always() && steps.scope.outputs.run == 'true'
+        shell: bash
+        run: |
+          if [ -f "$NAS_OUT/probe.txt" ]; then
+            while IFS= read -r line; do echo "::notice::probe: $line"; done < "$NAS_OUT/probe.txt"
+          else
+            echo "::notice::no probe.txt at $NAS_OUT"
+          fi
+
+      # An advisory run cannot fail the check, but "nothing was measured" is not
+      # "no regression". Say it in an annotation and in the summary, so a green
+      # check is never the only thing a reader sees.
+      - name: Report advisory result
+        if: always() && steps.scope.outputs.run == 'true' && steps.scope.outputs.block != 'true'
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ "${PERF_PROBE:-0}" = "1" ]; then
+            echo "::notice::probe mode - nothing to report"
+            exit 0
+          fi
+          if [ ! -f "$NAS_OUT/gate.json" ]; then
+            echo "::warning::advisory run produced no gate.json (pod timeout or crash); this PR was not measured"
+            {
+              echo "### Advisory: no measurement"
+              echo ""
+              echo "This run produced no result, so nothing here says the PR is"
+              echo "regression-free. Re-run the check to get a number."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY' || true
+          import json, os
+          d = json.load(open(os.path.join(os.environ["NAS_OUT"], "gate.json")))
+          pooled = d.get("pooled") or {}
+          kg = d.get("kernel_gain") or {}
+          best = kg.get("best") or {}
+          print("advisory verdict=%s pooled=%s%s"
+                % (d.get("verdict"),
+                   ", ".join("%s %.3fx" % kv for kv in pooled.items()),
+                   "" if not best else
+                   " | best kernel %s (%s) %.3fx, %d kernel regression(s)"
+                   % (best.get("kernel"), best.get("phase"),
+                      best.get("speedup", 0.0), len(kg.get("regressions") or []))))
+          PY
+
+      # Advisory runs stop here: gate.json and gate.md were published above, but
+      # the verdict does not touch the check. A declared perf or refactor change
+      # has to hold every kernel's speed before it merges.
+      - name: Enforce gate verdict
+        if: always() && steps.scope.outputs.run == 'true' && steps.scope.outputs.block == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${PERF_PROBE:-0}" = "1" ]; then
+            echo "::notice::probe mode - environment facts only, verdict not enforced"
+            exit 0
+          fi
+          if [ ! -f "$NAS_OUT/gate.json" ]; then
+            echo "::error::gate.json missing - the gate crashed or hit the pod timeout"
+            # Surface the tail as annotations: they are readable on the run page
+            # even when artifacts need a login.
+            LOG="$NAS_OUT/campaign.log"
+            [ -f "$LOG" ] || LOG="$NAS_OUT/campaign.log.partial"
+            if [ -f "$LOG" ]; then
+              tail -6 "$LOG" | while IFS= read -r line; do echo "::error::log: $line"; done
+            else
+              echo "::error::no campaign log under $NAS_OUT (NAS unreachable from pod?)"
+            fi
+            echo "### Gate output (tail)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            if [ -f "$LOG" ]; then
+              tail -80 "$LOG" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "(no campaign.log on NAS)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 3
+          fi
+          # One implementation for a fresh verdict and for the replay below.
+          python3 .github/workflows/scripts/perf-gate/verdict.py \
+            "$NAS_OUT/gate.json" "${{ steps.scope.outputs.block }}"
+
+      # An event that did not ask for a campaign (a description edit, a review,
+      # an unrelated label) leaves the previous verdict in place, and GitHub
+      # would show a fresh green check for a head that failed earlier. Re-play
+      # what was stored for this head instead: only an event whose policy and
+      # grid still match the stored marker gets here, and a real measurement
+      # overwrites the entry.
+      - name: Re-enforce stored verdict
+        if: >-
+          always() && steps.scope.outputs.run != 'true'
+          && steps.scope.outputs.replay == 'true'
+        shell: bash
+        run: |
+          set -uo pipefail
+          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          SRC="/wl_nas/devops/fla-ci/perf/heads/$HEAD_SHA/${{ matrix.runner }}"
+          if [ ! -f "$SRC.gate.json" ] || [ ! -f "$SRC.policy" ]; then
+            echo "::notice::no stored verdict for ${HEAD_SHA:0:12} on ${{ matrix.runner }}; nothing to re-enforce"
+            exit 0
+          fi
+          # The marker is one line, `block=<true|false> tier=<fast|full>`. A
+          # leftover one-token file from an older run has no tier, and the
+          # scope step would not have replayed it.
+          BLOCK=$(sed -n '1s/.*block=\([a-z]*\).*/\1/p' "$SRC.policy")
+          if [ -z "$BLOCK" ]; then
+            echo "::notice::$SRC.policy carries no policy marker; nothing to re-enforce"
+            exit 0
+          fi
+          python3 .github/workflows/scripts/perf-gate/verdict.py \
+            "$SRC.gate.json" "$BLOCK"
+
+      - name: Job summary
+        if: always() && steps.scope.outputs.run == 'true'
+        shell: bash
+        run: |
+          case "${{ steps.scope.outputs.policy }}" in
+            perf)     policy="blocking - declared performance change, no kernel may get slower" ;;
+            refactor) policy="blocking - declared refactor, no kernel may get slower" ;;
+            enforced) policy="blocking - manual run" ;;
+            *)        policy="advisory - not a performance change, a regression here does not block the merge" ;;
+          esac
+          echo "## Runner: ${{ matrix.runner }} (tier: ${{ steps.scope.outputs.tier }}) - $policy" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.scope.outputs.block }}" = "true" ]; then
+            echo "- merges only if every kernel holds its own time (2% of itself or 8 us, whichever is larger); no gain is required" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f "$NAS_OUT/gate.md" ]; then
+            cat "$NAS_OUT/gate.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_gate.md not produced: the pod failed or timed out, so this run measured nothing_" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v7.0.1
+        if: always() && steps.scope.outputs.run == 'true'
+        with:
+          name: ppu-gdn-gate-${{ steps.scope.outputs.tier }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NAS_OUT }}/
+          if-no-files-found: ignore
+          retention-days: 30
