@@ -16,7 +16,7 @@ import triton.language as tl
 
 from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.op import exp2
-from fla.utils import IS_PPU_810E, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_PPU_810E, IS_PPU_M890, autotune_cache_kwargs, check_shared_mem
 
 if TYPE_CHECKING:
     from fla.ops.cp.context import FLACPContext
@@ -46,9 +46,14 @@ def _prune_fwd_merged_configs(configs, named_args, **kwargs):
 # ZW810E: no head filter. Measured with benchmarks/cp/benchmark_gdn_preprocess.py on the
 # varlen layout CP actually produces, split wins on the bwd pre-process for every head from
 # 4 to 128, by 2%-23% depending on the head and on the boundary segment length.
+#
+# Neither list transfers to another part: the empty set keeps every non-PPU device on the
+# merged kernel it was tuned for, since nothing here measures split on those boards.
 _810E_SPLIT_HEADS = None
 _M890_SPLIT_HEADS = frozenset({32, 128})
-_SPLIT_HEADS = _810E_SPLIT_HEADS if IS_PPU_810E else _M890_SPLIT_HEADS
+_SPLIT_HEADS = (None if IS_PPU_810E else
+                _M890_SPLIT_HEADS if IS_PPU_M890 else
+                frozenset())
 
 # Split pays for a second launch with lower register pressure, so it needs enough work to
 # amortize that launch: the crossover sits at `HV * boundary_seg` head-tokens. Measured on

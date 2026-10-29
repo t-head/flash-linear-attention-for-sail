@@ -1,8 +1,9 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 """
 Micro-benchmark for the GDN Context-Parallel (CP) pre-process kernels.
@@ -304,7 +305,11 @@ def pin_config(kernel, num_warps, num_stages):
         obj = k
         for _ in range(4):
             if hasattr(obj, "configs"):
-                obj.configs = [triton.Config({}, num_warps=num_warps, num_stages=num_stages)]
+                # Keep the tile kwargs: the launch grids read BLOCK_SIZE from ``meta``.
+                pinned = [triton.Config(dict(c.kwargs), num_warps=num_warps,
+                                        num_stages=num_stages) for c in obj.configs]
+                obj.configs = pinned or [triton.Config({}, num_warps=num_warps,
+                                                       num_stages=num_stages)]
                 break
             obj = getattr(obj, "fn", None)
             if obj is None:
@@ -432,6 +437,7 @@ def _cp_worker(rank, world_size, T_local, H, dtype_str, warmup, repeats, port, r
                variants=("merged",)):
     import torch.distributed as dist
     import torch.nn.functional as F
+
     from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
@@ -542,6 +548,7 @@ def _cp_worker(rank, world_size, T_local, H, dtype_str, warmup, repeats, port, r
 
 def run_cp_e2e_mode(args, dtype):
     import tempfile
+
     import torch.multiprocessing as mp
     results = []
     world_size = args.cp
@@ -606,9 +613,10 @@ def main():
     p.add_argument("--seq-lens", type=parse_int_list, default=[4096, 8192, 16384],
                    help="LOCAL sequence length T per rank")
     p.add_argument("--varlen-lengths", type=parse_int_list, default=None,
-                   help="Run the varlen layout: lengths of the sequences this rank holds. "
-                        "The launches then take cu_seqlens[-2:] (fwd) / cu_seqlens[:2] (bwd) "
-                        "exactly like the CP wrapper, and --seq-lens is ignored.")
+                   help="kernel mode only: run the varlen layout with the lengths of the "
+                        "sequences this rank holds. The launches then take cu_seqlens[-2:] "
+                        "(fwd) / cu_seqlens[:2] (bwd) exactly like the CP wrapper, and "
+                        "--seq-lens is ignored.")
     p.add_argument("--phase", choices=["fwd", "bwd", "both"], default="both")
     p.add_argument("--variants", type=parse_str_list, default=["merged"],
                    help="Comma list of merged,split; in cp-e2e mode these are the arms "
@@ -626,6 +634,12 @@ def main():
     p.add_argument("--output-json", type=str, default=None)
     p.add_argument("--tag", type=str, default="", help="free-form label recorded in output")
     args = p.parse_args()
+
+    # cp-e2e builds one sequence per rank through the CP context; the packed layout only
+    # exists in kernel mode, so accepting the flag here would measure --seq-lens instead.
+    if args.mode == "cp-e2e" and args.varlen_lengths:
+        p.error("--varlen-lengths is a kernel-mode layout; cp-e2e mode builds one "
+                "sequence per rank and would silently measure --seq-lens")
 
     random.seed(SEED)
     torch.manual_seed(SEED)
