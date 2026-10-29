@@ -38,8 +38,8 @@ _DQKWG_BK_MIN = 64
 @fla_cache_autotune(
     configs=[
         triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 128]
-        for BV in [128]
+        for BK in [32, 64]
+        for BV in [64, 128]
         for num_warps in [4, 8]
         for num_stages in [2, 3, 4]
     ],
