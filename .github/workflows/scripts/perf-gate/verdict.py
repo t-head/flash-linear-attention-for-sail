@@ -20,10 +20,11 @@ single source of truth and this script only has to enforce it.
 Usage:
   verdict.py <gate.json> <block:true|false>
 
-Exit: 0 pass, 2 fail, 3 infra. ``infra`` means nothing was measured: that is
-not a pass, so a blocking gate fails on it. Returning 0 there made a campaign
-that died on the pod timeout (or on one bad point) report a green check, which
-is the one answer a gate must never give.
+Exit: 0 pass, 2 fail, 3 infra. ``infra`` means the campaign left no usable
+answer: either nothing was measured, or a point breached by less than its own
+sweep scatter and cannot be resolved at all. That is not a pass -- a blocking
+gate exists to be told the code holds its speed, and an unreadable measurement
+does not tell it. Re-run to measure again.
 """
 import json
 import statistics
@@ -38,8 +39,17 @@ def error(message, code=2):
 def main():
     path = sys.argv[1]
     blocking = sys.argv[2].strip()
-    with open(path) as fh:
-        d = json.load(fh)
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+    except (OSError, ValueError) as e:
+        # Copying the verdict to the NAS is the last thing the pod does, so a
+        # kill at the timeout can leave that copy half written, and a replay can
+        # be pointed at a file an older campaign never finished. Either way no
+        # verdict was left to judge: say so under the code a blocking gate
+        # already understands, instead of a traceback where a verdict belongs.
+        error(f"{path} cannot be read ({type(e).__name__}: {e}); no verdict was "
+              f"published to judge -- re-run to measure again", 3)
     verdict = d.get("verdict")
     pooled = d.get("pooled") or {}
     cells = d.get("cells") or []
@@ -55,14 +65,20 @@ def main():
         print("policy is advisory on this board; reporting only")
         return 0
 
-    # Nothing was measured, so no kernel was shown to hold its time. Name the
-    # first problems -- they say whether the pod never started or one point
-    # broke -- and exit 3, the same code the gate uses for infrastructure.
+    # Nothing usable was measured, so no kernel was shown to hold its time.
+    # Name the problems first -- they say whether the pod never started, or a
+    # point breached inside its own sweep scatter -- and exit 3, the same code
+    # the gate uses for infrastructure.
     if verdict == "infra":
         for problem in (d.get("problems") or [])[:4]:
             print("::error::infra: " + problem)
-        error("this result measured nothing (infra); a blocking gate cannot pass "
-              "on a campaign that did not run", 3)
+        # Say whether the campaign already spent another round on this point, so
+        # "re-run" is not advice the author has already paid for.
+        again = (d.get("sweeps") or {}).get("remeasured") or 0
+        remedy = (f"re-measured {again} round(s) and still unreadable" if again
+                  else "re-run to measure again")
+        error("this result is not a measurement (infra); a blocking gate cannot "
+              f"pass on it -- {remedy}", 3)
 
     slower = kg.get("regressions") or []
     # A regression and an infra problem both mean "no evidence the PR holds
