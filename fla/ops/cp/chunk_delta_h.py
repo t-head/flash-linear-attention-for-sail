@@ -38,31 +38,28 @@ def _prune_fwd_merged_configs(configs, named_args, **kwargs):
 
 
 # Split+Decompose head lists are per-board: the merged/split crossover flips between the
-# two PPU parts, so one list cannot be optimal for both.
-#
-# ZW-M890P, where the narrow list was originally tuned: merged stays more than 4x ahead
-# of split on the heads that lose out, leaving only H=32/128 with a >5% gain (H=8/48
-# regress, H=16/64 merged faster after the stage2 decomposition).
-# ZW810E: the crossover is a head count, not a work count. Measured with
-# benchmarks/cp/benchmark_gdn_preprocess.py, split wins the bwd pre-process by 1%-16% from
-# H=16 up, while H=4 loses 15%-30% and H=8 loses 1%-15%: below 16 heads the stage grid is
-# too narrow to amortize the second launch, however long the boundary segment is (512 to
-# 16384 tokens, dense and varlen).
+# two PPU parts, so one list cannot be optimal for both. Each list is the head set the
+# split-vs-merged benchmark picked on its own board, over the full head x T grid with dense
+# and varlen shapes; the per-point results are not repeated here.
 #
 # Neither list transfers to another part: the empty set keeps every non-PPU device on the
 # merged kernel it was tuned for, since nothing here measures split on those boards.
 _810E_SPLIT_HEADS = frozenset({16, 32, 64, 128})
-_M890_SPLIT_HEADS = frozenset({32, 128})
+_M890_SPLIT_HEADS = frozenset({32})
 _SPLIT_HEADS = (_810E_SPLIT_HEADS if IS_PPU_810E else
                 _M890_SPLIT_HEADS if IS_PPU_M890 else
                 frozenset())
 
 # Split pays for a second launch with lower register pressure, so it also needs enough work
-# to amortize that launch: the floor is `HV * boundary_seg` head-tokens. Measured end to end
-# in CP2 at H=16/32, split loses up to 8% at 8k-16k head-tokens, breaks even at 32k and wins
-# 3%-5% above it, while the kernel alone crosses over as low as 8k: the launch is what eats
-# the gain. The end-to-end number is what users see, so it sets the floor.
+# to amortize that launch: the floor is `HV * boundary_seg` head-tokens. The CP end-to-end
+# benchmark picks this floor rather than the kernel alone, since the launch is what eats the
+# gain.
 _SPLIT_MIN_HEAD_TOKENS = 32768
+
+# A dense rank has no `cu_seqlens`, so the head-token floor above cannot be evaluated and
+# the boundary segment is simply `T`. The same benchmark picks this floor: under it the
+# kernel is too small to amortize the second launch, so dense falls back to merged.
+_SPLIT_MIN_DENSE_TOKENS = 4096
 
 # FWD split path: empty on both boards, the merged kernel is faster for every
 # benchmarked head, so all FWD go merged.
@@ -83,18 +80,16 @@ _FWD_SPLIT_HEADS = frozenset()
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE': bs}, num_warps=num_warps, num_stages=num_stages)
-        # num_warps=8 added (candidate 1): baseline ACU shows this kernel is
-        # latency-bound on global-load memory_dependency with only ~5-10%
-        # warps_active; extra warps per CTA hide that latency. Configs that do
-        # not fit registers/shared memory are pruned by the autotuner, and the
-        # original [2, 4] configs remain, so the selected winner cannot regress.
+        # num_warps=8 is kept because this kernel is latency-bound on
+        # global-load dependencies and more warps per CTA hide that latency.
+        # Non-fitting configs are pruned by the autotuner and the original
+        # [2, 4] set stays, so the selected winner cannot regress.
         for bs in [32, 64]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ] + [
-        # D5: BLOCK_SIZE=128 halves grid columns (V/128+K/128 vs V/64+K/64),
-        # reducing tail-wave overhead. H=128 cold-cache A/B: 1.074x CI95=[1.067,1.082].
-        # nw=8 is the only competitive warp count; s={2,3} bracket the winner.
+        # The benchmark picked BLOCK_SIZE=128 with nw=8: fewer grid columns
+        # trim the tail wave, and these stages bracket that winner.
         triton.Config({'BLOCK_SIZE': 128}, num_warps=8, num_stages=ns)
         for ns in [2, 3]
     ],
@@ -545,9 +540,9 @@ def merge_fwd_bwd_kernel(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        # num_warps=8 added (candidate 1): same latency-bound / low-occupancy
-        # rationale as the fwd kernel. Original [2, 4] configs are retained and
-        # non-fitting configs are pruned, so the winner cannot regress.
+        # num_warps=8 for the same latency-bound reason as the fwd kernel.
+        # Non-fitting configs are pruned and the original [2, 4] set stays, so
+        # the selected winner cannot regress.
         for num_warps in [2, 4, 8]
         for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [1])
     ],
@@ -921,12 +916,11 @@ def pre_process_bwd_stage1_dh(
     dv += ((bos * HV + i_h) * V).to(tl.int64)
     stride_v = HV * V
 
-    # D4-A: capture the pointer element type so that any `.to(in_dtype)` cast
-    # on the dot inputs is stable. Without this, `b_q = b_q * b_g_exp` (fp32)
-    # mutates `b_q.dtype` to fp32 and the downstream `b_q.to(b_q.dtype)` becomes
-    # a no-op, forcing the compiler to emit TF32 MMA (m16n16k8) instead of
-    # bf16 MMA (m16n16k16) at half the FLOP/instr. Mirrors the known FWD
-    # stage2 pitfall for the same `.to(b_k.dtype)` after g-scaling pattern.
+    # Capture the pointer element type so that any `.to(in_dtype)` cast on the
+    # dot inputs stays bf16. Without this, `b_q = b_q * b_g_exp` (fp32) mutates
+    # `b_q.dtype` to fp32 and the downstream `b_q.to(b_q.dtype)` becomes a no-op,
+    # which makes the compiler fall back to TF32 MMA. Same pitfall as the fwd
+    # stage2 `.to(b_k.dtype)` after g-scaling.
     in_dtype = w.dtype.element_ty
 
     # Initialize dh accumulators
@@ -1653,18 +1647,19 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     return initial_state
 
 
-def _bwd_split_worth_it(HV: int, context: FLACPContext) -> bool:
+def _bwd_split_worth_it(HV: int, context: FLACPContext, T: int) -> bool:
     """Whether the split backward pre-process is the faster choice for this rank.
 
     The stages parallelize over value heads, so `HV` times the length of this rank's first
     local sequence (all `dht` covers) is the work available to amortize the second launch.
     The context's CPU copy of `cu_seqlens` is read so the gate stays off the device sync path.
+    A dense rank owns a single sequence, so its boundary segment is `T` itself.
     """
     if _SPLIT_HEADS is not None and HV not in _SPLIT_HEADS:
         return False
     cu_seqlens_cpu = context.cu_seqlens_cpu
     if cu_seqlens_cpu is None:
-        return True
+        return T >= _SPLIT_MIN_DENSE_TOKENS
     return HV * int(cu_seqlens_cpu[1] - cu_seqlens_cpu[0]) >= _SPLIT_MIN_HEAD_TOKENS
 
 
@@ -1729,7 +1724,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
         # dht carried back to the previous rank is the one at this rank's start, which is
         # where the first sequence starts. Both stages index sequence 0, so the slice must
         # stay single.
-        if _bwd_split_worth_it(HV, context) and g is not None:
+        if _bwd_split_worth_it(HV, context, T) and g is not None:
             k_param = k if bg is None else bg
             # Stage 1: compute dh (K x V portion of dhm)
             def grid_s1(meta): return (triton.cdiv(V, meta['BLOCK_SIZE']), HV)
