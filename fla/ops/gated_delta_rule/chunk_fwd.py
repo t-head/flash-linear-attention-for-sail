@@ -49,7 +49,6 @@ def _tril_inverse_neumann(b_A, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
     return b_P
 
 
-
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
