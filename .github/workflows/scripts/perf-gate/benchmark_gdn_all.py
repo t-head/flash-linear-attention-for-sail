@@ -86,10 +86,15 @@ gets slower than ``max(--gate-kernel-tol * its own time,
 disappears once it is averaged into the e2e total. The relative bound is 2% by
 default and the absolute floor 8 us; they meet at 400 us, so a short kernel
 (the cumsum pass is 3..31 us) is judged on the floor and a longer one on its
-own size, with no step in the allowance at the knee. That needs
+own size, with no step in the allowance at the knee. A breach counts as
+evidence only while that point's own sweeps agree within twice it; scatter
+twice the breach or wider makes the point unstable (exit 3) and the campaign
+measures another full-grid round (--gate-retry, bounded by --pod-timeout)
+before it reports. Kernel rows need
 ``--profile-iters > 0``; ``--gate-gain-level phase`` falls back to judging the
 pooled phase speedup instead (the per-phase median over the grid, the same
-number the verdict prints). The e2e total keeps its own regression check
+number the verdict prints) while still printing the per-kernel table, just
+without judging on it. The e2e total keeps its own regression check
 either way. No gain is required: a run that leaves the kernels where they
 were is a pass.
 
@@ -750,8 +755,7 @@ def cmd_bench(args):
                     print(f"[grid] H={H:3d} T={T:6d}  ERROR {rec['error']}", flush=True)
                 results.append(rec)
                 cleanup_cuda()
-    with open(args.out, "w") as fh:
-        json.dump(dict(meta=meta, results=results), fh, indent=1)
+    _dump_json(args.out, dict(meta=meta, results=results))
     print("[done] wrote", args.out, flush=True)
     return 0
 
@@ -786,21 +790,29 @@ def cleanup_cache(args, cache):
 # ---------------------------------------------------------------------------
 # baseline provisioning (clean PR checkout with no prepared base tree)
 # ---------------------------------------------------------------------------
-def archive_stale_grids(out_dir, log):
-    """Move grid JSONs from an earlier run out of the way.
+def archive_stale_run(out_dir, log):
+    """Move an earlier campaign's artifacts out of the directory.
 
     The gate pairs sweeps by index, so a leftover grid_opt_s2.json from a
     previous run would silently become an extra sweep and skew the median.
     This also catches a mix of legacy (_H<H>) and sweep (_s<N>) files.
+
+    The verdict files travel with the grids: a campaign that ends without
+    writing one (a bad --gate-phase, a sweep set it cannot judge) must not be
+    published, remembered as this head's verdict, or re-measured on the strength
+    of what an earlier campaign concluded there.
     """
     stale = sorted(glob.glob(os.path.join(out_dir, "grid_*.json")))
+    stale += [fp for fp in (os.path.join(out_dir, name)
+                            for name in ("gate.json", "gate.md", "tables.md"))
+              if os.path.exists(fp)]
     if not stale:
         return
     dest = os.path.join(out_dir, "_stale", time.strftime("%Y%m%d_%H%M%S"))
     os.makedirs(dest, exist_ok=True)
     for fp in stale:
         shutil.move(fp, os.path.join(dest, os.path.basename(fp)))
-    log(f"[stale] moved {len(stale)} grid JSON(s) from an earlier run -> {dest}")
+    log(f"[stale] moved {len(stale)} file(s) from an earlier run -> {dest}")
 
 
 def looks_like_fla_tree(path):
@@ -1003,6 +1015,7 @@ def run_worker(args, arm, repo, tag, cache, out_json, heads_s, seqlens_s,
 
 
 def cmd_all(args):
+    t_all = time.time()      # everything this process does, provisioning included
     args.out_dir = os.path.abspath(args.out_dir)
     args.opt_repo = os.path.abspath(args.opt_repo)
     if args.base_repo:
@@ -1020,7 +1033,7 @@ def cmd_all(args):
         with open(progress, "a") as fh:
             fh.write(line + "\n")
 
-    archive_stale_grids(args.out_dir, log)
+    archive_stale_run(args.out_dir, log)
 
     arms = []
     cleanup = None
@@ -1071,11 +1084,40 @@ def cmd_all(args):
             if cleanup:
                 cleanup()
             return 3 if args.gate else 1
-    log(f"campaign done in {time.time() - t0:.0f}s")
+    t_campaign = time.time() - t0
+    log(f"campaign done in {t_campaign:.0f}s")
+    # what one sweep of both arms costs, which is what a re-measure round costs
+    round_s = t_campaign / max(1, args.sweeps) if args.sweeps > 0 else 0.0
+    rc = run_aggregate(args)
+    # An unstable point is one the board could not resolve inside its own sweep
+    # scatter, so what it needs is another sweep rather than a red check the
+    # author has to argue with. A round re-measures the whole grid (a subset
+    # sweep would change what "N paired sweeps" means from point to point) and
+    # only runs while the pod still owns the budget for it.
+    for attempt in range(max(0, args.gate_retry) if args.gate else 0):
+        if rc != 3 or round_s <= 0:
+            break
+        # The pod budget was spent queueing and booting long before this process
+        # started, which the pod itself cannot see; the runner stamps the moment
+        # it submitted the job so that time is spent too.
+        budget = pod_budget_left(args.pod_timeout, args.pod_start, t_all, time.time())
+        go, why = needs_remeasure(args.out_dir, round_s, budget)
+        log(f"re-measure: {why}")
+        if not go:
+            break
+        for arm, repo, tag in arms:
+            name = f"grid_{arm}_r{attempt}"
+            ts = time.time()
+            rcr = run_worker(args, arm, repo, tag, caches[arm],
+                             os.path.join(args.out_dir, name + ".json"),
+                             heads_s, args.seq_lens, log_path=progress)
+            log(f"[{name}] rc={rcr} elapsed={time.time() - ts:.0f}s")
+            if rcr != 0:
+                break
+        rc = run_aggregate(args)
     if not args.keep_cache:
         for cache in caches.values():
             cleanup_cache(args, cache)
-    rc = run_aggregate(args)
     if cleanup:
         cleanup()
     return rc
@@ -1131,6 +1173,122 @@ def _read_json(path):
         return json.load(fh)
 
 
+def _dump_json(path, obj):
+    """Write JSON through a temporary name, so a reader never sees half a file.
+
+    A pod killed at its timeout can die in the middle of the last write, and a
+    truncated file is worse than a missing one: the readers that come after this
+    process (the checks step, the replay cache, the next campaign) would fail on
+    it rather than simply finding no verdict.
+    """
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def _write_text(path, text):
+    """Same rule for the reports: the bytes are either all there or none."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _grid_of(path):
+    """(meta, results) of a grid file, or a hole when it cannot be read.
+
+    Files are read long after the process that wrote them, so one broken JSON
+    must not take a whole campaign's verdict down with it. A file that is not
+    parseable joins the sweep list as a measurement that produced nothing, at the
+    position its name says and stamped with its modification time, and the gate
+    turns it into a named infrastructure problem.
+    """
+    try:
+        j = _read_json(path)
+        return j.get("meta", {}), list(j.get("results") or [])
+    except (OSError, ValueError) as e:
+        stamp = time.strftime("%F %T", time.localtime(os.path.getmtime(path)))
+        return dict(time=stamp, unreadable=os.path.basename(path),
+                    error=f"{type(e).__name__}: {e}"), []
+
+
+def _round_of(path):
+    """The round a grid file was measured in, or None when its name does not say.
+
+    ``grid_opt_s2.json`` is the second sweep of the plan, ``grid_opt_r0.json`` the
+    first re-measure round. A round is an identity, not a position: the two arms
+    do not always end up holding the same set of them, and only the name outlives
+    a copy that rewrites mtimes. A legacy ``grid_base_H32.json`` names no round.
+    """
+    tail = os.path.basename(path)[:-5].rsplit("_", 1)[-1]
+    if len(tail) > 1 and tail[0] in "sr" and tail[1:].isdigit():
+        return (0 if tail[0] == "s" else 1, int(tail[1:]))
+    return None
+
+
+def _round_name(rid):
+    """How a round is written in a file name, for the report."""
+    return f"{'s' if rid[0] == 0 else 'r'}{rid[1]}"
+
+
+def _sweep_key(path):
+    """Sort position of a grid file: the round it ran in, then its timestamp.
+
+    The gate pairs base against opt round by round, so a file has to sit where
+    its round happened -- which matters because an unreadable file has nothing
+    but its mtime to offer, and a late mtime would slide it and every sweep after
+    it one round sideways.
+    """
+    rid = _round_of(path)
+    if rid is not None:
+        return (rid[0], rid[1], "")
+    return (0, 0, _grid_of(path)[0].get("time", ""))
+
+
+def pair_rounds(rid_b, rid_o):
+    """Positions of the sweeps that ran in the same round, as (base, opt) pairs.
+
+    Pairing by list position instead assumes the two arms hold the same rounds,
+    and a re-measure breaks that the moment one worker dies: base answers ``r1``
+    while opt still holds ``r0`` as well, so position pairs base's ``r1`` against
+    opt's ``r0`` -- two sweeps taken minutes apart on a differently loaded board --
+    and drops opt's real ``r1`` without saying anything. That reads as a 1.14x
+    win on an unchanged kernel. A round only one arm answered is not a pair: it is
+    left out here and named as a gap by the caller.
+    """
+    if any(r is None for r in rid_b + rid_o):
+        # Legacy runs name one worker per H and carry no round; position is all
+        # there is, and their tables never claimed a paired ratio anyway.
+        return [(i, i) for i in range(min(len(rid_b), len(rid_o)))]
+    ib = {r: i for i, r in enumerate(rid_b)}
+    io = {r: i for i, r in enumerate(rid_o)}
+    return [(ib[r], io[r]) for r in sorted(set(ib) & set(io))]
+
+
+def unpaired_rounds(rid_b, rid_o):
+    """Rounds one arm measured and the other did not, as (arm, round) pairs."""
+    if any(r is None for r in rid_b + rid_o):
+        return []
+    only_b = sorted(set(rid_b) - set(rid_o))
+    only_o = sorted(set(rid_o) - set(rid_b))
+    return [("base", r) for r in only_b] + [("opt", r) for r in only_o]
+
+
+def _last_usable(metas):
+    """The newest sweep that can say anything about the arm.
+
+    One sweep's metadata describes what the arm was capable of (profile
+    counters, the cp wrapper, the tree it ran from) and is read for the whole
+    campaign, so a sweep whose file could not be read is stepped over instead of
+    quoted: it would make a complete campaign look unconfigured.
+    """
+    for m in reversed(metas):
+        if not m.get("unreadable"):
+            return m
+    return {}
+
+
 def _combine(samples):
     """Median of the numeric leaves, merging dict structures key by key."""
     samples = [s for s in samples if s is not None]
@@ -1145,15 +1303,20 @@ def _combine(samples):
 
 
 def load_arm(out_dir, prefix, drop=0):
+    """(point medians, one meta per sweep, one round id per sweep) of one arm."""
     data, metas, samples = {}, [], {}
     # matches legacy grid_<arm>_H<H>.json and CI grid_<arm>_s<N>.json, oldest
     # first so that drop removes the same warm-up sweep the gate drops
     files = sorted(glob.glob(os.path.join(out_dir, f"{prefix}_*.json")),
-                   key=lambda f: _read_json(f).get("meta", {}).get("time", ""))
+                   key=_sweep_key)
+    rids = [_round_of(fp) for fp in files][drop:]
     for fp in files[drop:]:
-        j = _read_json(fp)
-        metas.append(j.get("meta", {}))
-        for r in j["results"]:
+        meta, results = _grid_of(fp)
+        metas.append(meta)
+        if meta.get("unreadable"):
+            print(f"[warn] {fp} is not readable: {meta.get('error')}")
+            continue
+        for r in results:
             if "error" in r:
                 print(f"[warn] error in {fp}: {r['error']}")
                 continue
@@ -1162,7 +1325,7 @@ def load_arm(out_dir, prefix, drop=0):
     # keying by (H, T) alone would keep whichever sweep loaded last.
     for pt, recs in samples.items():
         data[pt] = _combine(recs)
-    return data, metas
+    return data, metas, rids
 
 
 def fmt3(v):
@@ -1175,6 +1338,12 @@ def spd(base, opt):
     return None
 
 
+# A campaign whose arms never answered one round in common has no paired ratio to
+# show. Dividing the two arm medians in its place would let the table claim a
+# pairing it did not measure, so it passes this instead and the cell reads "-".
+NO_PAIRS = (None, None)
+
+
 def paired_spd(pairs, H, T, container, key, base_ms, opt_ms):
     """Speedup as the gate computes it: median of the per-sweep ratios.
 
@@ -1184,6 +1353,8 @@ def paired_spd(pairs, H, T, container, key, base_ms, opt_ms):
     there are no sweeps to pair, i.e. legacy one-worker-per-H runs.
     """
     sb, so = pairs
+    if sb is None:
+        return None
     vals = []
     for b, o in zip(sb, so):
         pb = (b.get((H, T)) or {}).get(container) or {}
@@ -1206,6 +1377,26 @@ def kernel_knee(tol_rel, tol_abs):
     return tol_abs / tol_rel if tol_rel > 0 else None
 
 
+# How much wider a point's own sweep scatter has to be than the breach before
+# the breach stops counting as evidence. On a clean board the same untouched
+# 95 us kernel read 6 us apart across sweeps, so a 3 us breach inside that
+# wobble is the board talking, not the code -- while a 200 us breach with the
+# same wobble is a regression however jittery the point looks.
+NOISE_FACTOR = 2.0
+
+
+def point_is_unstable(margin, spread):
+    """True when the point's sweeps disagree by more than twice the breach.
+
+    ``margin`` is how far past its own bar the median sweep reads, ``spread`` the
+    range those same sweeps covered. A breach the scatter swallows cannot resolve
+    the bar it is held to, so the gate reports a measurement problem (still red
+    for a blocking board) and the campaign measures another round, rather than
+    naming a kernel that may not have slowed down at all.
+    """
+    return margin > 0 and spread >= NOISE_FACTOR * margin
+
+
 def kernel_gain_rows(sb, so, pts, tol_rel, tol_abs, phases=("fwd", "bwd")):
     """Per-kernel paired speedups, for a gain bar one kernel can clear.
 
@@ -1215,7 +1406,9 @@ def kernel_gain_rows(sb, so, pts, tol_rel, tol_abs, phases=("fwd", "bwd")):
     therefore runs on kernels:
       * the best kernel's pooled ratio is what a gain claim has to clear;
       * a kernel that gets slower than its allowance at any point is a
-        regression.
+        regression, unless that point's own sweeps scatter twice the breach or
+        wider -- then it is reported as unstable, which asks for a re-run
+        instead of naming a kernel.
 
     The allowance is max(tol_rel * base, tol_abs): 2% of the kernel's own time
     or 8 us, whichever is larger. The two bounds meet at tol_abs / tol_rel
@@ -1271,12 +1464,19 @@ def kernel_gain_rows(sb, so, pts, tol_rel, tol_abs, phases=("fwd", "bwd")):
                 deltas = [o - b for b, o in pairs]
                 margins = [(o - b) - kernel_bound(b, tol_rel, tol_abs)[0]
                            for b, o in pairs]
+                # Scatter of the margin across the paired sweeps: how much this
+                # board wobbles on this one point. A breach the same wobble
+                # swallows cannot be told from a point that held its speed, so
+                # the row carries the evidence and the caller decides: scatter
+                # twice the breach or wider reads as unstable.
+                spread = max(margins) - min(margins) if len(margins) > 1 else 0.0
                 rows.append(dict(
                     H=H, T=T, phase=ph, kernel=name, short=short(name),
                     speedup=median([b / o for b, o in pairs]),
                     base_ms=base_ms, opt_ms=opt_ms,
                     delta_ms=median(deltas), margin_ms=median(margins),
-                    tol_ms=allowed, rule=rule, paired=len(pairs)))
+                    spread_ms=spread, tol_ms=allowed, rule=rule,
+                    paired=len(pairs)))
 
     units = {}
     for r in rows:
@@ -1296,12 +1496,17 @@ def kernel_gain_rows(sb, so, pts, tol_rel, tol_abs, phases=("fwd", "bwd")):
         # A kernel sitting exactly on its allowance is not over it: the
         # comparison is on floats, and 3.06 - 3.00 is 0.06000000000000005.
         # The epsilon (1 ns) only absorbs that representation error.
-        u["regressed"] = [dict(H=p["H"], T=p["T"], phase=p["phase"],
-                               speedup=p["speedup"], base_ms=p["base_ms"],
-                               opt_ms=p["opt_ms"], delta_ms=p["delta_ms"],
-                               margin_ms=p["margin_ms"],
-                               tol_ms=p["tol_ms"], rule=p["rule"])
-                          for p in pts_u if p["margin_ms"] > 1e-9]
+        unstable, regressed = [], []
+        for p in pts_u:
+            if not p["margin_ms"] > 1e-9:
+                continue
+            row = dict(H=p["H"], T=p["T"], phase=p["phase"], speedup=p["speedup"],
+                       base_ms=p["base_ms"], opt_ms=p["opt_ms"],
+                       delta_ms=p["delta_ms"], margin_ms=p["margin_ms"],
+                       spread_ms=p["spread_ms"], tol_ms=p["tol_ms"], rule=p["rule"])
+            (unstable if point_is_unstable(p["margin_ms"], p["spread_ms"])
+             else regressed).append(row)
+        u["unstable"], u["regressed"] = unstable, regressed
         out.append(u)
     out.sort(key=lambda u: -u["speedup"])
     return out, unpaired
@@ -1315,7 +1520,39 @@ def _kernel_brief(u):
                 base_ms=u["base_ms"], opt_ms=u["opt_ms"], delta_ms=u["delta_ms"],
                 margin_ms=u.get("margin_ms"), tol_ms=u["tol_ms"],
                 rule=u.get("rule"), points=u.get("n_points"),
-                regressed=len(u.get("regressed") or []))
+                regressed=len(u.get("regressed") or []),
+                unstable=len(u.get("unstable") or []))
+
+
+def kernel_breakdown_lines(units, judged, tol_rel, tol_abs):
+    """Markdown of one row per kernel: both medians, the gap, and how it reads.
+
+    Every gate report gets this table, at both gain levels: whoever reads a verdict
+    wants to know which kernel moved, and a bar chart gives no number to argue with.
+    ``judged`` only labels the table -- whether these rows carry the verdict is the
+    caller's decision.
+    """
+    if not units:
+        return ["- nothing to break down: no kernel was timed in a sweep both arms "
+                "answered, so the phase numbers are all this board measured"]
+    out = ["- the diff columns are opt minus base, so a positive number means this "
+           f"arm is slower; a kernel fails once it is over max({tol_rel * 100:.0f}%, "
+           f"{tol_abs * 1e3:.0f} us) slower than base, and reads unstable when its "
+           "own sweeps scatter twice the breach or wider; the medians can average one "
+           "slow point away, so the per-point rows stay the authority; "
+           + ("this table is what the verdict judges" if judged
+              else "the verdict above is on the phase numbers"), "",
+           "| phase | kernel | base ms | opt ms | diff ms | diff % | unstable | pass |",
+           "|---|---|---:|---:|---:|---:|:--:|:--:|"]
+    for u in sorted(units, key=lambda u: u["speedup"]):
+        delta = u["opt_ms"] - u["base_ms"]
+        pct = delta / u["base_ms"] * 100 if u["base_ms"] else 0.0
+        noise = bool(u.get("unstable"))
+        out.append(f"| {u['phase']} | {u['short']} | {u['base_ms']:.3f} | "
+                   f"{u['opt_ms']:.3f} | {delta:+.3f} | {pct:+.1f}% | "
+                   f"{'yes' if noise else 'no'} | "
+                   f"{'no' if (u.get('regressed') or noise) else 'yes'} |")
+    return out
 
 
 def paired_kernel_spd(pairs, H, T, phase, names, base_ms, opt_ms):
@@ -1328,6 +1565,8 @@ def paired_kernel_spd(pairs, H, T, phase, names, base_ms, opt_ms):
     sums the torch-native rows, the table's `other` bucket.
     """
     sb, so = pairs
+    if sb is None:
+        return None
     vals = []
     for b, o in zip(sb, so):
         pb = profile_rows(b.get((H, T)), phase)
@@ -1386,7 +1625,9 @@ def kernel_cell(grid_base, grid_opt, H, T, phase, k, pick):
 
 
 def _meta_line(name, metas):
-    m = metas[0] if metas else {}
+    # the oldest sweep that can answer: an unreadable file has no identity to
+    # report, and listing one would put "?" where a commit belongs
+    m = next((x for x in metas if not x.get("unreadable")), {})
     if not m:
         return None
     dirty = m.get("dirty")
@@ -1408,6 +1649,8 @@ def kernel_ms(rec, unit):
 def paired_unit_spd(pairs, H, T, unit, base_ms, opt_ms):
     """Speedup of one launch unit over the paired sweeps (--kernels runs)."""
     sb, so = pairs
+    if sb is None:
+        return None
     vals = []
     for b, o in zip(sb, so):
         vb = kernel_ms(b.get((H, T)), unit)
@@ -1425,8 +1668,14 @@ def _kernel_cell(gb, go, H, T, unit, pairs=None):
     if b is None and o is None:
         return "-"
     # The table has to show the number the gate judges; the two per-arm
-    # medians are only the fallback when there is no sweep to pair.
-    s = (paired_unit_spd(pairs, H, T, unit, b, o) if pairs else None) or spd(b, o)
+    # medians are only the fallback when there is no sweep to pair. A CI
+    # campaign whose arms never answered the same round gets no fallback: a
+    # ratio of two independent medians would read exactly like the paired
+    # number it is not, so the cell stays a pair of timings.
+    if pairs is NO_PAIRS:
+        s = None
+    else:
+        s = (paired_unit_spd(pairs, H, T, unit, b, o) if pairs else None) or spd(b, o)
     bs = f"{b:.3f}" if b is not None else "n/a"
     os_ = f"{o:.3f}" if o is not None else "n/a"
     return f"{bs}->{os_} ({s:.2f}x)" if s else f"{bs}->{os_}"
@@ -1456,7 +1705,10 @@ def aggregate_kernels(args, gb, go, mb, mo, pairs=None):
     w = lines.append
     w(f"# GDN single-kernel: {tag_opt} vs {tag_base} — aggregated tables")
     w("")
-    w("speedup = median of the per-sweep paired ratios, base/opt (> 1 = opt faster)")
+    w("speedup = median of the per-sweep paired ratios, base/opt (> 1 = opt faster)"
+      if pairs is not NO_PAIRS else
+      "the arms never answered one round in common: no speedup below is a paired "
+      "measurement, so the cells show the two timings without a ratio")
     w("ms = device time of the timed unit summed over its fla kernels only, the same "
       "denominator as the T2/T3 columns; torch-native fills/reductions are excluded "
       "into `other_ms` and `wall` adds launch overhead.")
@@ -1490,8 +1742,7 @@ def aggregate_kernels(args, gb, go, mb, mo, pairs=None):
 
     txt = "\n".join(lines)
     out_fp = os.path.join(args.out_dir, "tables.md")
-    with open(out_fp, "w") as fh:
-        fh.write(txt + "\n")
+    _write_text(out_fp, txt + "\n")
     print(txt)
     print(f"[done] wrote {out_fp}", flush=True)
     return 0
@@ -1502,23 +1753,40 @@ def run_aggregate(args):
     # the sweep selection from what is on disk: drop the same warm-up the gate
     # dropped and pair the same files, otherwise tables.md and the verdict
     # report different speedups for the same campaign.
-    sb, _ = load_sweeps(args.out_dir, "grid_base")
-    so, _ = load_sweeps(args.out_dir, "grid_opt")
+    sb, _, _ = load_sweeps(args.out_dir, "grid_base")
+    so, _, _ = load_sweeps(args.out_dir, "grid_opt")
     usable = min(len(sb), len(so))
     # Same selection as run_gate: keep at least two sweeps and drop the same
     # warm-up, or the table would pair different files than the verdict.
     drop = min(max(args.drop_sweeps, 0), max(0, usable - 2))
-    gb, mb = load_arm(args.out_dir, "grid_base", drop)
-    go, mo = load_arm(args.out_dir, "grid_opt", drop)
-    cb, cbm = load_arm(args.out_dir, "cp_base", drop) if args.include_cp else ({}, [])
-    co, com = load_arm(args.out_dir, "cp_opt", drop) if args.include_cp else ({}, [])
+    gb, mb, rid_b = load_arm(args.out_dir, "grid_base", drop)
+    go, mo, rid_o = load_arm(args.out_dir, "grid_opt", drop)
+    cb, cbm, _ = (load_arm(args.out_dir, "cp_base", drop)
+                  if args.include_cp else ({}, [], []))
+    co, com, _ = (load_arm(args.out_dir, "cp_opt", drop)
+                  if args.include_cp else ({}, [], []))
     if not gb and not go:
         print(f"[error] no grid_*.json found in {args.out_dir}")
         return 1
 
     # Every speedup below is the gate's quantity: the median of the per-sweep
-    # paired ratios over the same retained sweeps the verdict uses.
-    pairs = (sb[drop:], so[drop:])
+    # paired ratios over the same retained sweeps the verdict uses, matched round
+    # to round by the number in the file name and over the same readable ones.
+    # Position would be enough while both arms hold every round, but a re-measure
+    # whose worker died leaves one arm a round the other never answered, and then
+    # the table would divide two sweeps taken minutes apart and still call the
+    # result paired. A sweep whose file cannot be parsed is skipped by both, so a
+    # campaign with a half-written file does not print tables whose numbers come
+    # from a different pairing than the verdict.
+    kept_b, kept_o = sb[drop:], so[drop:]
+    keep = [(i, j) for i, j in pair_rounds(rid_b, rid_o)
+            if not (mb[i].get("unreadable") or mo[j].get("unreadable"))]
+    if keep:
+        pairs = ([kept_b[i] for i, _ in keep], [kept_o[j] for _, j in keep])
+    elif any(r is None for r in rid_b + rid_o):
+        pairs = ([], [])            # legacy runs carry no round: arm medians stand
+    else:
+        pairs = NO_PAIRS
 
     heads = sorted({H for H, _ in list(gb) + list(go)})
     ts = sorted({T for _, T in list(gb) + list(go)})
@@ -1532,9 +1800,14 @@ def run_aggregate(args):
 
     lines = []
     w = lines.append
+    no_pair = pairs is NO_PAIRS
     w(f"# GDN: {tag_opt} vs {tag_base} — aggregated tables")
     w("")
-    w("speedup = median of the per-sweep paired ratios, base/opt (> 1 = opt faster)")
+    w("speedup = median of the per-sweep paired ratios, base/opt (> 1 = opt faster)"
+      if not no_pair else
+      "the arms never answered one round in common: no speedup below is a paired "
+      "measurement, and the columns are left blank rather than filled with a "
+      "ratio of two independent medians")
     w(f"grid: base_pts={len(gb)} opt_pts={len(go)}"
       + (f"  cp: base_pts={len(cb)} opt_pts={len(co)}" if args.include_cp else ""))
     for name, metas in (("base", mb), ("opt", mo)):
@@ -1546,8 +1819,12 @@ def run_aggregate(args):
     # ---------------- Table 1: E2E ----------------
     w("## T1. Module-level E2E (chunk_gated_delta_rule, non-CP) — speedup = base/opt")
     w("")
-    w("> latencies are per-arm medians; the speedup column is the median of the")
-    w("> per-sweep paired ratios, the same number the gate judges.")
+    if no_pair:
+        w("> the arms answered no round in common: the latencies below are measured,")
+        w("> the speedup columns are left blank instead of a ratio of two medians.")
+    else:
+        w("> latencies are per-arm medians; the speedup column is the median of the")
+        w("> per-sweep paired ratios, the same number the gate judges.")
     w("")
     w("| H | T | base_fwd | base_bwd | base_total | opt_fwd | opt_bwd | opt_total | fwd x | bwd x | total x |")
     w("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
@@ -1685,8 +1962,7 @@ def run_aggregate(args):
 
     txt = "\n".join(lines)
     out_fp = os.path.join(args.out_dir, "tables.md")
-    with open(out_fp, "w") as fh:
-        fh.write(txt + "\n")
+    _write_text(out_fp, txt + "\n")
     print(txt)
     print(f"[done] wrote {out_fp}", flush=True)
     if args.gate:
@@ -1698,19 +1974,22 @@ def run_aggregate(args):
 # CI gate: median-of-N paired sweeps + regression verdict
 # ---------------------------------------------------------------------------
 def load_sweeps(out_dir, prefix):
-    """All grid JSONs of one arm, ordered by measurement time.
+    """All grid JSONs of one arm, ordered by the round each was measured in.
 
     Records are kept even when the measurement failed: a point that never
     produced timings has to surface as an infrastructure problem, not vanish.
+    The same holds for a file that cannot be parsed at all -- it stays in the
+    list as a sweep with no points, so the count the gate reports is the count
+    of sweeps that were attempted.
     """
     files = sorted(glob.glob(os.path.join(out_dir, f"{prefix}_*.json")),
-                   key=lambda f: _read_json(f).get("meta", {}).get("time", ""))
+                   key=_sweep_key)
     sweeps, metas = [], []
     for fp in files:
-        j = _read_json(fp)
-        metas.append(j.get("meta", {}))
-        sweeps.append({(r["H"], r["T"]): r for r in j.get("results", [])})
-    return sweeps, metas
+        meta, results = _grid_of(fp)
+        metas.append(meta)
+        sweeps.append({(r["H"], r["T"]): r for r in results})
+    return sweeps, metas, [_round_of(fp) for fp in files]
 
 
 def median(xs):
@@ -1726,10 +2005,55 @@ def _meta_ident(m):
             f"({m.get('fla_file', '?')})")
 
 
+# A pod that overruns its budget publishes nothing, which is worse than an
+# honest red, so a re-measure leaves this much of the budget for the report.
+PUBLISH_MARGIN_S = 600
+
+
+def pod_budget_left(pod_timeout_min, pod_start, t_process, now):
+    """Seconds of pod budget left, or None when the campaign does not know it.
+
+    Two hosts' clocks are involved: the stamp comes from the runner that
+    submitted the job, the reading from the pod that runs it. Only one of the
+    two mistakes is affordable -- a stamp that is in the future here would hand
+    a re-measure a budget the campaign has already eaten, and a pod killed at
+    its timeout publishes nothing -- so an impossible stamp is ignored and the
+    time counted from this process' own start instead. A stamp that is merely
+    older than the truth makes the guard refuse a round, which costs a look and
+    not the report.
+    """
+    if pod_timeout_min <= 0:
+        return None
+    t_stamp = pod_start if 0 < pod_start <= now else t_process
+    return pod_timeout_min * 60 - max(0.0, now - t_stamp)
+
+
+def needs_remeasure(out_dir, round_s, budget_s=None):
+    """(yes, why) for measuring one more sweep after an INFRA verdict.
+
+    Only an unstable point is worth another sweep: a regression already is a
+    measurement, and a dead pod or a dirty tree is not fixed by more of them.
+    ``budget_s`` is the time the campaign still owns, or None when unknown.
+    """
+    try:
+        d = _read_json(os.path.join(out_dir, "gate.json"))
+    except (OSError, ValueError):
+        return False, "no gate.json to read"
+    pts = ((d.get("kernel_gain") or {}).get("unstable") or [])
+    cells = [c for c in d.get("cells") or [] if c.get("reason") == "unstable"]
+    if (d.get("verdict") or "") != "infra" or not (pts or cells):
+        return False, f"verdict={d.get('verdict')} with no unstable point"
+    if budget_s is not None and budget_s < round_s + PUBLISH_MARGIN_S:
+        return False, (f"{len(pts) + len(cells)} unstable point(s) but only "
+                       f"{budget_s / 60:.0f} min of budget left, a sweep needs "
+                       f"{round_s / 60:.0f} min")
+    return True, f"{len(pts) + len(cells)} unstable point(s) unreadable on this board"
+
+
 def run_gate(args):
     """Judge PR regressions. 0 = pass, 2 = regression, 3 = infra/config."""
-    sb, mb = load_sweeps(args.out_dir, "grid_base")
-    so, mo = load_sweeps(args.out_dir, "grid_opt")
+    sb, mb, rid_b = load_sweeps(args.out_dir, "grid_base")
+    so, mo, rid_o = load_sweeps(args.out_dir, "grid_opt")
     if not sb or not so:
         print(f"[gate] no grid_base/grid_opt JSON in {args.out_dir}", flush=True)
         return 3
@@ -1741,8 +2065,25 @@ def run_gate(args):
     n_total = min(len(sb), len(so))
     drop = min(max(args.drop_sweeps, 0), max(0, n_total - 2))
     sb, so = sb[drop:], so[drop:]
+    rid_b, rid_o = rid_b[drop:], rid_o[drop:]
     n = min(len(sb), len(so))
-    mb0, mo0 = (mb[-1] if mb else {}), (mo[-1] if mo else {})
+    # Sweeps beyond what was asked for mean a re-measure round ran. The reader
+    # has to see that: "used=4" of a 3-sweep plan is not the same campaign that
+    # started, and an unstable point named after a re-measure is far worse news
+    # than one that was only ever read once. Count the rounds, not the files: a
+    # re-measure whose worker died leaves one arm the extra round alone.
+    if any(r is not None for r in rid_b + rid_o):
+        again = len({r for r in rid_b + rid_o if r is not None and r[0] == 1})
+    else:
+        # A legacy run (one worker per H) names no round at all, and never says
+        # how many sweeps it wanted, so it cannot claim a re-measure either.
+        again = n_total - args.sweeps if args.sweeps > 0 else 0
+    remedy = (f"re-measured {again} round(s) and still unreadable" if again
+              else "re-run to measure again")
+    # Same fact for the summary line, where "to re-run" would be stale advice if
+    # the campaign already paid for another look.
+    unstable_note = "unreadable after re-measure" if again else "to re-run"
+    mb0, mo0 = _last_usable(mb), _last_usable(mo)
     if n < 2:
         problems.append(f"only {n} usable sweep(s); need >=2 for a stable median")
     fb, fo = mb0.get("fla_file"), mo0.get("fla_file")
@@ -1809,13 +2150,31 @@ def run_gate(args):
     ok = [{k for k, r in s.items() if "error" not in r and all(f in r for f in fields)}
           for s in sb + so]
     nb = len(sb)
+    # A sweep whose JSON cannot be read at all (a pod killed mid-write leaves a
+    # truncated file now and then) is a gap in the evidence rather than a
+    # contradiction. It is named as a problem so the run stays infra, but it is
+    # not required to hold every point: judging on the sweeps that did answer
+    # keeps a report and a verdict where the alternative was silence.
+    mbk, mok = mb[drop:], mo[drop:]
+    hb = [bool(m.get("unreadable")) for m in mbk]
+    ho = [bool(m.get("unreadable")) for m in mok]
     grid = set()
     for m in (mb0, mo0):
         if m.get("heads") and m.get("seqlens"):
             grid |= {(int(h), int(t)) for h in m["heads"] for t in m["seqlens"]}
-    for arm, sw, sets in (("base", sb, ok[:nb]), ("opt", so, ok[nb:])):
+    for arm, sw, sets, holes, rids in (("base", sb, ok[:nb], hb, rid_b),
+                                       ("opt", so, ok[nb:], ho, rid_o)):
         for i, (s, ks) in enumerate(zip(sw, sets)):
-            label = f"{arm} sweep {i + drop}"
+            # Name the round, not the list position: a re-measure can leave one arm
+            # a round the other does not have, and then the position says nothing
+            # about when the sweep was actually taken.
+            label = (f"{arm} round {_round_name(rids[i])}" if rids[i] is not None
+                     else f"{arm} sweep {i + drop}")
+            if holes[i]:
+                meta = (mbk if arm == "base" else mok)[i]
+                problems.append(f"{label}: {meta['unreadable']} is not readable "
+                                f"({meta['error']})")
+                continue
             failed = []
             for (H, T) in sorted(set(s) - ks):
                 miss = [f for f in fields if f not in s[(H, T)]]
@@ -1831,8 +2190,10 @@ def run_gate(args):
                 problems.append(f"{label}: ... and {len(absent) - 6} more unmeasured point(s)")
 
     # a point that failed in one arm only would silently drop out of the gate
-    pb = set.intersection(*ok[:nb]) if ok[:nb] else set()
-    po = set.intersection(*ok[nb:]) if ok[nb:] else set()
+    goodb = [ks for ks, bad in zip(ok[:nb], hb) if not bad]
+    goodo = [ks for ks, bad in zip(ok[nb:], ho) if not bad]
+    pb = set.intersection(*goodb) if goodb else set()
+    po = set.intersection(*goodo) if goodo else set()
     if pb != po:
         problems.append(f"point sets differ: only-base={sorted(pb - po)[:6]}, "
                         f"only-opt={sorted(po - pb)[:6]}")
@@ -1840,23 +2201,47 @@ def run_gate(args):
         problems = problems[:12] + [f"... {len(problems) - 12} more sweep problem(s)"]
     pts = sorted(pb & po)
     if not pts:
-        # No judged point left: list why, so the annotations name the damage
-        # instead of only reporting a missing gate.json.
+        # No judged point left. The old code returned here, which left the PR with
+        # no gate.json and no answer -- and the sweep holes named above are the
+        # only real finding the run has. Keep going so the report publishes them.
         print("[gate] no common (H,T) points between arms", flush=True)
-        for p in problems:
-            print(f"[gate]   infra: {p}", flush=True)
-        return 3
+        problems.append("no (H,T) point was measured successfully in both arms, so "
+                        "nothing below is a judgement on the code")
 
+    # Pair the rounds both arms answered in full; `used` then says how many
+    # ratios the medians come from, not how many files were attempted. Pairing by
+    # position instead would assume the arms hold the same rounds, and a re-measure
+    # whose worker died breaks that: base answers r1 while opt still answers r0
+    # too, and the two sweeps get divided against each other.
+    idx = [(i, j) for i, j in pair_rounds(rid_b, rid_o) if not (hb[i] or ho[j])]
+    for arm, rid in unpaired_rounds(rid_b, rid_o):
+        problems.append(
+            f"{arm} round {_round_name(rid)} has no "
+            f"{('opt' if arm == 'base' else 'base')} sweep of that round to pair "
+            f"with, so it is left out of every median")
+    if len(idx) < 2:
+        problems.append(f"only {len(idx)} readable sweep pair(s) left; need >=2 for a "
+                        f"stable median")
+    n = len(idx)
+    # The kernel profiles are paired the same way as the numbers above.
+    pb_sw, po_sw = [sb[i] for i, _ in idx], [so[j] for _, j in idx]
     cells = []
-    for H, T in pts:
-        for ph in phases:
-            field, key = PHASE_FIELDS[ph]
-            sp = [sb[i][(H, T)][field][key] / so[i][(H, T)][field][key] for i in range(n)]
-            cells.append(dict(
-                H=H, T=T, phase=ph, speedup=median(sp), min=min(sp), max=max(sp),
-                base_ms=median([sb[i][(H, T)][field][key] for i in range(n)]),
-                opt_ms=median([so[i][(H, T)][field][key] for i in range(n)]),
-                reason=None))
+    # Two arms can share every point and still have no round in common: base
+    # losing its first file to a killed pod, opt losing its second, leaves nothing
+    # to pair. Computing a median of that would raise and cost the whole
+    # campaign its report, so the empty case is skipped and the holes named above
+    # carry the run out as infra.
+    if idx:
+        for H, T in pts:
+            for ph in phases:
+                field, key = PHASE_FIELDS[ph]
+                sp = [sb[i][(H, T)][field][key] / so[j][(H, T)][field][key]
+                      for i, j in idx]
+                cells.append(dict(
+                    H=H, T=T, phase=ph, speedup=median(sp), min=min(sp), max=max(sp),
+                    base_ms=median([sb[i][(H, T)][field][key] for i, _ in idx]),
+                    opt_ms=median([so[j][(H, T)][field][key] for _, j in idx]),
+                    reason=None))
 
     def cell_tol(phase):
         return args.gate_tol_cp if PHASE_FIELDS[phase][0] == "cp" else args.gate_tol
@@ -1879,35 +2264,83 @@ def run_gate(args):
     if any(PHASE_FIELDS[p][0] == "cp" for p in phases):
         kernel_phases += ["cp_fwd", "cp_bwd"]
     gain_on_kernel = all(PHASE_FIELDS[p][0] == "e2e" for p in gain_phases)
+    iters = [m.get("profile_iters") for m in (mb0, mo0)]
+    has_prof = all(isinstance(i, int) and i > 0 for i in iters)
     if args.gate_gain_level == "kernel":
-        iters = [m.get("profile_iters") for m in (mb0, mo0)]
-        if not all(isinstance(i, int) and i > 0 for i in iters):
+        if not has_prof:
             print("[gate] a kernel-level verdict needs per-kernel timings, but "
                   f"the arms ran with profile_iters={iters}; re-run the workers with "
                   f"--profile-iters > 0 or pass --gate-gain-level phase", flush=True)
             return 3
         kernel_units, kernel_unpaired = kernel_gain_rows(
-            sb, so, pts, args.gate_kernel_tol, args.gate_kernel_tol_abs, kernel_phases)
+            pb_sw, po_sw, pts, args.gate_kernel_tol, args.gate_kernel_tol_abs,
+            kernel_phases)
         if not kernel_units:
-            print("[gate] no kernel was launched by both arms, so no kernel gain can "
-                  "be judged; the not-comparable rows name why", flush=True)
-            return 3
-        kernel_mode = True
+            # Nothing to judge on, but that is a gap in the evidence rather than a
+            # verdict on the code, and a run that publishes nothing is worse than an
+            # honest red: say so, stay infra, and still write the report.
+            print("[gate] no kernel has a timing from a round both arms answered, so "
+                  f"no kernel gain can be judged ({len(kernel_unpaired)} unmatched "
+                  f"kernel row(s), {sum(1 for x in hb + ho if x)} unreadable file(s))",
+                  flush=True)
+            problems.append(
+                f"no kernel has a timing from a round both arms answered: "
+                f"{len(kernel_unpaired)} unmatched kernel row(s) and "
+                f"{sum(1 for x in hb + ho if x)} unreadable file(s) leave no kernel "
+                f"gain to judge; {remedy}")
+        else:
+            kernel_mode = True
+    elif has_prof:
+        # A phase-level run draws the same kernel table: whoever reads a phase
+        # verdict still wants to know which kernel moved. The rows describe and
+        # do not judge -- every decision that could consume them below is guarded
+        # on kernel_mode, so this cannot turn a passing run into a failing one.
+        kernel_units, kernel_unpaired = kernel_gain_rows(
+            pb_sw, po_sw, pts, args.gate_kernel_tol, args.gate_kernel_tol_abs,
+            kernel_phases)
 
     # Two distinct failure modes: slower than base (a real regression) and
     # faster than base but below the requested bar (a shortfall).  Keeping them
     # apart stops the log from calling a 1.08x point a "regression". A kernel
     # gain is not a phase bar, so a phase-level run is the only one that
     # collects phase shortfalls.
+    # A third kind sits between them: a breach the point's own sweeps do not
+    # agree on, which says the window was disturbed rather than the code, and
+    # is asked for a re-run.
     regressions = []
+    unstable_points = []
     for c in cells:
         c["tol"] = cell_tol(c["phase"])
-        if c["speedup"] < 1.0 - c["tol"]:
-            c["reason"] = "regression"
-            regressions.append(c)
+        # How far below the bar the median reads, in the same ratio units as the
+        # sweep range: the breach the point is blamed for.
+        c["margin"] = 1.0 - c["tol"] - c["speedup"]
+        if c["margin"] > 0:
+            if point_is_unstable(c["margin"], c["max"] - c["min"]):
+                c["reason"] = "unstable"
+                unstable_points.append(c)
+            else:
+                c["reason"] = "regression"
+                regressions.append(c)
 
     kernel_best = kernel_units[0] if kernel_mode else None
-    kernel_regressions = [u for u in kernel_units if u["regressed"]]
+    # Only a kernel-level verdict feeds kernel rows into the decision; a
+    # phase-level run reports them and keeps the verdict on the phase numbers.
+    kernel_regressions = ([u for u in kernel_units if u["regressed"]]
+                          if kernel_mode else [])
+    kernel_unstable = ([(u, p) for u in kernel_units for p in u["unstable"]]
+                       if kernel_mode else [])
+    for u, p in kernel_unstable:
+        problems.append(
+            f"{u['short']} {p['phase']} H={p['H']} T={p['T']} is over its "
+            f"{p['tol_ms']:.3f} ms bound by {p['margin_ms']:.3f} ms, but its "
+            f"sweeps scatter {p['spread_ms']:.3f} ms, twice the breach or "
+            f"wider: the point cannot resolve the bar it is held to; {remedy}")
+    for c in unstable_points:
+        problems.append(
+            f"H={c['H']} T={c['T']} {c['phase']} reads {c['speedup']:.3f}x, "
+            f"{c['margin'] * 100:.2f}% below its {c['tol']:.3f} bar, while its "
+            f"own sweeps span {c['min']:.3f}..{c['max']:.3f}x: that scatter is "
+            f"twice the breach or wider; {remedy}")
     kernel_shortfall = None
     # The best-kernel bar is an e2e claim: a cp-only gain is a different request
     # and keeps its phase-level number.
@@ -1916,8 +2349,14 @@ def run_gate(args):
             and kernel_best["speedup"] < args.min_speedup):
         kernel_shortfall = kernel_best
 
-    pooled = {ph: median([c["speedup"] for c in cells if c["phase"] == ph])
-              for ph in phases}
+    # A phase with no cell has no number to pool. Dropping the key is the honest
+    # shape: every reader of gate.json formats what is left as a ratio, and a
+    # null would only reach a format string.
+    pooled = {}
+    for ph in phases:
+        vals = [c["speedup"] for c in cells if c["phase"] == ph]
+        if vals:
+            pooled[ph] = median(vals)
     # The bar applies to the pooled phase speedup, the same number the verdict
     # reports and the workflow re-checks: a per-point bar failed a real win at
     # 0.998x on a single (H,T) wobble the pooling is there to absorb.
@@ -1942,9 +2381,11 @@ def run_gate(args):
                                    gain_phases=gain_phases,
                                    gain_level="kernel" if kernel_mode else "phase",
                                    kernel_tol=args.gate_kernel_tol,
-                                   kernel_tol_abs=args.gate_kernel_tol_abs),
+                                   kernel_tol_abs=args.gate_kernel_tol_abs,
+                                   noise_factor=NOISE_FACTOR),
                    skipped_phases=skipped,
-                   sweeps=dict(files_base=len(mb), files_opt=len(mo), used=n, dropped=drop),
+                   sweeps=dict(files_base=len(mb), files_opt=len(mo), used=n,
+                               dropped=drop, remeasured=again),
                    pooled=pooled, problems=problems, cells=cells,
                    kernel_gain=dict(
                        level="kernel" if kernel_mode else "phase",
@@ -1954,8 +2395,12 @@ def run_gate(args):
                                                     args.gate_kernel_tol_abs)),
                        best=_kernel_brief(kernel_best),
                        units=[_kernel_brief(u) for u in kernel_units],
+                       # Judged rows only, so a phase-level run cannot ask for a
+                       # re-measure round over kernels it does not gate on.
                        regressions=[dict(kernel=u["short"], **p)
-                                    for u in kernel_units for p in u["regressed"]],
+                                    for u in kernel_regressions for p in u["regressed"]],
+                       unstable=[dict(kernel=u["short"], **p)
+                                 for u, p in kernel_unstable],
                        not_comparable=kernel_unpaired),
                    failing=[dict(H=c["H"], T=c["T"], phase=c["phase"],
                                  reason=c["reason"], speedup=c["speedup"],
@@ -1968,13 +2413,41 @@ def run_gate(args):
                    opt=dict(tag=mo0.get("tag"), commit=mo0.get("commit"),
                             fla_file=mo0.get("fla_file"), dirty=mo0.get("dirty"),
                             torch=mo0.get("torch"), device=mo0.get("device")))
-    with open(os.path.join(args.out_dir, "gate.json"), "w") as fh:
-        json.dump(payload, fh, indent=1)
+    _dump_json(os.path.join(args.out_dir, "gate.json"), payload)
 
-    lines = [f"# GDN performance gate: {verdict.upper()}", ""]
+    # Name the board in the headline: a PR carries one comment per board and the
+    # two do not always agree, so an unlabelled FAIL has no answer to "which
+    # machine?". The CI label is what the reader clicked; the device string is
+    # what the pod actually held, so a mismatch between them shows up in the
+    # title instead of being silently renamed away.
+    label = os.environ.get("PERF_BOARD") or ""
+    seen = "/".join(sorted({m.get("device") for m in (mo0, mb0) if m.get("device")}))
+    board = label or seen
+    if label and seen and label != seen:
+        board = f"{label} (device {seen})"
+    lines = [f"# GDN performance gate{' on ' + board if board else ''}: "
+             f"{verdict.upper()}", ""]
     lines.append(f"- opt: {_meta_ident(mo0)}")
     lines.append(f"- base: {_meta_ident(mb0)}")
-    lines.append(f"- sweeps: used={n} (dropped {drop} of {n_total} pairs)")
+    # Say out loud when the paired count is smaller than the files on disk, so
+    # "used=3 (dropped 0 of 4 pairs)" is not read as an arithmetic mistake.
+    unread = sum(1 for x in hb + ho if x)
+    note = f"- sweeps: used={n} (dropped {drop} of {n_total} pairs"
+    note += f", {unread} file(s) unreadable" if unread else ""
+    note += ("); every number below is the median of those paired sweeps" if n else
+             "); the arms never answered a round in common, so nothing below is a "
+             "measurement")
+    lines.append(note)
+    lines.append("- noise rule: a breach counts as evidence only while the point's "
+                 f"own sweeps agree within {NOISE_FACTOR:.0f}x it; scatter twice the "
+                 "breach or wider makes the point unstable, the campaign measures "
+                 "another round, and the report says whether the point settled")
+    if again:
+        # Say so in the report: the extra sweeps are in every number below, and a
+        # point that still scatters after a second look is different news from
+        # one that was only ever read once.
+        lines.append(f"- re-measure: {again} extra sweep round(s) ran after an unstable "
+                     f"point; they are paired into the medians below")
     lines.append(f"- thresholds: speedup >= {1.0 - args.gate_tol:.3f} (e2e)"
                  f", >= {1.0 - args.gate_tol_cp:.3f} (cp)"
                  + (f", >= {args.min_speedup:.3f} (min-speedup on the best kernel)"
@@ -1995,11 +2468,14 @@ def run_gate(args):
                          f"meet at {knee:.3f} ms)")
     if skipped:
         lines.append(f"- skipped phases: {', '.join(skipped)} (an arm did not measure them)")
-    lines.append("- pooled: " + ", ".join(f"{ph} {v:.3f}x" for ph, v in pooled.items()))
+    lines.append("- pooled: " + (", ".join(f"{ph} {v:.3f}x" for ph, v in pooled.items())
+                                 or "nothing: no sweep was readable in both arms"))
+    n_unstable = len(kernel_unstable) + len(unstable_points)
     lines.append(f"- result: {len(regressions)} regression(s), "
                  f"{len(shortfalls)} shortfall(s)"
                  + (f", {len(kernel_regressions)} kernel regression(s)"
                     if kernel_mode else "")
+                 + (f", {n_unstable} unstable point(s) {unstable_note}" if n_unstable else "")
                  + f", {len(problems)} infra problem(s)")
     if problems:
         lines += ["", "## Infra problems"] + [f"- {p}" for p in problems]
@@ -2025,18 +2501,9 @@ def run_gate(args):
                          f"{c['opt_ms']:.3f} | {c['speedup']:.3f}x | "
                          f"{(args.min_speedup - c['speedup']) * 100:.1f}% | "
                          f"{c['points']} | {c['min']:.3f}..{c['max']:.3f} |")
-    if kernel_mode:
-        head = (f"## Kernels ({len(kernel_units)}) - median of paired sweeps per kernel"
-                + (f", bar {args.min_speedup:.3f}x" if args.min_speedup > 0 else ""))
-        lines += ["", head, "",
-                  "| phase | kernel | base ms | opt ms | speedup | slowdown ms | "
-                  "allowed ms | over ms | bound |",
-                  "|---|---|---:|---:|---:|---:|---:|---:|---|"]
-        for u in kernel_units:
-            lines.append(f"| {u['phase']} | {u['short']} | {u['base_ms']:.3f} | "
-                         f"{u['opt_ms']:.3f} | {u['speedup']:.3f}x | "
-                         f"{max(0.0, u['delta_ms']):.3f} | {u['tol_ms']:.3f} | "
-                         f"{max(0.0, u['margin_ms']):.3f} | {u['rule']} |")
+    head = "## Kernels" + (f" ({len(kernel_units)})" if kernel_units else "")
+    lines += ["", head, ""] + kernel_breakdown_lines(
+        kernel_units, kernel_mode, args.gate_kernel_tol, args.gate_kernel_tol_abs)
     if kernel_regressions:
         lines += ["", f"## Kernel regressions ({len(kernel_regressions)}) - slower "
                   f"than the tolerance allows", "",
@@ -2055,22 +2522,27 @@ def run_gate(args):
         for r in kernel_unpaired:
             lines.append(f"| {r['H']} | {r['T']} | {r['phase']} | {r['kernel']} | "
                          f"{r['why']} |")
-    lines += ["", "## All points (median of paired sweeps)",
-              "| H | T | " + " | ".join(f"{ph} x" for ph in phases) + " |",
-              "|---:|---:|" + "---:|" * len(phases)]
-    by_pt = {}
-    for c in cells:
-        by_pt.setdefault((c["H"], c["T"]), {})[c["phase"]] = c["speedup"]
-    for (H, T), d in sorted(by_pt.items()):
-        lines.append(f"| {H} | {T} | "
-                     + " | ".join(f"{d[ph]:.3f}" for ph in phases) + " |")
+    if cells:
+        lines += ["", "## All points (median of paired sweeps)",
+                  "| H | T | " + " | ".join(f"{ph} x" for ph in phases) + " |",
+                  "|---:|---:|" + "---:|" * len(phases)]
+        by_pt = {}
+        for c in cells:
+            by_pt.setdefault((c["H"], c["T"]), {})[c["phase"]] = c["speedup"]
+        for (H, T), d in sorted(by_pt.items()):
+            lines.append(f"| {H} | {T} | "
+                         + " | ".join(f"{d[ph]:.3f}" for ph in phases) + " |")
+    else:
+        lines += ["", "## All points (median of paired sweeps)", "",
+                  "- nothing to lay out: no sweep was readable in both arms, so the "
+                  "infra rows above are the whole measurement"]
     gate_md = os.path.join(args.out_dir, "gate.md")
-    with open(gate_md, "w") as fh:
-        fh.write("\n".join(lines) + "\n")
+    _write_text(gate_md, "\n".join(lines) + "\n")
 
     print(f"[gate] {verdict.upper()}: {len(pts)} points x {len(phases)} phase(s), "
           f"sweeps used={n} dropped={drop}, pooled "
-          + ", ".join(f"{ph}={v:.3f}x" for ph, v in pooled.items()), flush=True)
+          + (", ".join(f"{ph}={v:.3f}x" for ph, v in pooled.items())
+             or "nothing (no sweep readable in both arms)"), flush=True)
     if kernel_mode:
         knee = kernel_knee(args.gate_kernel_tol, args.gate_kernel_tol_abs)
         bound = (f"{args.gate_kernel_tol * 100:.0f}% above {knee:.3f} ms, "
@@ -2079,6 +2551,10 @@ def run_gate(args):
         print(f"[gate] kernel gain: best {kernel_best['short']} ({kernel_best['phase']}) "
               f"{kernel_best['speedup']:.3f}x of {len(kernel_units)} kernel(s), "
               f"tolerance {bound}", flush=True)
+    if kernel_unstable or unstable_points:
+        print(f"[gate] UNSTABLE: {len(kernel_unstable) + len(unstable_points)} "
+              f"breach(es) narrower than the point's own sweep scatter; the numbers "
+              f"do not settle it; {remedy}", flush=True)
     for u in kernel_regressions:
         for p in u["regressed"]:
             print(f"[gate]   kernel {u['short']:<22s} {p['phase']:<4s} H={p['H']:<3d} "
@@ -2106,7 +2582,8 @@ def run_gate(args):
                   f"{c['points']} point(s)  (need {args.min_speedup:.3f}x)", flush=True)
     for p in problems:
         print(f"[gate]   infra: {p}", flush=True)
-    if failing or kernel_regressions or kernel_shortfall:
+    if failing or kernel_regressions or kernel_shortfall or kernel_unstable \
+            or unstable_points:
         print(f"[gate] full list: {gate_md}", flush=True)
         print(f"[gate] per-kernel detail: {os.path.join(args.out_dir, 'tables.md')}", flush=True)
     print(f"[gate] wrote {gate_md} and gate.json", flush=True)
@@ -2160,6 +2637,16 @@ def build_parser():
                          "(0 = legacy one worker per H)")
     ap.add_argument("--drop-sweeps", type=int, default=1,
                     help="gate: drop the first N sweeps (compile/clock ramp)")
+    ap.add_argument("--gate-retry", type=int, default=1,
+                    help="gate: extra sweeps to measure when the verdict is an "
+                         "unreadable (unstable) point (0 = report it as it is)")
+    ap.add_argument("--pod-timeout", type=float, default=0.0,
+                    help="minutes this campaign may spend, so a re-measure can "
+                         "refuse to overrun it (0 = unknown, no guard)")
+    ap.add_argument("--pod-start", type=float, default=0.0,
+                    help="epoch seconds when the pod was asked for, so the budget "
+                         "above also counts the queue time this process cannot "
+                         "see (0 = fall back to my own start)")
     ap.add_argument("--gate", action="store_true",
                     help="CI gate: judge median paired speedups, write gate.md/gate.json; "
                          "exit 2 on regression, 3 on infra/config problem")

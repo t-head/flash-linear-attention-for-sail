@@ -18,6 +18,18 @@
 #                   The verdict is the median of the rest, so a single disturbed
 #                   sweep cannot decide it; three was one blip away from a
 #                   false verdict at the 5% band.
+#   PERF_GATE_RETRY  extra full-grid rounds to measure when a blocking gate
+#                   reads an unstable point (default: 1, 0 = report it as it
+#                   is). A breach inside the point's own sweep scatter is not a
+#                   measurement, so the campaign takes another look while the
+#                   pod still has budget instead of handing the author a red.
+#   PERF_POD_TIMEOUT  minutes this campaign may spend, given to the re-measure
+#                   as a budget so it refuses to start a round the pod cannot
+#                   finish (default: 0 = unknown, no guard). Set it to the
+#                   step's timeout_minutes, which counts queue time too.
+#   PERF_POD_START  epoch seconds when the pod was asked for (default: 0 = use
+#                   this process' start), so the budget above also spends the
+#                   queue and container-boot time the campaign cannot see.
 #   PERF_TOL        allowed slowdown before FAIL  (default: 0.03)
 #   PERF_TOL_CP     same for the CP pre-process units (default: 0.05)
 #   PERF_CP         1 = also time the CP pre-process units (default: 1). They sit
@@ -69,6 +81,9 @@ DEVICE=${PERF_DEVICE:-0}
 HEADS=${PERF_HEADS:-16,32,64,128}
 SEQLENS=${PERF_SEQLENS:-16384}
 SWEEPS=${PERF_SWEEPS:-4}
+GATE_RETRY=${PERF_GATE_RETRY:-1}
+POD_TIMEOUT=${PERF_POD_TIMEOUT:-0}
+POD_START=${PERF_POD_START:-0}
 TOL=${PERF_TOL:-0.03}
 TOL_CP=${PERF_TOL_CP:-0.05}
 CP=${PERF_CP:-1}
@@ -104,7 +119,8 @@ if [ "${PREFLIGHT_ONLY:-0}" = "1" ]; then
   exit $?
 fi
 
-echo "[ci] base=$TARGET opt=$REPO heads=$HEADS T=$SEQLENS sweeps=$SWEEPS tol=$TOL cp_tol=$TOL_CP level=$GATE_LEVEL"
+echo "[ci] base=$TARGET opt=$REPO heads=$HEADS T=$SEQLENS sweeps=$SWEEPS retry=$GATE_RETRY" \
+     "tol=$TOL cp_tol=$TOL_CP level=$GATE_LEVEL"
 # The verdict judges the e2e phases and the CP pre-process units for
 # regressions, and at kernel level every kernel's own time as well. The CP units
 # only run under cp_context, so they are timed through their wrappers in the
@@ -113,7 +129,9 @@ echo "[ci] base=$TARGET opt=$REPO heads=$HEADS T=$SEQLENS sweeps=$SWEEPS tol=$TO
 # units (--kernels) stay a manual tool and are not judged here.
 GATE_ARGS=(--gate --gate-phase "$GATE_PHASE" --gate-tol "$TOL" --gate-tol-cp "$TOL_CP"
            --gate-gain-level "$GATE_LEVEL"
-           --gate-kernel-tol "$KERNEL_TOL" --gate-kernel-tol-abs "$KERNEL_TOL_ABS")
+           --gate-kernel-tol "$KERNEL_TOL" --gate-kernel-tol-abs "$KERNEL_TOL_ABS"
+           --gate-retry "$GATE_RETRY" --pod-timeout "$POD_TIMEOUT" \
+           --pod-start "$POD_START")
 [ "$CP" = "1" ] || GATE_ARGS+=(--no-cp)
 set +e
 python3 "$BENCH" "${COMMON[@]}" --sweeps "$SWEEPS" --drop-sweeps 1 "${GATE_ARGS[@]}" "$@"

@@ -1,7 +1,9 @@
 name: ppu-gdn-perf-gate
 
 # GDN performance gate: PR head vs merge-base(target), per-kernel cold caches,
-# median over paired sweeps.
+# median over paired sweeps. A breach narrower than the point's own sweep
+# scatter is a measurement problem: the campaign measures another round before
+# it reports, and it is never a verdict on the code.
 #   exit 0 = PASS / exit 2 = regression or shortfall / exit 3 = infra problem
 #
 # Tiers follow the declaration. A perf or refactor claim is judged on the full
@@ -159,6 +161,9 @@ jobs:
       # the pod ends, so nothing written under /workspace/source reaches this
       # runner. Results travel over the shared NAS instead (same convention as
       # fla-ut-test-ppu.yml): container side /mnt/wl_nas, runner side /wl_nas.
+      # The mount turns out to be asymmetric: every file under it was published by a
+      # pod and every step below only reads it, so a move or a write has to be the
+      # pod's job.
       NAS_OUT: /wl_nas/devops/fla-ci/perf/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -209,7 +214,12 @@ jobs:
           # PR-controlled strings reach bash through env, never through `${{ }}`
           # interpolation inside the script, so a title cannot inject shell code.
           EVENT: ${{ github.event_name }}
+          # Which PR activity started this run: replay is decided on it below, so
+          # an event that can carry new code cannot reuse a stored verdict.
           ACTION: ${{ github.event.action }}
+          # A re-run raises the attempt count, so it is the signal that someone
+          # asked for a new measurement rather than another no-op event.
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
           BOARD: ${{ matrix.runner }}
@@ -493,6 +503,10 @@ jobs:
                | tr -s '[:space:]' '\n' | grep -qx 'perf-full'; then
             FULL=1; why="${why:-explicit request}"
           fi
+          # The campaign inside the pod cannot see the queue it is about to
+          # join, so stamp the moment this runner submitted the job: the
+          # re-measure guard spends that time too.
+          echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
           if [ "$FULL" = "1" ]; then
             echo "tier=full" >> "$GITHUB_OUTPUT"
             echo "heads=16,32,64,128" >> "$GITHUB_OUTPUT"
@@ -517,10 +531,29 @@ jobs:
           # stored numbers answer something else (a label added the block, a
           # request widened the grid), so measure: this is also what keeps a
           # campaign that GitHub dropped from being replaced by a stale replay.
+          #
+          # "Same question" is decided by what the event could have changed, not
+          # by whether a file is on disk. opened, synchronize and
+          # ready_for_review all carry a head the runner is being asked to
+          # measure -- a force-push back to an old commit, or a base branch that
+          # moved under a still-same sha -- so they measure even when something
+          # is stored. Only the events that cannot move the tree replay: a title
+          # or body edit, a label added or removed, a reopen, a submitted review.
+          # The replay covers the first attempt only: clicking re-run is an
+          # explicit ask to measure, so no verdict can become unfalsifiable.
           STORED="/wl_nas/devops/fla-ci/perf/heads/$(git rev-parse HEAD)/$BOARD.policy"
           case "$policy" in advisory) cur_block=false ;; *) cur_block=true ;; esac
           case "$FULL" in 1) cur_tier=full ;; *) cur_tier=fast ;; esac
-          if [ "$EVENT" != "workflow_dispatch" ] && [ -f "$STORED" ]; then
+          # A submitted review carries no code, and its payload is not expected
+          # to name the action, so the event alone decides for that one.
+          case "$EVENT/$ACTION" in
+            pull_request/edited|pull_request/labeled|pull_request/unlabeled)
+              no_op=true ;;
+            pull_request/reopened|pull_request_review/*) no_op=true ;;
+            *) no_op=false ;;
+          esac
+          if [ "$no_op" = true ] && [ "${RUN_ATTEMPT:-1}" = "1" ] \
+             && [ -f "$STORED" ]; then
             stored=$(sed -n '1p' "$STORED" | tr -d '\r')
             s_block=$(printf '%s' "$stored" | sed -n 's/.*block=\([a-z]*\).*/\1/p')
             s_tier=$(printf '%s' "$stored" | sed -n 's/.*tier=\([a-z]*\).*/\1/p')
@@ -534,6 +567,37 @@ jobs:
             echo "::notice::stored $BOARD result is block=${s_block:-unknown}" \
                  "tier=${s_tier:-unknown}, this event needs block=$cur_block" \
                  "tier=$cur_tier; measuring again"
+          elif [ -f "$STORED" ] && [ "$EVENT" != "workflow_dispatch" ]; then
+            # Say why a stored verdict is being walked past: without this the
+            # only trace of the extra campaign is a notice nobody looks for.
+            if [ "${RUN_ATTEMPT:-1}" != "1" ]; then
+              echo "::notice::$BOARD re-run (attempt ${RUN_ATTEMPT:-1}): measuring" \
+                   "again, the stored verdict is not reused"
+            else
+              echo "::notice::$BOARD has a stored verdict for this head, but" \
+                   "$EVENT/${ACTION:-event} carries a measurement request;" \
+                   "measuring again"
+            fi
+          fi
+          # A campaign replaces this head's answer, but only publishes it at the
+          # end. Until then the previous verdict is still on disk, and a no-op event
+          # arriving in between -- a title edit, a review -- would replay it as
+          # though this campaign had produced it, so a PASS could outlive the run
+          # that was meant to overturn it. Retiring it is a NAS write, and this
+          # runner has never managed one: every file under that path was published
+          # by a pod, and the steps here only read them. So the pod moves the old
+          # verdict aside before it measures (see "Run gate on PPU"); what is left
+          # here is to say the retirement is owed, and to record whether this mount
+          # can be written from the runner at all -- that fact is what pushed the
+          # write into the pod, and a reader should not have to infer it.
+          HEAD_DIR="$(dirname "$STORED")"
+          if [ -f "$STORED" ] || [ -f "${STORED%.policy}.gate.json" ]; then
+            mode=read-only
+            if touch "$HEAD_DIR/.wtest" 2>/dev/null; then
+              rm -f "$HEAD_DIR/.wtest"; mode=writable
+            fi
+            echo "::notice::$BOARD has a stored verdict to retire; the runner sees" \
+                 "that NAS dir as $mode, so the pod retires it before measuring"
           fi
           echo "run=true" >> "$GITHUB_OUTPUT"
           echo "replay=false" >> "$GITHUB_OUTPUT"
@@ -608,12 +672,57 @@ jobs:
             fi
             echo "::notice::NAS writable: $NAS_OUT"
 
+            # The retirement the scope step promised, done here because this is the
+            # only context that can write the NAS. The window this does not close is
+            # the queue before the pod starts: a no-op event landing there replays the
+            # previous verdict, which is a real answer for this same head, and a
+            # re-run or the next push measures again.
+            HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+            BOARD="${{ matrix.runner }}"
+            HEADS="/mnt/wl_nas/devops/fla-ci/perf/heads/$HEAD_SHA"
+            if [ -f "$HEADS/$BOARD.policy" ] || [ -f "$HEADS/$BOARD.gate.json" ]; then
+              mkdir -p "$HEADS/invalidated"
+              stamp="$BOARD-${{ github.run_id }}a${{ github.run_attempt }}"
+              retired=1
+              for ext in policy gate.json; do
+                if [ -f "$HEADS/$BOARD.$ext" ]; then
+                  mv -f "$HEADS/$BOARD.$ext" "$HEADS/invalidated/$stamp.$ext" || retired=0
+                fi
+              done
+              if [ "$retired" != 1 ]; then
+                # The predecessor is still replayable and nothing can be measured
+                # on top of it, so stop here and say why in the log the runner
+                # steps already tail; the missing verdict is what reddens a
+                # blocking board and warns an advisory one.
+                mkdir -p "$OUT"
+                {
+                  echo "REFUSED: could not retire $BOARD's stored verdict in $HEADS"
+                  echo "id=$(id)"
+                  echo "head_dir=$(ls -ld "$HEADS" 2>&1)"
+                  echo "grave_dir=$(ls -ld "$HEADS/invalidated" 2>&1)"
+                } > "$OUT/campaign.log"
+                cat "$OUT/campaign.log"
+                cp -f "$OUT/campaign.log" "$NAS_OUT/campaign.log" 2>/dev/null
+                exit 0
+              fi
+              echo "[ci] retired $BOARD's stored verdict into $HEADS/invalidated/$stamp.*"
+            fi
+
             # Grid comes from the tier decided above.
             PERF_HEADS="${{ steps.scope.outputs.heads }}"
             PERF_SEQLENS="${{ steps.scope.outputs.seqlens }}"
             PERF_SWEEPS="${{ steps.scope.outputs.sweeps }}"
             export PERF_HEADS PERF_SEQLENS PERF_SWEEPS
-            echo "::notice::tier=${{ steps.scope.outputs.tier }} H=$PERF_HEADS T=$PERF_SEQLENS sweeps=$PERF_SWEEPS"
+            # The report headline names the board with this label, the same one
+            # the checks page shows, so a reader can tell the two apart.
+            export PERF_BOARD="${{ matrix.runner }}"
+            # Same number the step was given, so the campaign can tell a
+            # re-measure round not to start one it cannot finish. timeout_minutes
+            # counts queue time the process cannot see, which the re-measure
+            # guard leaves its own margin for.
+            export PERF_POD_TIMEOUT="${{ steps.scope.outputs.pod_timeout }}"
+            export PERF_POD_START="${{ steps.scope.outputs.started_at }}"
+            echo "::notice::tier=${{ steps.scope.outputs.tier }} H=$PERF_HEADS T=$PERF_SEQLENS sweeps=$PERF_SWEEPS pod=${PERF_POD_TIMEOUT}m"
 
             # Mirror the campaign log every 20s: if the pod is killed at the
             # timeout we still learn which point it died on.
@@ -648,14 +757,11 @@ jobs:
             # The policy and the grid travel with it: a replay only stands when
             # both still match, so a label that makes the gate blocking (or a
             # request that widens the grid) measures instead of replaying.
-            HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
             if [ -f "$OUT/gate.json" ]; then
-              mkdir -p "/mnt/wl_nas/devops/fla-ci/perf/heads/$HEAD_SHA"
-              cp -f "$OUT/gate.json" \
-                "/mnt/wl_nas/devops/fla-ci/perf/heads/$HEAD_SHA/${{ matrix.runner }}.gate.json"
+              mkdir -p "$HEADS"
+              cp -f "$OUT/gate.json" "$HEADS/$BOARD.gate.json"
               printf 'block=%s tier=%s\n' "${{ steps.scope.outputs.block }}" \
-                "${{ steps.scope.outputs.tier }}" \
-                > "/mnt/wl_nas/devops/fla-ci/perf/heads/$HEAD_SHA/${{ matrix.runner }}.policy"
+                "${{ steps.scope.outputs.tier }}" > "$HEADS/$BOARD.policy"
             fi
             # Keep the tail in the job log too, so a crash is diagnosable even
             # without the artifact.
@@ -700,7 +806,13 @@ jobs:
           fi
           python3 - <<'PY' || true
           import json, os
-          d = json.load(open(os.path.join(os.environ["NAS_OUT"], "gate.json")))
+          try:
+              d = json.load(open(os.path.join(os.environ["NAS_OUT"], "gate.json")))
+          except ValueError as e:
+              # Half a file is the same story as no file: nothing was published.
+              print("::warning::the published gate.json is not readable (%s); this "
+                    "PR was not measured" % e)
+              raise SystemExit(0)
           pooled = d.get("pooled") or {}
           kg = d.get("kernel_gain") or {}
           best = kg.get("best") or {}
@@ -711,6 +823,15 @@ jobs:
                    " | best kernel %s (%s) %.3fx, %d kernel regression(s)"
                    % (best.get("kernel"), best.get("phase"),
                       best.get("speedup", 0.0), len(kg.get("regressions") or []))))
+          # An infra verdict says the campaign did not settle the question, which
+          # is worth naming even on a board that does not block: the author
+          # otherwise reads "verdict=infra" with no idea what to do about it. The
+          # problem text already says whether a re-measure round was spent, so no
+          # advice goes on top of it here.
+          probs = d.get("problems") or []
+          if probs:
+              print("::warning::%d measurement problem(s), first: %s"
+                    % (len(probs), probs[0]))
           PY
 
       # Advisory runs stop here: gate.json and gate.md were published above, but
@@ -750,12 +871,12 @@ jobs:
           python3 .github/workflows/scripts/perf-gate/verdict.py \
             "$NAS_OUT/gate.json" "${{ steps.scope.outputs.block }}"
 
-      # An event that did not ask for a campaign (a description edit, a review,
-      # an unrelated label) leaves the previous verdict in place, and GitHub
-      # would show a fresh green check for a head that failed earlier. Re-play
-      # what was stored for this head instead: only an event whose policy and
-      # grid still match the stored marker gets here, and a real measurement
-      # overwrites the entry.
+      # An event that cannot have moved the head (a description edit, a label
+      # added or removed, a reopen, a review) leaves the previous verdict in
+      # place, and GitHub would show a fresh green check for a head that failed
+      # earlier. Re-play what was stored for this head instead: only an event
+      # whose policy and grid still match the stored marker gets here, and a real
+      # measurement overwrites the entry.
       - name: Re-enforce stored verdict
         if: >-
           always() && steps.scope.outputs.run != 'true'
@@ -812,9 +933,17 @@ jobs:
           board = os.environ["BOARD"]
           tier = os.environ.get("TIER", "")
 
-          with open(os.path.join(nas, "gate.json")) as fh:
-              gate = json.load(fh)
-          with open(os.path.join(nas, "gate.md")) as fh:
+          try:
+              with open(os.path.join(nas, "gate.json")) as fh:
+                  gate = json.load(fh)
+          except ValueError as e:
+              # A pod killed during its last copy can leave half a file behind.
+              # Posting a comment built on nothing would be worse than saying the
+              # campaign never finished publishing.
+              print("::warning::%s/gate.json is not readable (%s); no report posted"
+                    % (nas, e))
+              raise SystemExit(0)
+          with open(os.path.join(nas, "gate.md"), encoding="utf-8") as fh:
               report = fh.read()
 
           verdict = (gate.get("verdict") or "unknown").upper()
@@ -830,11 +959,21 @@ jobs:
               best_s = ("%s %s %.3fx" % (best.get("kernel"), best.get("phase"),
                                          best.get("speedup", 0.0))
                         if best else "none")
+              # An INFRA verdict from an unstable point reads as "nothing
+              # regressed but red", so name the count and what was already done
+              # about it: the campaign re-measures on its own while it has the
+              # pod budget for it, and then says so.
+              unstable = len(gain.get("unstable") or [])
+              again = (gate.get("sweeps") or {}).get("remeasured") or 0
+              note = ""
+              if unstable:
+                  what = ("re-measured %d round(s)" % again) if again else "re-run"
+                  note = " | %d unstable point(s), %s" % (unstable, what)
               print("::notice::gate %s on %s (%s tier): pooled %s | best kernel %s | "
-                    "%d phase, %d kernel regression(s)"
+                    "%d phase, %d kernel regression(s)%s"
                     % (verdict, board, tier, pooled_s, best_s,
                        len(gate.get("failing") or []),
-                       len(gain.get("regressions") or [])))
+                       len(gain.get("regressions") or []), note))
 
           # One marker per board: the next run of this board patches its own
           # comment, a push adds a verdict instead of a wall of old reports.
