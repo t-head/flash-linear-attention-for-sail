@@ -283,6 +283,9 @@ def causal_conv1d_bwd(
         )
     else:
         dy_input = dy
+    # dy_input may be replaced by the (contiguous) premul output above, so the
+    # strides fed to the bwd kernel must be derived from dy_input, not the
+    # original dy (which can be a non-contiguous view)
     stride_dy_n, stride_dy_t, stride_dy_d = dy_input.stride()
     causal_conv1d_bwd_kernel[grid](
         x=x,
