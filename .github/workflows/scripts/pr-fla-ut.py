@@ -26,12 +26,42 @@ from junit_xml import TestCase, TestSuite
 
 OUTPUT_XML = "test-results.xml"
 
+FAILURES_HEADER = re.compile(r"^=+\s*FAILURES\s*=+$")
+SECTION_HEADER = re.compile(r"^=+ .+ =+$")
+VERDICT_LINE = re.compile(r"^(FAILED|ERROR)\s+\S+")
+DETAIL_LIMIT = 200
+
 
 def derive_test_name(case_command: str) -> str:
     return re.sub(r"\s+", "_", case_command.strip())
 
 
-def run_one_case(i: int, case_command: str, total_count: int, timeout: float = 1200):
+def extract_failure_detail(output: str, limit: int = DETAIL_LIMIT) -> list[str]:
+    """Return pytest's FAILURES section plus short-summary verdict lines.
+
+    pytest prints tracebacks mid-output and ends with duration tables, so a
+    plain tail window misses the actual failure.  Returns an empty list when
+    the output carries no recognizable failure section (crash/timeout paths).
+    """
+    picked: list[str] = []
+    in_section = False
+    for line in output.splitlines():
+        stripped = line.strip()
+        if FAILURES_HEADER.match(stripped):
+            in_section = True
+        elif in_section and SECTION_HEADER.match(stripped):
+            in_section = False
+            continue
+        if in_section or VERDICT_LINE.match(stripped):
+            picked.append(line)
+    if len(picked) > limit:
+        omitted = len(picked) - limit
+        picked = picked[:limit]
+        picked.append(f"... ({omitted} more failure lines omitted)")
+    return picked
+
+
+def run_one_case(i: int, case_command: str, total_count: int, timeout: float = 1200, budget_note: str = ""):
     """Run one caselist command; return (junit_case, status, reason, output).
 
     status is one of PASS/FAIL/TIMEOUT/ERROR and is always printed as
@@ -40,7 +70,7 @@ def run_one_case(i: int, case_command: str, total_count: int, timeout: float = 1
     test_name = derive_test_name(case_command)
     junit_case = TestCase(name=test_name, classname="flaTest")
 
-    print(f"\n[{i}/{total_count}] Running: {test_name}")
+    print(f"\n[{i}/{total_count}] Running: {test_name}{budget_note}")
     print(f"Command: {case_command}")
     print("-" * 50)
 
@@ -130,47 +160,87 @@ def run_cases(caselist_path: str, build_dir: str, output_xml: str = OUTPUT_XML, 
 
     os.chdir(build_dir)
     print(f"Working directory: {os.getcwd()}")
+    budget = f"{deadline:g}s" if deadline else "disabled"
+    print(f"Budget: per-case timeout {timeout:g}s; overall deadline {budget}")
 
     xml_path = os.path.abspath(output_xml)
     all_cases: list[TestCase] = []
-    failures: list[tuple[str, str, str, str]] = []
+    results: list[tuple[str, str, str, str, float]] = []
+    failures: list[tuple[str, str, str, str, float]] = []
     passed = 0
     start_time = time.time()
 
     for i, cmd in enumerate(test_commands, 1):
-        if deadline and time.time() - start_time > deadline:
-            junit_case = TestCase(name=derive_test_name(cmd), classname="flaTest")
-            reason = "Not run: overall deadline exceeded"
+        name = derive_test_name(cmd)
+        elapsed = time.time() - start_time
+        if deadline and elapsed > deadline:
+            junit_case = TestCase(name=name, classname="flaTest")
+            reason = f"Not run: overall deadline {deadline:g}s exceeded after {elapsed:.0f}s"
+            print(f"\n[{i}/{len(test_commands)}] Skipped: {name}")
+            print(f"    {reason}")
             junit_case.add_skipped_info(reason)
             all_cases.append(junit_case)
-            failures.append(("SKIPPED", derive_test_name(cmd), reason, ""))
+            results.append(("SKIPPED", name, reason, "", 0.0))
+            failures.append(("SKIPPED", name, reason, "", 0.0))
             write_xml(xml_path, all_cases)
             continue
-        junit_case, status, reason, output = run_one_case(i, cmd, len(test_commands), timeout)
+        junit_case, status, reason, output = run_one_case(
+            i, cmd, len(test_commands), timeout, f" (elapsed {elapsed:.0f}s / {budget})"
+        )
+        duration = junit_case.elapsed_sec or 0.0
         all_cases.append(junit_case)
+        results.append((status, name, reason, output, duration))
         if status == "PASS":
             passed += 1
         else:
-            failures.append((status, derive_test_name(cmd), reason, output))
+            failures.append((status, name, reason, output, duration))
         write_xml(xml_path, all_cases)
 
     total = len(test_commands)
-    print(f"\nTests completed. Total: {total}, Passed: {passed}")
+    elapsed_total = time.time() - start_time
+    counts = {s: sum(1 for r in results if r[0] == s) for s in ("FAIL", "TIMEOUT", "ERROR", "SKIPPED")}
+    print(
+        f"\nTests completed. Total: {total}, Passed: {passed}, Failed: {counts['FAIL']}, "
+        f"Timeout: {counts['TIMEOUT']}, Error: {counts['ERROR']}, Skipped: {counts['SKIPPED']}"
+    )
+    print(f"Elapsed: {elapsed_total:.0f}s; overall deadline: {budget}; per-case timeout: {timeout:g}s")
     print(f"Report: {xml_path}")
+
+    print("\n=== CASE RESULTS ===")
+    for status, name, reason, output, duration in results:
+        suffix = f"  ({reason})" if status != "PASS" else ""
+        print(f"[{status}] {duration:8.1f}s  {name}{suffix}")
+    print("====================")
 
     if failures:
         # Echo a diagnosis block at the end of the log so the failing case and
-        # its last output lines are visible without scrolling the whole run.
+        # its pytest failure section are visible without scrolling the whole run.
         print("\n=== FAILED CASES ===")
-        for status, name, reason, output in failures:
+        for status, name, reason, output, duration in failures:
             print(f"[{status}] {name}")
             print(f"    Reason: {reason}")
-            tail = output.splitlines()[-40:]
-            if tail:
-                print("    Last output lines:")
-                for line in tail:
-                    print(f"      {line}")
+            print(f"    Duration: {duration:.1f}s")
+            detail = extract_failure_detail(output) if output else []
+            if detail:
+                print("    Failure output:")
+            elif output:
+                print("    No pytest failure section found; last 40 output lines:")
+                detail = output.splitlines()[-40:]
+            for line in detail:
+                print(f"      {line}")
         print("====================")
+        print(
+            f"Result: FAIL ({counts['FAIL']} failed, {counts['TIMEOUT']} timeout, "
+            f"{counts['ERROR']} error, {counts['SKIPPED']} not run)"
+        )
+        for status, name, reason, output, duration in failures[:10]:
+            print(f"::error::FLA UT {status}: {name} ({reason})", file=sys.stderr, flush=True)
+        if len(failures) > 10:
+            print(
+                f"::error::FLA UT: {len(failures) - 10} more failing case(s) listed in the log",
+                file=sys.stderr,
+                flush=True,
+            )
         sys.exit(1)
 
 
