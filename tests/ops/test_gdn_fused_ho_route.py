@@ -12,6 +12,11 @@ pinned in SWEEP (H 4..256, B 1..8, T 2k..32k, D 64/128, MHA and GQA), best confi
 against best config, arm-alternated medians, +-0.5% noise, BV=64. Nothing routed to
 fused measured slower than +0.5%; outside the frontier the pair wins by up to 18%.
 Keeping the sweep in the test lets the frontier be re-reviewed without re-running it.
+
+The route is enabled on the ZW_M890P only. Re-measured on a ZW810E over the same 35
+shapes, the fused kernel is slower on 34 of them (median +12.5%, worst +23.7% at NT 256
+grid 64), including all nine the frontier routes to fused, so `use_fused_ho` also
+requires IS_PPU_M890.
 """
 
 import pytest
@@ -20,7 +25,7 @@ import torch.nn.functional as F
 
 import fla.ops.gated_delta_rule.chunk as chunk_mod
 from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd, fused_ho_pays_off
-from fla.utils import assert_close, device
+from fla.utils import assert_close, device, IS_PPU_M890
 
 # (label, B, T, HV, D, fused-vs-pair delta in %, route)
 SWEEP = [
@@ -123,6 +128,7 @@ def _spy_fused(monkeypatch):
     return calls
 
 
+@pytest.mark.skipif(not IS_PPU_M890, reason='the fused route runs on the ZW_M890P only')
 def test_fused_route_matches_pair(monkeypatch):
     inputs = _inputs(1, 16384, 2, 64)  # NT 256
     assert _route(1, 16384, 2, 64)
@@ -155,4 +161,14 @@ def test_wide_head_dim_stays_pair(monkeypatch):
 def test_state_v_first_stays_pair(monkeypatch):
     calls = _spy_fused(monkeypatch)
     chunk_gated_delta_rule_fwd(**_inputs(1, 16384, 2, 64), state_v_first=True)
+    assert not calls
+
+
+@pytest.mark.skipif(IS_PPU_M890, reason='the 890P is the board the route is enabled on')
+def test_fused_route_is_m890_only(monkeypatch):
+    # The shape frontier says fused here, but the fused kernel is slower on every other
+    # board of the sweep, so the route must stay closed.
+    assert _route(1, 16384, 2, 64)
+    calls = _spy_fused(monkeypatch)
+    chunk_gated_delta_rule_fwd(**_inputs(1, 16384, 2, 64))
     assert not calls

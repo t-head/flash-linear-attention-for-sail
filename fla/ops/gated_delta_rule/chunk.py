@@ -29,7 +29,7 @@ from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.index import prepare_chunk_indices
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard, IS_PPU_M890
 
 
 def fused_ho_pays_off(k, v, cu_seqlens, chunk_size=64):
@@ -108,9 +108,12 @@ def chunk_gated_delta_rule_fwd(
 
     # h and v_new are fwd-internal (bwd recomputes both), so the two kernels can be fused.
     # K > 128 stays unfused: four 64-row state tiles plus the four k tiles no longer fit,
-    # and the fused kernel measures ~4% slower at K=256.
+    # and the fused kernel measures ~4% slower at K=256. Only the ZW_M890P runs it: on the
+    # ZW810E the fused kernel is slower at every shape of the sweep (median +12.5%, worst
+    # +23.7% at NT 256 grid 64), and no other board was measured.
     use_fused_ho = (
-        g is not None
+        IS_PPU_M890
+        and g is not None
         and not state_v_first
         and cp_context is None
         and k.shape[-1] <= 128

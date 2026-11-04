@@ -20,6 +20,7 @@ from fla.utils import (
     IS_NVIDIA_HOPPER,
     IS_PPU,
     IS_PPU_810E,
+    IS_PPU_M890,
     autotune_cache_kwargs,
     check_shared_mem,
 )
@@ -31,9 +32,11 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # and we re-validate the wider config space.
 if IS_NVIDIA_BLACKWELL:
     GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2]
-elif IS_PPU:
+elif IS_PPU_M890:
     # PPU-verified expanded num_warps space (seq=8K, heads=16..128).
     GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2, 4, 8, 16]
+elif IS_PPU:
+    GATED_DELTA_RULE_FWD_H_NUM_WARPS = [4, 8, 16]
 else:
     GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2, 4]
 
@@ -65,7 +68,8 @@ def _aiu_enabled_for(*tensors: torch.Tensor) -> bool:
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
-        for num_stages in ([1, 2] if IS_PPU or check_shared_mem('ampere') else [2, 1])
+        for num_stages in ([1, 2] if IS_PPU_M890 else
+                           ([2, 3, 4] if IS_PPU or check_shared_mem('ampere') else [2, 1]))
         for BV in ([32, 64, 128] if IS_PPU else ([32, 64] if check_shared_mem('ada') else [32]))
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
