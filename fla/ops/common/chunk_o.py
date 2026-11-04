@@ -16,6 +16,7 @@ from fla.ops.utils.op import exp2
 from fla.utils import (
     IS_NVIDIA_HOPPER,
     IS_PPU,
+    IS_PPU_M890,
     TRITON_ABOVE_3_4_0,
     TRITON_ABOVE_3_7_1,
     autotune_cache_kwargs,
@@ -29,6 +30,27 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 # Used to allocate dg with NK_MAX = cdiv(K, BK_MIN) slices.
 _DQKWG_BK_MIN = 64
 
+# BV=64 was measured on the ZW-890P only, and the extra configs are not free: a
+# cache miss compiles the whole grid before the first call returns, which is what
+# the chunk_o UT pays per shape. So 890P keeps the swept grid minus the stage that
+# never won, and other boards keep the upstream one.
+if IS_PPU_M890:
+    _CHUNK_FWD_O_CONFIGS = [
+        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64]
+        for BV in [64, 128]
+        for num_warps in [4, 8]
+        for num_stages in [2, 3]
+    ]
+else:
+    _CHUNK_FWD_O_CONFIGS = [
+        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 128]
+        for BV in [128]
+        for num_warps in [4, 8]
+        for num_stages in [2, 3, 4]
+    ]
+
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
@@ -36,13 +58,7 @@ _DQKWG_BK_MIN = 64
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @fla_cache_autotune(
-    configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_CHUNK_FWD_O_CONFIGS,
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
