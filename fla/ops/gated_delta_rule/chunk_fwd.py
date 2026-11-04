@@ -15,7 +15,7 @@ from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices, solve_tril
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
-from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs
+from fla.utils import IS_PPU_M890, IS_TF32_SUPPORTED, autotune_cache_kwargs
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
@@ -26,6 +26,26 @@ else:
 # is amplified by each doubling level. Plain tf32 there costs ~1e-2 on the solved
 # matrix; tf32x3 (3-pass) matches fp32 to ~1e-7 for a third of the fp32 FMA cost.
 SOLVE_TRIL_DIAG_PRECISION = tl.constexpr('tf32x3' if IS_TF32_SUPPORTED else 'ieee')
+
+# The wider grid only earns its keep on the 890P it was swept on. Anywhere else a
+# fresh process pays for every config of every new (H, HV, K, BC) key before the
+# first call returns, and BK=128 is far more expensive to compile than it is to
+# run: on ZW-810E it turned the chunk_solve UT from 13 s into 211 s. BK=128 and
+# 4 stages never won a measured shape, so the 890P grid keeps the winner
+# (BK=64 / 1 warp / 2 stages) and drops them; other boards keep the upstream one.
+if IS_PPU_M890:
+    _KKT_SOLVE_CONFIGS = [
+        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64]
+        for num_warps in [1, 2]
+        for num_stages in [2, 3]
+    ]
+else:
+    _KKT_SOLVE_CONFIGS = [
+        triton.Config({'BK': BK}, num_warps=num_warps)
+        for BK in [32, 64]
+        for num_warps in [1, 2, 4]
+    ]
 
 
 @triton.jit
@@ -54,12 +74,7 @@ def _tril_inverse_neumann(b_A, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @fla_cache_autotune(
-    configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [1, 2]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_KKT_SOLVE_CONFIGS,
     key=['H', 'HV', 'K', 'BC'],
     **autotune_cache_kwargs,
 )
