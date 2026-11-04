@@ -21,7 +21,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 360
+    timeout-minutes: 480
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +41,7 @@ jobs:
           nproc_per_node: 1
           node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
-          timeout_minutes: 300
+          timeout_minutes: 450
           container_options: |
             cpus: "${{ matrix.runner == 'OAM-810E' && '11' || '31' }}"
             memory: "${{ matrix.runner == 'OAM-810E' && '112Gi' || '256Gi' }}"
@@ -73,9 +73,12 @@ jobs:
             NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
             mkdir -p "$NAS_RESULT_DIR"
             set +e
+            # Test-loop budget is 6h; the worker/job caps above must stay larger
+            # than deadline + per-case timeout + build margin so the runner, not
+            # the scheduler, always produces the verdict.
             python .github/workflows/scripts/pr-fla-ut.py \
               --caselist .github/workflows/scripts/casecmd.list \
-              --timeout 4200 --deadline 11100 \
+              --timeout 4200 --deadline 21600 \
               --output-xml "$NAS_RESULT_DIR/test-results.xml" \
               2>&1 | tee "$NAS_RESULT_DIR/test-output.log"
             TEST_EXIT_CODE=${PIPESTATUS[0]}
@@ -92,37 +95,81 @@ jobs:
           export NAS_RESULT_DIR="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import os
+          import re
           import xml.etree.ElementTree as ET
+
+          FAILURES_HEADER = re.compile(r"^=+\s*FAILURES\s*=+$")
+          SECTION_HEADER = re.compile(r"^=+ .+ =+$")
+          VERDICT_LINE = re.compile(r"^(FAILED|ERROR)\s+\S+")
+
+
+          def failure_detail(text, limit=120):
+              # pytest prints tracebacks mid-output and ends with duration
+              # tables, so a plain tail window misses the actual failure.
+              picked, in_section = [], False
+              for line in (text or "").splitlines():
+                  stripped = line.strip()
+                  if FAILURES_HEADER.match(stripped):
+                      in_section = True
+                  elif in_section and SECTION_HEADER.match(stripped):
+                      in_section = False
+                      continue
+                  if in_section or VERDICT_LINE.match(stripped):
+                      picked.append(line)
+              if not picked:
+                  picked = (text or "").splitlines()[-60:]
+              if len(picked) > limit:
+                  omitted = len(picked) - limit
+                  picked = picked[:limit]
+                  picked.append(f"... ({omitted} more lines omitted)")
+              return picked
+
 
           board = os.environ["NAS_RESULT_DIR"].rstrip("/").split("/")[-1]
           path = os.path.join(os.environ["NAS_RESULT_DIR"], "test-results.xml")
-          print(f"## Runner: {board}")
           if not os.path.isfile(path):
+              print(f"## Runner: {board}")
               print(f"JUnit report not found: {path}")
               raise SystemExit(0)
 
+          rows = []
+          counts = {"PASS": 0, "FAIL": 0, "ERROR": 0, "SKIPPED": 0}
           tree = ET.parse(path)
           for tc in tree.getroot().iter("testcase"):
               name = tc.get("name", "?")
               secs = float(tc.get("time") or 0)
               failure = tc.find("failure")
               error = tc.find("error")
+              skipped = tc.find("skipped")
               if failure is not None:
                   status, node = "FAIL", failure
               elif error is not None:
                   status, node = "ERROR", error
+              elif skipped is not None:
+                  status, node = "SKIPPED", skipped
               else:
                   status, node = "PASS", None
+              counts[status] += 1
+              rows.append((status, name, secs, node))
+
+          print(f"## Runner: {board}")
+          print(
+              f"Total: {sum(counts.values())}, Passed: {counts['PASS']}, Failed: {counts['FAIL']}, "
+              f"Error: {counts['ERROR']}, Skipped: {counts['SKIPPED']}"
+          )
+          for status, name, secs, node in rows:
               print(f"- {status} `{name}` ({secs:.0f}s)")
               if node is None:
                   continue
               print(f"  - Reason: {node.get('message') or 'unknown'}")
-              tail = (node.text or "").splitlines()[-60:]
-              if tail:
-                  print("  - Last output lines:")
+              if status == "SKIPPED":
+                  continue
+              detail = failure_detail(node.text)
+              if detail:
+                  print("  - Failure output:")
                   print("")
                   print("    ```")
-                  for line in tail:
+                  for line in detail:
                       print(f"    {line}")
                   print("    ```")
           PY

@@ -115,6 +115,32 @@ def test_deadline_skips_remaining_commands(tmp_path):
     assert "deadline" in (skipped.get("message", "") or "")
 
 
+def test_deadline_skip_states_budget_and_elapsed(tmp_path):
+    proc, xml_path = run_runner(tmp_path, ["sleep 2", "echo late"], deadline=1)
+    assert proc.returncode == 1
+    assert "deadline 1s exceeded after" in proc.stdout
+    assert "Skipped: 1" in proc.stdout
+    block = proc.stdout.split("=== FAILED CASES ===", 1)[1]
+    assert "overall deadline 1s exceeded" in block
+    assert "::error::FLA UT SKIPPED" in proc.stderr
+
+
+def test_failure_block_extracts_pytest_failure_section(tmp_path):
+    fake_pytest = (
+        "printf '%s\\n' '=== FAILURES ===' '___ test_bad ___' 'E   assert 1 == 2' "
+        "'=== slowest 30 durations ===' '342.00s call tests/x.py::test_bad' "
+        "'=== short test summary info ===' 'FAILED tests/x.py::test_bad - assert 1 == 2'; exit 1"
+    )
+    proc, xml_path = run_runner(tmp_path, [fake_pytest])
+    assert proc.returncode == 1
+    block = proc.stdout.split("=== FAILED CASES ===", 1)[1]
+    assert "FAILED tests/x.py::test_bad" in block
+    assert "assert 1 == 2" in block
+    assert "slowest 30 durations" not in block
+    assert "Result: FAIL (1 failed" in proc.stdout
+    assert "::error::FLA UT FAIL" in proc.stderr
+
+
 def test_missing_caselist_exits_one(tmp_path):
     xml_path = tmp_path / "results.xml"
     proc = subprocess.run(
