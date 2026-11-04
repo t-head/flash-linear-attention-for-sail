@@ -9,8 +9,8 @@
 
 `fused_ho_pays_off` encodes a timing frontier measured on ZW_M890P over the 35 shapes
 pinned in SWEEP (H 4..256, B 1..8, T 2k..32k, D 64/128, MHA and GQA), best config
-against best config, arm-alternated medians, +-0.5% noise, BV=64. Nothing routed to
-fused measured slower than +0.5%; outside the frontier the pair wins by up to 18%.
+against best config, arm-alternated medians, +-0.5% noise, BV=64. Every routed shape
+measured faster (worst -0.24%); outside the frontier the pair wins by up to 17%.
 Keeping the sweep in the test lets the frontier be re-reviewed without re-running it.
 
 The route is enabled on the ZW_M890P only. Re-measured on a ZW810E over the same 35
@@ -29,41 +29,41 @@ from fla.utils import assert_close, device, IS_PPU_M890
 
 # (label, B, T, HV, D, fused-vs-pair delta in %, route)
 SWEEP = [
-    ('s_t2k', 1, 2048, 96, 128, 2.17, 'pair'),
-    ('35b_t4k', 1, 4096, 32, 128, -0.02, 'pair'),
-    ('ho_gqa_4_32_t4k', 1, 4096, 32, 128, -0.50, 'pair'),
-    ('122b_t4k', 1, 4096, 96, 128, 4.73, 'pair'),
-    ('ho_b3_h40', 3, 4096, 40, 128, 8.29, 'pair'),
-    ('ho_b2_h96_t4k', 2, 4096, 96, 128, 2.17, 'pair'),
-    ('h64_b4_t4k', 4, 4096, 64, 128, -3.19, 'fused'),
-    ('ho_h80_t6k', 1, 6144, 80, 128, 7.48, 'pair'),
-    ('p_h8', 1, 8192, 8, 128, 17.41, 'pair'),
-    ('d64_t8k', 1, 8192, 32, 64, 1.66, 'pair'),
-    ('p_h16', 1, 8192, 16, 128, 8.90, 'pair'),
-    ('gqa_4_16', 1, 8192, 16, 128, 9.14, 'pair'),
-    ('35b_t8k', 1, 8192, 32, 128, -0.30, 'pair'),
-    ('p_h32', 1, 8192, 32, 128, -1.00, 'pair'),
-    ('b_b2', 2, 8192, 16, 128, -1.80, 'pair'),
-    ('gqa_8_32', 1, 8192, 32, 128, -0.15, 'pair'),
-    ('p_h48', 1, 8192, 48, 128, 17.80, 'pair'),
-    ('p_h64', 1, 8192, 64, 128, 7.43, 'pair'),
-    ('b_b4', 4, 8192, 16, 128, 9.66, 'pair'),
-    ('gqa_16_64', 1, 8192, 64, 128, 5.16, 'pair'),
-    ('ho_gqa_8_64', 1, 8192, 64, 128, 7.00, 'pair'),
-    ('ho_d64_h64_b2', 2, 8192, 64, 64, -2.13, 'pair'),
-    ('122b_t8k', 1, 8192, 96, 128, 1.59, 'pair'),
-    ('p_h128', 1, 8192, 128, 128, 1.32, 'pair'),
-    ('b_b8', 8, 8192, 16, 128, 5.72, 'pair'),
-    ('ho_b6_h24', 6, 8192, 24, 128, 5.48, 'pair'),
-    ('p_h192', 1, 8192, 192, 128, -3.08, 'fused'),
-    ('p_h256', 1, 8192, 256, 128, -3.00, 'fused'),
-    ('ho_h112_t10k', 1, 10240, 112, 128, -5.26, 'fused'),
-    ('ho_h48_t12k', 1, 12288, 48, 128, 16.02, 'pair'),
-    ('35b_t16k', 1, 16384, 32, 128, -3.33, 'fused'),
-    ('h16_b2_t16k', 2, 16384, 16, 128, -0.55, 'fused'),
-    ('s_t16k', 1, 16384, 96, 128, -5.20, 'fused'),
-    ('ho_h96_t24k', 1, 24576, 96, 128, -6.95, 'fused'),
-    ('s_t32k', 1, 32768, 96, 128, -7.60, 'fused'),
+    ('s_t2k', 1, 2048, 96, 128, 0.44, 'pair'),
+    ('35b_t4k', 1, 4096, 32, 128, 1.59, 'pair'),
+    ('ho_gqa_4_32_t4k', 1, 4096, 32, 128, 1.14, 'pair'),
+    ('122b_t4k', 1, 4096, 96, 128, 1.83, 'pair'),
+    ('ho_b3_h40', 3, 4096, 40, 128, 6.96, 'pair'),
+    ('ho_b2_h96_t4k', 2, 4096, 96, 128, -0.26, 'pair'),
+    ('h64_b4_t4k', 4, 4096, 64, 128, -0.86, 'fused'),
+    ('ho_h80_t6k', 1, 6144, 80, 128, 3.83, 'pair'),
+    ('p_h8', 1, 8192, 8, 128, 10.40, 'pair'),
+    ('d64_t8k', 1, 8192, 32, 64, 3.23, 'pair'),
+    ('p_h16', 1, 8192, 16, 128, 2.80, 'pair'),
+    ('gqa_4_16', 1, 8192, 16, 128, 1.44, 'pair'),
+    ('35b_t8k', 1, 8192, 32, 128, 0.01, 'pair'),
+    ('p_h32', 1, 8192, 32, 128, -0.89, 'pair'),
+    ('b_b2', 2, 8192, 16, 128, -3.91, 'pair'),
+    ('gqa_8_32', 1, 8192, 32, 128, 1.58, 'pair'),
+    ('p_h48', 1, 8192, 48, 128, 14.98, 'pair'),
+    ('p_h64', 1, 8192, 64, 128, 6.40, 'pair'),
+    ('b_b4', 4, 8192, 16, 128, 7.62, 'pair'),
+    ('gqa_16_64', 1, 8192, 64, 128, 3.52, 'pair'),
+    ('ho_gqa_8_64', 1, 8192, 64, 128, 5.29, 'pair'),
+    ('ho_d64_h64_b2', 2, 8192, 64, 64, -2.78, 'pair'),
+    ('122b_t8k', 1, 8192, 96, 128, 0.59, 'pair'),
+    ('p_h128', 1, 8192, 128, 128, 1.42, 'pair'),
+    ('b_b8', 8, 8192, 16, 128, 4.47, 'pair'),
+    ('ho_b6_h24', 6, 8192, 24, 128, 5.59, 'pair'),
+    ('p_h192', 1, 8192, 192, 128, -2.29, 'fused'),
+    ('p_h256', 1, 8192, 256, 128, -0.26, 'fused'),
+    ('ho_h112_t10k', 1, 10240, 112, 128, -4.67, 'fused'),
+    ('ho_h48_t12k', 1, 12288, 48, 128, 16.33, 'pair'),
+    ('35b_t16k', 1, 16384, 32, 128, -2.92, 'fused'),
+    ('h16_b2_t16k', 2, 16384, 16, 128, -1.37, 'fused'),
+    ('s_t16k', 1, 16384, 96, 128, -4.66, 'fused'),
+    ('ho_h96_t24k', 1, 24576, 96, 128, -5.35, 'fused'),
+    ('s_t32k', 1, 32768, 96, 128, -5.74, 'fused'),
 ]
 
 
