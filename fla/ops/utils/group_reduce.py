@@ -18,8 +18,12 @@ def group_heads_sum_kernel(
     G: tl.constexpr,
     K: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    I64: tl.constexpr,
 ):
-    i_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    if I64:
+        i_r = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
+    else:
+        i_r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     m_r = i_r < n_rows
     o_k = tl.arange(0, K)
     b_acc = tl.zeros([BLOCK_R, K], dtype=tl.float32)
@@ -38,7 +42,7 @@ def sum_group_heads(x: torch.Tensor, group: int) -> torch.Tensor:
 
     The torch equivalent `x.view(B, T, H, group, K).sum(3)` reduces along a
     non-innermost axis of a 5-D view, which on the bwd shapes moves 302 MB at
-    0.59 TB/s on the ZW-M890P and 1.3 TB/s on H200. This kernel reads the
+    0.61 TB/s on the ZW-M890P and 1.4 TB/s on H200. This kernel reads the
     `group` slices of one output row back to back and accumulates in fp32:
     2.4 TB/s / 4.2 TB/s on the same shapes. `group == 2` is one fp32 add per
     element and reproduces torch bit for bit; a larger group can differ by
@@ -56,6 +60,7 @@ def sum_group_heads(x: torch.Tensor, group: int) -> torch.Tensor:
     out = torch.empty(B, T, H, K, dtype=x.dtype, device=x.device)
     block_r = max(1, 1024 // K)
     group_heads_sum_kernel[(triton.cdiv(n_rows, block_r),)](
-        x, out, n_rows, G=group, K=K, BLOCK_R=block_r, num_warps=4,
+        x, out, n_rows, G=group, K=K, BLOCK_R=block_r, I64=x.numel() >= 2**31,
+        num_warps=4,
     )
     return out
