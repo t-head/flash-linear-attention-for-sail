@@ -1494,6 +1494,9 @@ def test_sum_group_heads(B: int, T: int, HV: int, K: int, G: int, dtype: torch.d
     assert out.shape == ref.shape
     assert out.dtype == dtype
     assert_close('sum_group_heads', ref, out, 0.005)
+    if G == 2:
+        # one fp32 add per element: there is no summation order to differ from torch
+        assert torch.equal(out, ref)
 
     # a strided head slice must reduce the same logical heads as the contiguous layout
     xnc = torch.randn(B, T, 2 * HV, K, dtype=dtype, device=device)[:, :, ::2, :]

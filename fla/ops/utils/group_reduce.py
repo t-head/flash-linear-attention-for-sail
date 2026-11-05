@@ -40,7 +40,9 @@ def sum_group_heads(x: torch.Tensor, group: int) -> torch.Tensor:
     non-innermost axis of a 5-D view, which on the bwd shapes moves 302 MB at
     0.59 TB/s on the ZW-M890P and 1.3 TB/s on H200. This kernel reads the
     `group` slices of one output row back to back and accumulates in fp32:
-    2.4 TB/s / 4.2 TB/s on the same shapes, bit-identical to torch.
+    2.4 TB/s / 4.2 TB/s on the same shapes. `group == 2` is one fp32 add per
+    element and reproduces torch bit for bit; a larger group can differ by
+    1 ulp of the output dtype, as the summation order is then not the same.
     """
     B, T, HV, K = x.shape
     if group == 1:
