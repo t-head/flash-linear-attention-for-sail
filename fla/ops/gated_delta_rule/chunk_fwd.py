@@ -15,12 +15,89 @@ from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices, solve_tril
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
-from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs
+from fla.utils import IS_PPU_M890, IS_TF32_SUPPORTED, autotune_cache_kwargs
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
 else:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('ieee')
+
+# The diagonal-block inverse is the base of every later term, and its rounding error
+# is amplified by each doubling level. Plain tf32 there costs ~1e-2 on the solved
+# matrix; tf32x3 (3-pass) matches fp32 to ~1e-7 for a third of the fp32 FMA cost.
+SOLVE_TRIL_DIAG_PRECISION = tl.constexpr('tf32x3' if IS_TF32_SUPPORTED else 'ieee')
+
+# The wider grid only earns its keep on the 890P it was swept on. Anywhere else a
+# fresh process pays for every config of every new (H, HV, K, BC) key before the
+# first call returns, and BK=128 is far more expensive to compile than it is to
+# run: on ZW-810E it turned the chunk_solve UT from 13 s into 211 s. BK=128 and
+# 4 stages never won a measured shape, so the 890P grid keeps the winner
+# (BK=64 / 1 warp / 2 stages) and drops them; other boards keep the upstream one.
+if IS_PPU_M890:
+    _KKT_SOLVE_CONFIGS = [
+        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64]
+        for num_warps in [1, 2]
+        for num_stages in [2, 3]
+    ]
+else:
+    _KKT_SOLVE_CONFIGS = [
+        triton.Config({'BK': BK}, num_warps=num_warps)
+        for BK in [32, 64]
+        for num_warps in [1, 2, 4]
+    ]
+
+
+@triton.jit
+def _nilpotent_inverse(b_N, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
+    """prod_{j<log2(BC)} (I + N^(2^j)) = sum_k N^k, exact when N^BC == 0.
+
+    Only used with BC <= 8, i.e. at most the (I + N)(I + N^2)(I + N^4) product.
+    """
+    b_P = b_N + m_I
+    b_N2 = tl.dot(b_N, b_N, input_precision=PRECISION)
+    b_P = b_P + tl.dot(b_P, b_N2, input_precision=PRECISION)
+    if BC > 4:
+        b_N4 = tl.dot(b_N2, b_N2, input_precision=PRECISION)
+        b_P = b_P + tl.dot(b_P, b_N4, input_precision=PRECISION)
+    return b_P
+
+
+@triton.jit
+def _tril_inverse_neumann(b_A, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
+    """(I + A)^-1 for strictly-lower-triangular A, by nilpotent doubling.
+
+    A^BC == 0, so (I + A)^-1 = sum_k (-A)^k = prod_j (I + N^(2^j)), N = -A,
+    with log2(BC) factors, all on tensor cores instead of BC-2 serial row
+    eliminations.
+
+    Doubling a whole [BC, BC] block is exact in exact arithmetic but not backward
+    stable: the intermediates reach ||N||^(2^j) while the result is O(1), so the
+    fp32 accumulations cancel. With correlated keys and beta near 2 (the
+    `allow_neg_eigval` range) a 16x16 block of 31/16 loses the [15, 0] entry,
+    -0.7849456 -> -0.71875; rows-elimination stays at 1e-7. For BC == 16 the
+    block is therefore split into its two 8x8 diagonal halves,
+
+        X = [[X00, 0], [-X11 A10 X00, X11]],
+
+    where X00 and X11 are exact 8-level doublings (N^8 == 0 there) of the
+    block-diagonal part D of N = -A: D^k keeps only the two diagonal blocks, so
+    the same doubling sequence yields blockdiag(X00, X11) at the cost of the
+    unsplit call. Every intermediate then stays within reach of the fp32
+    mantissa: the same block lands at 4e-6.
+    """
+    b_N = -b_A
+    if BC <= 8:
+        b_X = _nilpotent_inverse(b_N, m_I, BC, PRECISION)
+    else:
+        m_lo = tl.arange(0, BC) < BC // 2
+        m_hi = tl.arange(0, BC) >= BC // 2
+        b_A10 = tl.where(m_hi[:, None] & m_lo[None, :], b_A, 0.)
+        # N10 == -A10, so adding A10 back zeroes the off-diagonal block.
+        b_P = _nilpotent_inverse(b_N + b_A10, m_I, BC // 2, PRECISION)
+        b_X = b_P - tl.dot(tl.dot(b_P, b_A10, input_precision=PRECISION), b_P,
+                           input_precision=PRECISION)
+    return b_X
 
 
 @triton.heuristics({
@@ -28,11 +105,7 @@ else:
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @fla_cache_autotune(
-    configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ],
+    configs=_KKT_SOLVE_CONFIGS,
     key=['H', 'HV', 'K', 'BC'],
     **autotune_cache_kwargs,
 )
@@ -63,7 +136,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     Steps:
     1. Compute all 10 lower-triangular [BC, BC] blocks of beta * K @ K^T in registers
     2. Apply gate and beta scaling
-    3. Forward substitution on diagonal blocks
+    3. Invert the diagonal blocks by nilpotent doubling (all matmul)
     4. Block merge to get full (I+A)^{-1}
     5. Write result to A (output)
     """
@@ -177,7 +250,6 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     # m_tc: boundary mask to prevent NaN from 0 * inf (IEEE 754) when
     #   out-of-bounds g loads as 0 via boundary_check and exp2(0 - g_inbounds) overflows
     m_d = o_i[:, None] > o_i[None, :]
-    m_I = o_i[:, None] == o_i[None, :]
 
     if USE_G:
         b_A00 *= tl.where(m_d & m_tc0[:, None] & m_tc0[None, :], exp2(b_g0[:, None] - b_g0[None, :]), 0.)
@@ -212,43 +284,20 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     b_A32 = b_A32 * b_b3[:, None]
 
     ############################################################################
-    # Step 3: forward substitution on diagonal blocks -> (I + A_diag)^{-1}
+    # Step 3: invert the diagonal blocks -> (I + A_diag)^{-1}
     #
-    # Same algorithm as solve_tril, but rows are extracted from in-register
-    # [BC, BC] tensor via tl.sum(tl.where(mask, tensor, 0), 0) instead of
-    # tl.load from HBM.
+    # Nilpotent doubling: A_diag^BC == 0, so the inverse is the finite series
+    # sum_k (-A_diag)^k, evaluated as log2(BC) matmul factors. Rows past T are
+    # zero, which makes their inverse rows the identity, so the partial-chunk
+    # case needs no extra handling.
     ############################################################################
 
-    b_Ai00 = -b_A00
-    b_Ai11 = -b_A11
-    b_Ai22 = -b_A22
-    b_Ai33 = -b_A33
+    m_I = o_i[:, None] == o_i[None, :]
 
-    for i in range(2, min(BC, T - i_tc0)):
-        b_a00 = tl.sum(tl.where((o_i == i)[:, None], -b_A00, 0.), 0)
-        b_a00 = tl.where(o_i < i, b_a00, 0.)
-        b_a00 = b_a00 + tl.sum(b_a00[:, None] * b_Ai00, 0)
-        b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
-    for i in range(2, min(BC, T - i_tc1)):
-        b_a11 = tl.sum(tl.where((o_i == i)[:, None], -b_A11, 0.), 0)
-        b_a11 = tl.where(o_i < i, b_a11, 0.)
-        b_a11 = b_a11 + tl.sum(b_a11[:, None] * b_Ai11, 0)
-        b_Ai11 = tl.where((o_i == i)[:, None], b_a11, b_Ai11)
-    for i in range(2, min(BC, T - i_tc2)):
-        b_a22 = tl.sum(tl.where((o_i == i)[:, None], -b_A22, 0.), 0)
-        b_a22 = tl.where(o_i < i, b_a22, 0.)
-        b_a22 = b_a22 + tl.sum(b_a22[:, None] * b_Ai22, 0)
-        b_Ai22 = tl.where((o_i == i)[:, None], b_a22, b_Ai22)
-    for i in range(2, min(BC, T - i_tc3)):
-        b_a33 = tl.sum(tl.where((o_i == i)[:, None], -b_A33, 0.), 0)
-        b_a33 = tl.where(o_i < i, b_a33, 0.)
-        b_a33 = b_a33 + tl.sum(b_a33[:, None] * b_Ai33, 0)
-        b_Ai33 = tl.where((o_i == i)[:, None], b_a33, b_Ai33)
-
-    b_Ai00 += m_I
-    b_Ai11 += m_I
-    b_Ai22 += m_I
-    b_Ai33 += m_I
+    b_Ai00 = _tril_inverse_neumann(b_A00, m_I, BC, SOLVE_TRIL_DIAG_PRECISION)
+    b_Ai11 = _tril_inverse_neumann(b_A11, m_I, BC, SOLVE_TRIL_DIAG_PRECISION)
+    b_Ai22 = _tril_inverse_neumann(b_A22, m_I, BC, SOLVE_TRIL_DIAG_PRECISION)
+    b_Ai33 = _tril_inverse_neumann(b_A33, m_I, BC, SOLVE_TRIL_DIAG_PRECISION)
 
     ############################################################################
     # Step 4: block merge -> full (I + A)^{-1}
@@ -327,6 +376,23 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     tl.store(p_A32, b_Ai32.to(A.dtype.element_ty), mask=m_A32)
     tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), mask=m_A33)
 
+    # The six upper-triangular blocks are exactly zero ((I+A)^{-1} of a lower-triangular
+    # A is lower triangular). Writing them here lets the caller allocate A with
+    # torch.empty instead of paying a separate full-tensor zero fill.
+    b_zero = tl.zeros([BC, BC], dtype=A.dtype.element_ty)
+    p_A01 = A + (i_tc0 + o_i)[:, None] * (HV*BT) + (BC + o_i)[None, :]
+    p_A02 = A + (i_tc0 + o_i)[:, None] * (HV*BT) + (2*BC + o_i)[None, :]
+    p_A03 = A + (i_tc0 + o_i)[:, None] * (HV*BT) + (3*BC + o_i)[None, :]
+    p_A12 = A + (i_tc1 + o_i)[:, None] * (HV*BT) + (2*BC + o_i)[None, :]
+    p_A13 = A + (i_tc1 + o_i)[:, None] * (HV*BT) + (3*BC + o_i)[None, :]
+    p_A23 = A + (i_tc2 + o_i)[:, None] * (HV*BT) + (3*BC + o_i)[None, :]
+    tl.store(p_A01, b_zero, mask=m_tc0[:, None])
+    tl.store(p_A02, b_zero, mask=m_tc0[:, None])
+    tl.store(p_A03, b_zero, mask=m_tc0[:, None])
+    tl.store(p_A12, b_zero, mask=m_tc1[:, None])
+    tl.store(p_A13, b_zero, mask=m_tc1[:, None])
+    tl.store(p_A23, b_zero, mask=m_tc2[:, None])
+
 
 @dispatch('gated_delta_rule')
 def chunk_gated_delta_rule_fwd_intra(
@@ -379,7 +445,7 @@ def chunk_gated_delta_rule_fwd_intra(
         # Step 1: fused kkt + solve_tril
         BC = 16
         NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-        A = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
+        A = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
         chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * HV)](
             k=k,
             g=g,
