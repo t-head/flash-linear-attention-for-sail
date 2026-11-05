@@ -12,6 +12,7 @@ import triton.language as tl
 from fla.ops.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
+from fla.ops.utils.group_reduce import sum_group_heads
 from fla.ops.utils.op import exp2
 from fla.utils import IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_mem
 
@@ -375,7 +376,7 @@ def prepare_wy_repr_bwd(
         **_wy_bwd_tile_kwargs(K, V),
     )
     if H != HV:
-        dk = dk.view(B, T, H, HV // H, K).sum(3)
+        dk = sum_group_heads(dk, HV // H)
     return dk, dv, db, dg
 
 

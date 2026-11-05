@@ -30,6 +30,7 @@ from fla.ops.gated_delta_rule.gate import gdn_gate_bwd, gdn_gate_chunk_cumsum, g
 from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.group_reduce import sum_group_heads
 from fla.utils import IS_PPU, assert_close, device
 
 
@@ -1468,3 +1469,35 @@ def test_chunk_gated_delta_rule_bwd_dhu(
         assert_close('dv2', dv2_ref.to(dtype), dv2_tri, 0.006)
         if use_h0:
             assert_close('dh0', dh0_ref, dh0_tri, 0.006)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'HV', 'K', 'G', 'dtype'),
+    [
+        pytest.param(B, T, HV, K, G, dtype, id=f"B{B}-T{T}-HV{HV}-K{K}-G{G}-{dtype}")
+        for (B, T, HV, K, G, dtype) in [
+            (1, 1024, 32, 128, 2, torch.bfloat16),
+            (1, 1024, 48, 128, 2, torch.bfloat16),
+            (2, 256, 8, 64, 2, torch.float16),
+            (1, 128, 4, 32, 2, torch.float32),
+            # K not a power of two: the kernel would need a masked load, torch takes over
+            (1, 64, 12, 100, 3, torch.bfloat16),
+        ]
+    ],
+)
+def test_sum_group_heads(B: int, T: int, HV: int, K: int, G: int, dtype: torch.dtype):
+    torch.manual_seed(42)
+    x = torch.randn(B, T, HV, K, dtype=dtype, device=device)
+    ref = x.view(B, T, HV // G, G, K).sum(3)
+    out = sum_group_heads(x, G)
+
+    assert out.shape == ref.shape
+    assert out.dtype == dtype
+    assert_close('sum_group_heads', ref, out, 0.005)
+
+    # a strided head slice must reduce the same logical heads as the contiguous layout
+    xnc = torch.randn(B, T, 2 * HV, K, dtype=dtype, device=device)[:, :, ::2, :]
+    assert torch.equal(sum_group_heads(xnc, G), xnc.reshape(B, T, HV // G, G, K).sum(3))
+
+    # a single head per group is the identity and must not launch anything
+    assert sum_group_heads(x, 1) is x
