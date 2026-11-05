@@ -296,6 +296,142 @@ def test_chunk_kkt_solve(
     assert_close('A', A_ref, A_tri, 0.005)
 
 
+def _kkt_solve_ref_fp64(
+    k: torch.Tensor,
+    g: torch.Tensor | None,
+    beta: torch.Tensor,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Float64 `(I + L)^{-1}` per chunk, laid out like the kernel's A output.
+
+    Unlike `chunk_kkt_solve_ref` the accumulator is float64, and a chunk is
+    inverted over the rows it actually owns, so a sequence tail shorter than
+    `chunk_size` is supported.
+    """
+    B, T, H, _ = k.shape
+    HV = beta.shape[2]
+    BT = chunk_size
+    k = k.double()
+    if HV != H:
+        k = k.repeat_interleave(HV // H, dim=2)
+    beta = beta.double()
+    g = None if g is None else g.double()
+
+    m = torch.tril(torch.ones(BT, BT, dtype=torch.bool, device=k.device), diagonal=-1)
+    A_out = torch.zeros(B, T, HV, BT, dtype=torch.float64, device=k.device)
+    if cu_seqlens is None:
+        spans = [(b, 0, T) for b in range(B)]
+    else:
+        assert B == 1
+        spans = [(0, int(cu_seqlens[i]), int(cu_seqlens[i + 1]))
+                 for i in range(len(cu_seqlens) - 1)]
+
+    for b, bos, eos in spans:
+        for s in range(bos, eos, BT):
+            e = min(s + BT, eos)
+            n = e - s
+            k_c = k[b:b + 1, s:e].permute(0, 2, 1, 3)  # [1, HV, n, K]
+            kkt = torch.matmul(k_c, k_c.transpose(-1, -2))
+            if g is not None:
+                g_c = g[b:b + 1, s:e].permute(0, 2, 1)
+                gdiff = g_c[..., :, None] - g_c[..., None, :]
+                gate = torch.exp2(gdiff.masked_fill(~m[:n, :n], 0.0))
+            else:
+                gate = 1.0
+            beta_c = beta[b:b + 1, s:e].permute(0, 2, 1)
+            L = kkt * gate * beta_c[..., :, None] * m[:n, :n]
+            X = torch.linalg.inv(torch.eye(n, dtype=torch.float64, device=k.device) + L)
+            A_out[b, s:e, :, :n] = X.permute(0, 2, 1, 3)
+    return A_out
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'HV', 'D', 'chunk_size'),
+    [
+        pytest.param(1, 256, 2, 2, 128, 64, id='dense'),
+        pytest.param(1, 173, 2, 2, 128, 64, id='tail'),
+    ],
+)
+def test_chunk_kkt_solve_correlated_keys_high_beta(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    chunk_size: int,
+):
+    """beta -> 2 with identical keys, the corner where blocking the inverse matters.
+
+    Every key is the same unit vector, so each intra-chunk Gram matrix is all ones
+    and L is a constant strictly-lower matrix scaled by beta. Solving a 16x16
+    diagonal block by one nilpotent doubling of the whole block cancels in fp32:
+    the [15, 0] entry of the inverse lands on -0.719 instead of -0.7849, and the
+    solved A drifts by 0.56 RMS-relative instead of 0.9%. Inverting the same block
+    in two 8x8 levels has to stay within bf16 rounding of the float64 solve.
+    """
+    torch.manual_seed(42)
+    beta_eff = 1.9375  # 31/16; 2 * sigmoid() reaches, but never exceeds, 2
+    k = torch.full((B, T, H, D), D ** -0.5, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, D, dtype=torch.bfloat16, device=device)
+    beta = torch.full((B, T, HV), beta_eff, dtype=torch.bfloat16, device=device)
+    g = torch.zeros(B, T, HV, dtype=torch.float32, device=device)
+
+    A_ref = _kkt_solve_ref_fp64(k, g, beta, chunk_size=chunk_size)
+    _, _, A_tri = chunk_gated_delta_rule_fwd_intra(
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        chunk_size=chunk_size,
+    )
+
+    assert_close('A', A_ref.float(), A_tri.float(), 0.02)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'HV', 'D', 'cu_seqlens'),
+    [
+        pytest.param(1, 173, 2, 2, 64, None, id='tail'),
+        pytest.param(1, 192, 2, 2, 64, [0, 155, 192], id='varlen'),
+    ],
+)
+def test_chunk_kkt_solve_writes_every_A_element(
+    monkeypatch: pytest.MonkeyPatch,
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    cu_seqlens: list[int] | None,
+):
+    """`A` is allocated with `torch.empty`, so no stale pool bytes may survive.
+
+    Rows past the end of a chunk or of a sequence belong to no chunk result, yet
+    the kernel must still write them. Running the same call on a zero-filled
+    allocation therefore has to reproduce the `torch.empty` result exactly.
+    """
+    torch.manual_seed(42)
+    BT = 64
+    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    k = F.normalize(k, p=2, dim=-1)
+    v = torch.randn(B, T, HV, D, dtype=torch.bfloat16, device=device)
+    beta = torch.rand(B, T, HV, dtype=torch.bfloat16, device=device).sigmoid()
+    g = _make_gate(B, T, HV, BT)
+    cu = None if cu_seqlens is None else torch.LongTensor(cu_seqlens).to(device)
+
+    w0, u0, A0 = chunk_gated_delta_rule_fwd_intra(
+        k=k, v=v, g=g, beta=beta, cu_seqlens=cu, chunk_size=BT,
+    )
+    monkeypatch.setattr(torch, 'empty', torch.zeros)
+    w1, u1, A1 = chunk_gated_delta_rule_fwd_intra(
+        k=k, v=v, g=g, beta=beta, cu_seqlens=cu, chunk_size=BT,
+    )
+
+    assert torch.equal(A0, A1), 'A holds elements that the kernel never writes'
+    assert torch.equal(w0, w1) and torch.equal(u0, u1)
+
+
 def gdn_gate_fwd_ref(
     g: torch.Tensor,
     A_log: torch.Tensor,

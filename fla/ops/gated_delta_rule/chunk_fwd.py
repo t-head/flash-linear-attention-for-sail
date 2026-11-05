@@ -49,24 +49,55 @@ else:
 
 
 @triton.jit
-def _tril_inverse_neumann(b_A, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
-    """(I + A)^-1 for strictly-lower-triangular A, by nilpotent doubling.
+def _nilpotent_inverse(b_N, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
+    """prod_{j<log2(BC)} (I + N^(2^j)) = sum_k N^k, exact when N^BC == 0.
 
-    A^BC == 0, so (I + A)^-1 = sum_k (-A)^k = prod_j (I + N^(2^j)), N = -A,
-    with log2(BC) factors. Every step is a [BC, BC] matmul, so the whole
-    inversion runs on tensor cores instead of BC-2 serial row eliminations.
+    Only used with BC <= 8, i.e. at most the (I + N)(I + N^2)(I + N^4) product.
     """
-    b_N = -b_A
     b_P = b_N + m_I
     b_N2 = tl.dot(b_N, b_N, input_precision=PRECISION)
     b_P = b_P + tl.dot(b_P, b_N2, input_precision=PRECISION)
     if BC > 4:
         b_N4 = tl.dot(b_N2, b_N2, input_precision=PRECISION)
         b_P = b_P + tl.dot(b_P, b_N4, input_precision=PRECISION)
-    if BC > 8:
-        b_N8 = tl.dot(b_N4, b_N4, input_precision=PRECISION)
-        b_P = b_P + tl.dot(b_P, b_N8, input_precision=PRECISION)
     return b_P
+
+
+@triton.jit
+def _tril_inverse_neumann(b_A, m_I, BC: tl.constexpr, PRECISION: tl.constexpr):
+    """(I + A)^-1 for strictly-lower-triangular A, by nilpotent doubling.
+
+    A^BC == 0, so (I + A)^-1 = sum_k (-A)^k = prod_j (I + N^(2^j)), N = -A,
+    with log2(BC) factors, all on tensor cores instead of BC-2 serial row
+    eliminations.
+
+    Doubling a whole [BC, BC] block is exact in exact arithmetic but not backward
+    stable: the intermediates reach ||N||^(2^j) while the result is O(1), so the
+    fp32 accumulations cancel. With correlated keys and beta near 2 (the
+    `allow_neg_eigval` range) a 16x16 block of 31/16 loses the [15, 0] entry,
+    -0.7849456 -> -0.71875; rows-elimination stays at 1e-7. For BC == 16 the
+    block is therefore split into its two 8x8 diagonal halves,
+
+        X = [[X00, 0], [-X11 A10 X00, X11]],
+
+    where X00 and X11 are exact 8-level doublings (N^8 == 0 there) of the
+    block-diagonal part D of N = -A: D^k keeps only the two diagonal blocks, so
+    the same doubling sequence yields blockdiag(X00, X11) at the cost of the
+    unsplit call. Every intermediate then stays within reach of the fp32
+    mantissa: the same block lands at 4e-6.
+    """
+    b_N = -b_A
+    if BC <= 8:
+        b_X = _nilpotent_inverse(b_N, m_I, BC, PRECISION)
+    else:
+        m_lo = tl.arange(0, BC) < BC // 2
+        m_hi = tl.arange(0, BC) >= BC // 2
+        b_A10 = tl.where(m_hi[:, None] & m_lo[None, :], b_A, 0.)
+        # N10 == -A10, so adding A10 back zeroes the off-diagonal block.
+        b_P = _nilpotent_inverse(b_N + b_A10, m_I, BC // 2, PRECISION)
+        b_X = b_P - tl.dot(tl.dot(b_P, b_A10, input_precision=PRECISION), b_P,
+                           input_precision=PRECISION)
+    return b_X
 
 
 @triton.heuristics({
