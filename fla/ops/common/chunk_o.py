@@ -12,6 +12,7 @@ import triton.language as tl
 from fla.ops.common.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
+from fla.ops.utils.group_reduce import sum_group_heads
 from fla.ops.utils.op import exp2
 from fla.utils import (
     IS_NVIDIA_HOPPER,
@@ -899,8 +900,8 @@ def chunk_bwd_dqkwg(
     )
 
     if H != HV:
-        dq = dq.view(B, T, H, HV // H, K).sum(3)
-        dk = dk.view(B, T, H, HV // H, K).sum(3)
+        dq = sum_group_heads(dq, HV // H)
+        dk = sum_group_heads(dk, HV // H)
     if dg is not None:
         dg = dg.sum(0)
     return dq, dk, dw, dg

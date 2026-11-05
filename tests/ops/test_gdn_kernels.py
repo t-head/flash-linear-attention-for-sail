@@ -15,6 +15,7 @@ that implements the same math, so that every kernel can be validated in isolatio
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
 
 from fla.ops.common import chunk_o
 from fla.ops.common.chunk_delta_h import (
@@ -30,6 +31,7 @@ from fla.ops.gated_delta_rule.gate import gdn_gate_bwd, gdn_gate_chunk_cumsum, g
 from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.group_reduce import group_heads_sum_kernel, sum_group_heads
 from fla.utils import IS_PPU, assert_close, device
 
 
@@ -1468,3 +1470,50 @@ def test_chunk_gated_delta_rule_bwd_dhu(
         assert_close('dv2', dv2_ref.to(dtype), dv2_tri, 0.006)
         if use_h0:
             assert_close('dh0', dh0_ref, dh0_tri, 0.006)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'HV', 'K', 'G', 'dtype'),
+    [
+        pytest.param(B, T, HV, K, G, dtype, id=f"B{B}-T{T}-HV{HV}-K{K}-G{G}-{dtype}")
+        for (B, T, HV, K, G, dtype) in [
+            (1, 1024, 32, 128, 2, torch.bfloat16),
+            (1, 1024, 48, 128, 2, torch.bfloat16),
+            (2, 256, 8, 64, 2, torch.float16),
+            (1, 128, 4, 32, 2, torch.float32),
+            # 35 rows: the last block is partial and the group is not 2
+            (1, 7, 15, 128, 3, torch.bfloat16),
+            # K not a power of two: the kernel would need a masked load, torch takes over
+            (1, 64, 12, 100, 3, torch.bfloat16),
+        ]
+    ],
+)
+def test_sum_group_heads(B: int, T: int, HV: int, K: int, G: int, dtype: torch.dtype):
+    torch.manual_seed(42)
+    x = torch.randn(B, T, HV, K, dtype=dtype, device=device)
+    ref = x.view(B, T, HV // G, G, K).sum(3)
+    out = sum_group_heads(x, G)
+
+    assert out.shape == ref.shape
+    assert out.dtype == dtype
+    assert_close('sum_group_heads', ref, out, 0.005)
+    if G == 2:
+        # one fp32 add per element: there is no summation order to differ from torch
+        assert torch.equal(out, ref)
+
+    # a strided head slice must reduce the same logical heads as the contiguous layout
+    xnc = torch.randn(B, T, 2 * HV, K, dtype=dtype, device=device)[:, :, ::2, :]
+    assert torch.equal(sum_group_heads(xnc, G), xnc.reshape(B, T, HV // G, G, K).sum(3))
+
+    if not K & (K - 1):
+        # the 64-bit index variant only turns on above 2**31 elements, so run the
+        # kernel directly to at least compile and check it on this shape
+        n_rows = B * T * (HV // G)
+        out64 = torch.empty_like(out)
+        group_heads_sum_kernel[(triton.cdiv(n_rows, 1024 // K),)](
+            x, out64, n_rows, G=G, K=K, BLOCK_R=max(1, 1024 // K), I64=True, num_warps=4,
+        )
+        assert torch.equal(out64, out)
+
+    # a single head per group is the identity and must not launch anything
+    assert sum_group_heads(x, 1) is x
