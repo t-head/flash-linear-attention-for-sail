@@ -19,9 +19,11 @@ the generic dispatch in :mod:`fla.ops.backends`.
   Those transpose copies make decode slower than Triton, so it is opt-in via
   ``FLA_PLA_GDN_DECODE=1`` and stays off by default.
 
-Both verifiers accept the K-first state layout only, so calls that pass
-``state_v_first=True`` (including ``fla.layers.GatedDeltaNet``) stay on Triton;
-only direct K-first operator calls route to PLA.
+The prefill verifier also accepts the V-first state layout that
+``fla.layers.GatedDeltaNet`` passes, transposing at the boundary (a one-off
+copy amortized over the whole prefill), so the layer's inference prefill routes
+to PLA transparently; V-first training stays on Triton and decode is K-first
+only.
 
 Disable with ``FLA_PLA_GDN=0``.
 """
@@ -85,9 +87,11 @@ class _PLAGDNHybridFunction(torch.autograd.Function):
         chunk_size: int,
     ):
         from pla.prefill.flashqla import chunk_gated_delta_rule_fwd
+        # PLA derives ht dtype from initial_state; feed it fp32 so ht matches native's fp32.
+        h0 = initial_state.float() if initial_state is not None else None
         if use_gate_in_kernel:
             _, _, o, _, ht = chunk_gated_delta_rule_fwd(
-                q, k, v, None, None, scale=scale, initial_state=initial_state,
+                q, k, v, None, None, scale=scale, initial_state=h0,
                 cu_seqlens=cu_seqlens, output_final_state=output_final_state,
                 normalize_qk=use_qk_l2norm_in_kernel,
                 raw_gate_a=g[0], raw_beta_b=beta[0],
@@ -98,7 +102,7 @@ class _PLAGDNHybridFunction(torch.autograd.Function):
             beta_act = torch.sigmoid(beta.float()) if use_beta_sigmoid_in_kernel else beta
             _, _, o, _, ht = chunk_gated_delta_rule_fwd(
                 q, k, v, g.float(), beta_act.float(), scale=scale,
-                initial_state=initial_state, cu_seqlens=cu_seqlens,
+                initial_state=h0, cu_seqlens=cu_seqlens,
                 output_final_state=output_final_state,
                 normalize_qk=use_qk_l2norm_in_kernel,
             )
@@ -108,7 +112,7 @@ class _PLAGDNHybridFunction(torch.autograd.Function):
         ctx.use_beta_sigmoid_in_kernel = use_beta_sigmoid_in_kernel
         ctx.use_gate_in_kernel = use_gate_in_kernel
         ctx.chunk_size = chunk_size
-        return o, ht
+        return o.to(q.dtype), ht  # PLA already returns q.dtype; cast mirrors native's contract
 
     @staticmethod
     @input_guard
@@ -243,6 +247,8 @@ class PLAGDNBackend(BaseBackend):
             return False, f'PLA requires K=V=128, got K={q.shape[-1]}, V={v.shape[-1]}'
         if (v.shape[2], k.shape[2]) not in PLA_HEAD_CONFIGS:
             return False, f'head config (H={v.shape[2]}, Hg={k.shape[2]}) is outside the PLA dispatch table'
+        if q.shape[2] != k.shape[2]:
+            return False, f'PLA requires matching q/k head counts, got {q.shape[2]}/{k.shape[2]}'
         if q.shape[0] != 1:
             return False, 'PLA prefill takes packed [1, T, ...] inputs only'
         if cp_context is not None:
@@ -252,12 +258,24 @@ class PLAGDNBackend(BaseBackend):
         # than silently reading a V-first state as K-first.
         if kwargs.get('transpose_state_layout'):
             return False, 'PLA does not accept the deprecated transpose_state_layout alias'
-        if state_v_first or allow_neg_eigval:
-            return False, 'PLA supports neither state_v_first nor allow_neg_eigval'
+        # dispatch also bypasses the native head_first/chunk_size validation, so reject
+        # them here and let the native entry point raise its explicit errors.
+        if 'head_first' in kwargs:
+            return False, 'PLA does not accept the removed head_first option'
+        if kwargs.get('chunk_size', 64) not in (16, 32, 64):
+            return False, 'PLA requires chunk_size in (16, 32, 64)'
+        if allow_neg_eigval:
+            return False, 'PLA prefill does not scale beta for allow_neg_eigval'
+        needs_grad = _needs_grad(
+            (q, k, v, g, beta, initial_state, kwargs.get('A_log'), kwargs.get('dt_bias')))
+        # the hybrid training function threads a K-first state only, so a V-first
+        # call that needs grad stays on Triton (also the faster training path).
+        if state_v_first and needs_grad:
+            return False, 'PLA V-first prefill is inference-only; training stays on Triton'
         if initial_state is not None and (
             initial_state.dtype not in _STATE_DTYPES or not initial_state.is_contiguous()
         ):
-            return False, 'PLA needs a contiguous fp32/bf16 [N, H, K, V] initial state'
+            return False, 'PLA needs a contiguous fp32/bf16 initial state'
         # dispatch bypasses the native packed-sequence checks, so enforce them here.
         if (
             cu_seqlens is not None and initial_state is not None
@@ -272,11 +290,11 @@ class PLAGDNBackend(BaseBackend):
             and kwargs.get('dt_bias') is not None
         ):
             return False, 'PLA raw-gate prefill needs beta sigmoid plus explicit A_log and dt_bias'
-        if _needs_grad((q, k, v, g, beta, initial_state, kwargs.get('A_log'), kwargs.get('dt_bias'))):
-            if os.environ.get('FLA_PLA_GDN_TRAIN', '0') != '1':
-                return False, 'training needs FLA_PLA_GDN_TRAIN=1 (hybrid PLA fwd + Triton bwd)'
+        if needs_grad and os.environ.get('FLA_PLA_GDN_TRAIN', '0') != '1':
+            return False, 'training needs FLA_PLA_GDN_TRAIN=1 (hybrid PLA fwd + Triton bwd)'
         return True, None
 
+    @input_guard
     def chunk_gated_delta_rule(
         self,
         q: torch.Tensor,
@@ -309,9 +327,15 @@ class PLAGDNBackend(BaseBackend):
                 use_gate_in_kernel, A_log, dt_bias, cu_seqlens, chunk_size,
             )
         from pla.prefill.flashqla import chunk_gated_delta_rule_fwd
+        # PLA derives ht dtype from initial_state; feed fp32 (V-first transposed) to match native.
+        h0 = initial_state
+        if h0 is not None:
+            if state_v_first:
+                h0 = h0.transpose(-1, -2)
+            h0 = h0.float().contiguous()
         if use_gate_in_kernel:
             _, _, o, _, ht = chunk_gated_delta_rule_fwd(
-                q, k, v, None, None, scale=scale, initial_state=initial_state,
+                q, k, v, None, None, scale=scale, initial_state=h0,
                 cu_seqlens=cu_seqlens, output_final_state=output_final_state,
                 normalize_qk=use_qk_l2norm_in_kernel,
                 raw_gate_a=g[0], raw_beta_b=beta[0],
@@ -322,11 +346,13 @@ class PLAGDNBackend(BaseBackend):
             beta_act = torch.sigmoid(beta.float()) if use_beta_sigmoid_in_kernel else beta
             _, _, o, _, ht = chunk_gated_delta_rule_fwd(
                 q, k, v, g.float(), beta_act.float(), scale=scale,
-                initial_state=initial_state, cu_seqlens=cu_seqlens,
+                initial_state=h0, cu_seqlens=cu_seqlens,
                 output_final_state=output_final_state,
                 normalize_qk=use_qk_l2norm_in_kernel,
             )
-        return o.to(q.dtype), ht
+        if state_v_first and ht is not None:
+            ht = ht.transpose(-1, -2).contiguous()
+        return o.to(q.dtype), ht  # PLA already returns q.dtype; cast mirrors native's contract
 
     def fused_recurrent_gated_delta_rule_verifier(
         self,
@@ -358,6 +384,8 @@ class PLAGDNBackend(BaseBackend):
             return False, 'PLA decode supports a scalar gate only'
         if g is None or beta is None:
             return False, 'PLA decode requires g and beta'
+        if beta.dim() != 3:
+            return False, 'PLA decode takes one beta scalar per head, i.e. [B, T, HV]'
         if not (use_gate_in_kernel and use_beta_sigmoid_in_kernel):
             return False, 'PLA decode fuses the raw gating and beta sigmoid paths only'
         # the raw-gate kernel needs both gate parameters; a bias-free or A_log-free
@@ -366,6 +394,8 @@ class PLAGDNBackend(BaseBackend):
             return False, 'PLA decode requires A_log and dt_bias'
         if q.dtype not in (torch.float16, torch.bfloat16):
             return False, f'PLA requires fp16/bf16 inputs, got {q.dtype}'
+        if not (q.dtype == k.dtype == v.dtype == g.dtype == beta.dtype):
+            return False, 'PLA decode requires q/k/v/g/beta of one activation dtype'
         if q.shape[-1] != 128 or v.shape[-1] != 128:
             return False, f'PLA requires K=V=128, got K={q.shape[-1]}, V={v.shape[-1]}'
         if (v.shape[2], k.shape[2]) not in PLA_HEAD_CONFIGS:
@@ -392,6 +422,7 @@ class PLAGDNBackend(BaseBackend):
             return False, 'PLA decode takes packed [1, N, ...] or [N, 1, ...] inputs'
         return True, None
 
+    @input_guard
     def fused_recurrent_gated_delta_rule(
         self,
         q: torch.Tensor,
@@ -423,7 +454,9 @@ class PLAGDNBackend(BaseBackend):
         elif cu_seqlens is not None:
             cu = cu_seqlens.to(torch.int32).contiguous()
         else:
-            cu = torch.tensor([0, T], dtype=torch.int32, device=q.device)
+            # device-side offsets: a Python-list tensor would force a host sync and
+            # block CUDA graph capture on every decode call.
+            cu = torch.arange(0, 2, dtype=torch.int32, device=q.device) * T
         if scale is None:
             scale = q.shape[-1] ** -0.5
         N = cu.numel() - 1

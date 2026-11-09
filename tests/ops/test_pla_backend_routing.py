@@ -33,9 +33,16 @@ def pla_backend():
 @pytest.fixture
 def routed(pla_backend, monkeypatch, request):
     """Force the PLA backend available and record calls into its impls."""
+    # with dispatch off the public functions are undecorated, so forcing
+    # is_available cannot produce a PLA route and the routing-hit tests are inert.
+    if be_mod._DISPATCH_DISABLED:
+        pytest.skip('routing is inert under FLA_DISABLE_BACKEND_DISPATCH=1')
     monkeypatch.setattr(PLAGDNBackend, 'is_available', classmethod(lambda cls: True))
     # keep FlashQLA off so a PLA rejection falls through to the Triton reference
     monkeypatch.setenv('FLA_FLASH_QLA', '0')
+    # clear the inherited PLA routing flags so each test sets its own condition
+    monkeypatch.delenv('FLA_PLA_GDN', raising=False)
+    monkeypatch.delenv('FLA_PLA_GDN_TRAIN', raising=False)
     calls = []
 
     def make(name, out_shapes):
@@ -71,6 +78,26 @@ def test_prefill_routes_to_pla(routed):
         o, ht = chunk_gated_delta_rule(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
     assert routed == ['prefill']
     assert o.shape == (1, 256, 16, 128)
+
+
+def test_prefill_v_first_routes_to_pla(routed):
+    # GatedDeltaNet passes state_v_first=True; its inference prefill must still route
+    q, k, v, g, beta = gdn_inputs()
+    with torch.no_grad():
+        o, ht = chunk_gated_delta_rule(q, k, v, g, beta, use_qk_l2norm_in_kernel=True,
+                                       state_v_first=True)
+    assert routed == ['prefill']
+    assert o.shape == (1, 256, 16, 128)
+
+
+def test_prefill_v_first_training_falls_back(routed):
+    # a V-first call that needs grad stays on Triton (the hybrid is K-first only)
+    q, k, v, g, beta = gdn_inputs(grad=True)
+    o, _ = chunk_gated_delta_rule(q, k, v, g, beta, use_qk_l2norm_in_kernel=True,
+                                  state_v_first=True)
+    assert routed == []
+    o.sum().backward()
+    assert q.grad is not None
 
 
 def test_prefill_falls_back_on_head_dim(routed):
@@ -238,7 +265,10 @@ def test_prefill_falls_back_when_pla_unavailable(pla_unavailable):
     assert torch.equal(o, ref_o) and torch.equal(ht, ref_ht)
 
 
-def test_decode_falls_back_when_pla_unavailable(pla_unavailable):
+def test_decode_falls_back_when_pla_unavailable(pla_unavailable, monkeypatch):
+    # decode is off by default; enable it so the only thing between this supported
+    # call and the patched PLA impl is the availability guard under test.
+    monkeypatch.setenv('FLA_PLA_GDN_DECODE', '1')
     q, k, v, a, b, h0, cu, A_log, dt_bias = decode_inputs()
     with torch.no_grad():
         o, ht = fused_recurrent_gated_delta_rule(
@@ -263,6 +293,16 @@ def test_prefill_verifier_rejects_unsupported():
     base = dict(use_qk_l2norm_in_kernel=True)
     accepted = be.chunk_gated_delta_rule_verifier(q, k, v, g, beta, **base)[0]
     assert accepted
+    # V-first inference (the GatedDeltaNet path) is accepted; V-first training is not
+    assert be.chunk_gated_delta_rule_verifier(
+        q, k, v, g, beta, state_v_first=True, **base)[0]
+    q.requires_grad_(True)
+    assert not be.chunk_gated_delta_rule_verifier(
+        q, k, v, g, beta, state_v_first=True, **base)[0]
+    q.requires_grad_(False)
+    # allow_neg_eigval scales beta to [0, 2), which the PLA forward does not apply
+    assert not be.chunk_gated_delta_rule_verifier(
+        q, k, v, g, beta, allow_neg_eigval=True, use_beta_sigmoid_in_kernel=True, **base)[0]
     # deprecated layout alias carries a V-first intent the impl would misread
     assert not be.chunk_gated_delta_rule_verifier(
         q, k, v, g, beta, transpose_state_layout=True, **base)[0]

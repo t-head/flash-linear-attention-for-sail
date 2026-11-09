@@ -17,13 +17,18 @@ import math
 import pytest
 import torch
 
+from fla.ops.backends import _DISPATCH_DISABLED
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from fla.ops.gated_delta_rule.backends import gdr_registry
 from fla.ops.gated_delta_rule.backends.pla import PLAGDNBackend
 
 # gate on the backend's own availability (real import probe), not just find_spec
 HAS_PLA = PLAGDNBackend.is_available()
-pytestmark = pytest.mark.skipif(not HAS_PLA, reason='requires a PPU board with an importable pla')
+# with dispatch off the public functions are undecorated, so the routing-evidence
+# assertions below can never observe a PLA hit; skip the whole module in that mode.
+pytestmark = pytest.mark.skipif(
+    not HAS_PLA or _DISPATCH_DISABLED,
+    reason='requires a PPU board with an importable pla and dispatch enabled')
 
 DEVICE = 'cuda'
 LOG_KEY = 'gated_delta_rule:chunk_gated_delta_rule:pla'
@@ -71,12 +76,16 @@ def raw_gate_inputs(T, H, Hg, seed):
     return q, k, v, g, beta, h0, A_log, dt_bias
 
 
-@pytest.mark.parametrize('case', ['dense', 'varlen_raw_gate'])
+@pytest.mark.parametrize('case', ['dense', 'bf16_state', 'varlen_raw_gate'])
 def test_prefill_parity(case, monkeypatch):
     monkeypatch.setenv('FLA_PLA_GDN_TRAIN', '0')
-    if case == 'dense':
-        q, k, v, g, beta, h0 = prefill_inputs(2048, 16, 4)
+    if case in ('dense', 'bf16_state'):
+        q, k, v, g, beta, h0 = prefill_inputs(2048, 16, 4, seed=2 if case == 'bf16_state' else 0)
         kwargs = dict(use_qk_l2norm_in_kernel=True)
+        if case == 'bf16_state':
+            # a bf16 state is the only input that makes PLA derive a bf16 ht; the adapter
+            # must promote it so ht stays fp32 like native, and the parity below proves it
+            h0 = h0.to(torch.bfloat16)
     else:
         q, k, v, g, beta, h0 = prefill_inputs(3048, 16, 4, seed=1,
                                               cu=[0, 1000, 3048])
@@ -94,7 +103,40 @@ def test_prefill_parity(case, monkeypatch):
         o_t, ht_t = triton_entry(chunk_gated_delta_rule)(q, k, v, g, beta, initial_state=h0,
                                                          output_final_state=True, **kwargs)
     assert LOG_KEY in gdr_registry._logged, 'the call did not route to PLA'
+    assert o_p.dtype == q.dtype and ht_p.dtype == torch.float32, (o_p.dtype, ht_p.dtype)
+    assert ht_t.dtype == torch.float32, ht_t.dtype
     assert rel_max(o_p, o_t) <= 1e-2, rel_max(o_p, o_t)
+    assert rel_max(ht_p, ht_t) <= 1e-2, rel_max(ht_p, ht_t)
+
+
+def test_prefill_v_first_parity(monkeypatch):
+    """GatedDeltaNet-style prefill: V-first state + raw gating, inference (no grad)."""
+    monkeypatch.setenv('FLA_PLA_GDN_TRAIN', '0')
+    torch.manual_seed(5)
+    T, H, Hg = 2048, 16, 4
+    q = torch.randn(1, T, Hg, 128, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(1, T, Hg, 128, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(1, T, H, 128, device=DEVICE, dtype=torch.bfloat16)
+    g = torch.randn(1, T, H, device=DEVICE, dtype=torch.bfloat16)
+    beta = torch.randn(1, T, H, device=DEVICE, dtype=torch.bfloat16)
+    # V-first recurrent state [N, HV, V, K], exactly as GatedDeltaNet caches it
+    h0 = torch.randn(1, H, 128, 128, device=DEVICE, dtype=torch.float32) * 0.1
+    A_log = torch.randn(H, device=DEVICE, dtype=torch.float32)
+    dt_bias = torch.randn(H, device=DEVICE, dtype=torch.float32)
+    kwargs = dict(use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                  use_beta_sigmoid_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
+                  state_v_first=True, output_final_state=True)
+    gdr_registry._logged.discard(LOG_KEY)
+    with torch.no_grad():
+        o_p, ht_p = chunk_gated_delta_rule(q, k, v, g, beta, initial_state=h0, **kwargs)
+        o_t, ht_t = triton_entry(chunk_gated_delta_rule)(q, k, v, g, beta, initial_state=h0,
+                                                         **kwargs)
+    assert LOG_KEY in gdr_registry._logged, 'the V-first prefill did not route to PLA'
+    assert rel_max(o_p, o_t) <= 1e-2, rel_max(o_p, o_t)
+    # matching the Triton V-first state proves the boundary transpose is correct;
+    # a missing or wrong transpose would leave ht_p transposed and fail this check
+    assert ht_p.shape == ht_t.shape == (1, H, 128, 128)
+    assert ht_p.dtype == torch.float32 and o_p.dtype == q.dtype, (ht_p.dtype, o_p.dtype)
     assert rel_max(ht_p, ht_t) <= 1e-2, rel_max(ht_p, ht_t)
 
 
@@ -135,6 +177,7 @@ def test_hybrid_training_parity(monkeypatch):
                                        output_final_state=True,
                                        use_qk_l2norm_in_kernel=True)
     assert LOG_KEY in gdr_registry._logged, 'the training call did not route to the PLA hybrid'
+    assert o_p.dtype == q.dtype and ht_p.dtype == torch.float32, (o_p.dtype, ht_p.dtype)
     (o_p.sum() + ht_p.sum()).backward()
     grads_p = [t.grad.clone() for t in (q, k, v, g, beta)]
 
@@ -162,6 +205,7 @@ def test_hybrid_training_raw_gate_parity(monkeypatch):
                                        output_final_state=True, A_log=A_log, dt_bias=dt_bias,
                                        **kwargs)
     assert LOG_KEY in gdr_registry._logged, 'the raw-gate call did not route to the PLA hybrid'
+    assert o_p.dtype == q.dtype and ht_p.dtype == torch.float32, (o_p.dtype, ht_p.dtype)
     (o_p.sum() + ht_p.sum()).backward()
     grads_p = [t.grad.clone() for t in primals]
 
