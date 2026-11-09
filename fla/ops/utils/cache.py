@@ -19,6 +19,7 @@ import torch
 import triton
 from packaging import version
 from triton.runtime.autotuner import Autotuner
+from triton.runtime.errors import OutOfResources
 
 TRITON_ABOVE_3_5_1 = version.parse(triton.__version__) >= version.parse("3.5.1")
 TRITON_ABOVE_3_4_0 = version.parse(triton.__version__) >= version.parse("3.4.0")
@@ -61,6 +62,20 @@ class FlaCacheMode(enum.Enum):
 
 FLA_CACHE_MODE: FlaCacheMode = FlaCacheMode.from_env()
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    """Return True when an environment variable is set to a truthy value (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Correctness tests only need *a* valid config, not the fastest one. When enabled,
+# CachedAutotuner pins the first prune-valid config for each key instead of running the
+# on-device benchmark sweep -- that sweep (repeated for every distinct autotune key /
+# constexpr specialization) is the dominant cost of the PPU unit-test suite. Results are
+# numerically identical because the same kernel runs, just with a fixed valid config.
+# Off by default; intended for test/CI runs only.
+FLA_AUTOTUNE_FAST: bool = _env_flag("FLA_AUTOTUNE_FAST")
 
 
 def sanitize_gpu_name(gpu_name: str) -> str:
@@ -377,6 +392,9 @@ class CachedAutotuner(Autotuner):
         key = AutotuneKey.build(self.arg_names, self.keys, args, kwargs)
         if self.should_check_fla_cache(key):
             self.maybe_load_cached_config(key)
+        fast_pinned = False
+        if FLA_AUTOTUNE_FAST and key.autotune_key not in self.cache:
+            fast_pinned = self._pin_first_valid_config(key, args, kwargs)
         if self.validate_cached_config and self.early_config_prune and key.autotune_key in self.cache:
             cfg = self.cache[key.autotune_key]
             named_args = dict(zip(self.arg_names, args))
@@ -385,7 +403,40 @@ class CachedAutotuner(Autotuner):
                 # a cached config must pass the safety pruning for the current shape too;
                 # drop the entry so the next call re-tunes from the declared configs
                 del self.cache[key.autotune_key]
-        return super().run(*args, **kwargs)
+        try:
+            return super().run(*args, **kwargs)
+        except OutOfResources:
+            # A fast-pinned config is chosen without benchmarking, so it may not fit the
+            # current shape. Drop it and let Triton run the full sweep (which skips
+            # out-of-resource configs per candidate) so we still get a valid config.
+            if fast_pinned and key.autotune_key in self.cache:
+                del self.cache[key.autotune_key]
+                logger.debug(
+                    "Fast-pinned config for kernel %s ran out of resources; "
+                    "falling back to full autotune", self.kernel_name,
+                )
+                return super().run(*args, **kwargs)
+            raise
+
+    def _pin_first_valid_config(self, key: AutotuneKey, args, kwargs) -> bool:
+        """Pin the first prune-valid config for `key` so Triton skips the on-device sweep.
+
+        Returns True when a config was pinned. Correctness tests only need a valid
+        config, so this reuses the same early_config_prune the cached-config validation
+        relies on and takes its first survivor. No-op (returns False) when there is a
+        single config (Triton never benchmarks then) or when nothing survives pruning.
+        """
+        if len(self.configs) <= 1:
+            return False
+        named_args = dict(zip(self.arg_names, args))
+        if self.early_config_prune:
+            pruned = self.early_config_prune(self.configs, named_args, **kwargs)
+        else:
+            pruned = self.configs
+        if not pruned:
+            return False
+        self.cache[key.autotune_key] = pruned[0]
+        return True
 
     def maybe_load_cached_config(self, key: AutotuneKey):
         best_config = load_cached_config(self.kernel_name, key)

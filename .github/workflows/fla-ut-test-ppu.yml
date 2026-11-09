@@ -131,6 +131,12 @@ jobs:
             # This suite exports no FLA_CI_ENV, so test_gdn_qwen.py cannot infer a CI scope on
             # its own: pin it, keeping one case per compiled kernel path instead of all 79.
             export FLA_TEST_GDN_QWEN_SCOPE=ci
+            # These are correctness tests, so they need a valid kernel config, not the
+            # fastest one. Pin the first prune-valid config instead of benchmarking the
+            # whole autotune sweep on-device for every key -- that sweep is the dominant
+            # cost of this suite. Results are numerically identical (same kernel, fixed
+            # valid config); any config that does not fit falls back to a full sweep.
+            export FLA_AUTOTUNE_FAST=1
 
             pip install setuptools wheel junit-xml rich
             pip install --upgrade pytest
