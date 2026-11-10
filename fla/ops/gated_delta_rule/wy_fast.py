@@ -14,7 +14,33 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.group_reduce import sum_group_heads
 from fla.ops.utils.op import exp2
-from fla.utils import IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_NVIDIA_BLACKWELL, IS_PPU_810E, IS_PPU_M890, autotune_cache_kwargs, check_shared_mem
+
+
+def _rwu_fwd_autotune_kwargs():
+    # Issue #29: each PPU board autotunes over only its own winners; other devices keep the shared union.
+    if IS_PPU_810E:
+        configs = [
+            # --- PPU 810E best configs ---
+            triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=4),   # H <= 48
+            triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=1),  # H >= 64
+        ]
+    elif IS_PPU_M890:
+        configs = [
+            # --- PPU M890P best configs ---
+            triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),   # H=8,16,32,48
+            triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=5),  # H=64,128
+        ]
+    else:
+        # Every other device keeps the previous shared union; the per-board tuning above is PPU-specific.
+        configs = [
+            triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=4),
+            triton.Config({'BK': 32, 'BV': 32}, num_warps=4, num_stages=4),
+            triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=1),
+            triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+            triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=5),
+        ]
+    return {'configs': configs, 'key': ['H', 'HV', 'K', 'V', 'BT', 'IS_VARLEN']}
 
 
 @triton.heuristics({
@@ -22,16 +48,7 @@ from fla.utils import IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_m
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @fla_cache_autotune(
-    configs=[
-        # --- PPU 810E best configs ---
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=4),   # H=8,16,48,64
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=4, num_stages=4),   # H=32
-        triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=1),  # H=128
-        # --- PPU 890P best configs ---
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),   # H=8,16,32,48
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=5),  # H=64,128
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'IS_VARLEN'],
+    **_rwu_fwd_autotune_kwargs(),
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])

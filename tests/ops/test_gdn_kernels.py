@@ -201,6 +201,68 @@ def test_recompute_w_u_fwd(
     assert_close('w', w_ref, w_tri, 0.005)
 
 
+@pytest.mark.parametrize(
+    ('H', 'HV', 'D', 'varlen', 'use_g'),
+    [
+        pytest.param(H, HV, D, varlen, use_g,
+                     id=f"H{H}-HV{HV}-D{D}-{'varlen' if varlen else 'dense'}-use_g{use_g}")
+        for (H, HV, D, varlen, use_g) in [
+            (2, 2, 64, False, True),    # D=64: BV=128 (810E) / BK=BV=128 (M890P) are masked
+            (2, 4, 64, False, False),   # D=64 GVA (HV > H), ungated
+            (1, 1, 128, False, True),   # D=128: 128-column tiles are exact, K splits in two
+            (2, 2, 64, True, True),     # varlen D=64: masked 128-column tiles
+            (2, 4, 64, True, False),    # varlen D=64 GVA, ungated
+        ]
+    ],
+)
+def test_recompute_w_u_fwd_each_config(
+    H: int,
+    HV: int,
+    D: int,
+    varlen: bool,
+    use_g: bool,
+    monkeypatch,
+):
+    """Validate every tile the board may pick, not just the first one FLA_AUTOTUNE_FAST pins.
+
+    The numerical tests above only exercise the pinned first config, leaving each
+    board's second tile (e.g. the masked 128-column tiles at D=64) untested in CI.
+    """
+    torch.manual_seed(42)
+    BT = 64
+    dtype = torch.bfloat16
+    if varlen:
+        cu_seqlens = torch.LongTensor([0, 64, 128]).to(device)
+        B, T = 1, cu_seqlens[-1].item()
+    else:
+        cu_seqlens, B, T = None, 2, 128
+    k = torch.randn(B, T, H, D, dtype=dtype, device=device)
+    v = torch.randn(B, T, HV, D, dtype=dtype, device=device)
+    beta = torch.rand(B, T, HV, dtype=dtype, device=device).sigmoid()
+    A = _make_wy_inverse(B, T, HV, BT, dtype)
+    g = torch.randn(B, T, HV, dtype=torch.float32, device=device) * 0.1 if use_g else None
+
+    if varlen:
+        w_ref, u_ref = recompute_w_u_fwd_varlen_ref(k, v, beta, A, g, cu_seqlens)
+    else:
+        w_ref, u_ref = recompute_w_u_fwd_ref(k, v, beta, A, g)
+
+    tuner = wy_fast.recompute_w_u_fwd_kernel.fn
+    # checked one by one: autotune must not be trusted to land on a safe config by luck
+    configs = tuner.configs if IS_PPU else [None]
+    for config in configs:
+        with monkeypatch.context() as patch:
+            if config is not None:
+                patch.setattr(tuner, 'configs', [config])
+                patch.setattr(tuner, 'cache', {})
+            w_tri, u_tri = recompute_w_u_fwd(k, v, beta, A, g, cu_seqlens=cu_seqlens)
+            if config is not None:
+                assert tuner.best_config is config
+
+        assert_close('u', u_ref, u_tri, 0.005)
+        assert_close('w', w_ref, w_tri, 0.005)
+
+
 def chunk_kkt_solve_ref(
     k: torch.Tensor,
     g: torch.Tensor | None,
