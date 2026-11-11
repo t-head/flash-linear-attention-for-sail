@@ -38,8 +38,8 @@ chunk oracle.
 Run notes:
   * ``unset FLA_CI_ENV`` first -- ``fla.utils.assert_close`` downgrades assertions to warnings
     when it is set, which makes a green run meaningless.
-  * CI scope: ``FLA_CI_ENV=1`` also shrinks the matrix to one case per compile path (15 cases
-    instead of 79). ``FLA_TEST_GDN_QWEN_SCOPE=full`` opts back into the cross product; see the
+  * CI scope: ``FLA_CI_ENV=1`` also shrinks the matrix to one case per compile path instead of
+    the full 79-case cross product. ``FLA_TEST_GDN_QWEN_SCOPE=full`` opts back into it; see the
     "CI scope" block below for which axis each retained case stands in for.
   * long-sequence tier is opt-in: ``FLA_TEST_LONG_SEQ=1 pytest tests/ops/test_gdn_qwen.py``
     (env-var gating follows the existing ``SKIP_TEST_CHUNK_VARLEN`` idiom in this repo).
@@ -91,8 +91,8 @@ from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device  # noqa: E402
 # warning -- the gate there is crashes, NaN and gross divergence.
 #
 # ``FLA_TEST_GDN_QWEN_SCOPE=full`` restores the cross product under CI, ``=ci`` shrinks a local
-# run; anything else is a typo worth failing on. Cutting below 15 cases starts dropping kernel
-# binaries rather than just numbers.
+# run; anything else is a typo worth failing on. Dropping a compile-axis value entirely starts
+# dropping kernel binaries rather than just numbers, so keep one case per axis value.
 _SCOPE = (os.getenv('FLA_TEST_GDN_QWEN_SCOPE') or '').strip().lower() or (
     'ci' if os.getenv('FLA_CI_ENV') == '1' else 'full')
 if _SCOPE not in ('ci', 'full'):
@@ -271,8 +271,15 @@ def _matrix_cases() -> list:
             for dtype, tag in _DTYPE_IDS
         ]
     return [
-        # off-bucket head count: below the smallest prune bucket (8), and not a power of two
+        # One bf16 guard per per-rank HV = HV_global/TP reachable at a realistic TP (see #6);
+        # LOCAL_HEADS[H] lists the (model, TP) each H derives from. 6 is an off-bucket path
+        # probe (sub-bucket code path, unreachable at a realistic TP); 128 is the top bucket.
+        pytest.param(4, 1000, torch.bfloat16, id='H4-T1000-bf16'),
         pytest.param(6, 1000, torch.bfloat16, id='H6-T1000-bf16-off-bucket'),
+        pytest.param(8, 1000, torch.bfloat16, id='H8-T1000-bf16'),
+        pytest.param(12, 1000, torch.bfloat16, id='H12-T1000-bf16'),
+        pytest.param(16, 1000, torch.bfloat16, id='H16-T1000-bf16'),
+        pytest.param(24, 1000, torch.bfloat16, id='H24-T1000-bf16'),
         # mid bucket at the production shape, on a partial trailing chunk (1000 = 15*64 + 40);
         # also the only case that passes h0 *and* asks for ht *and* backprops dht, i.e. the
         # USE_INITIAL_STATE / STORE_FINAL_STATE / USE_FINAL_STATE_GRADIENT = True specialization
@@ -290,7 +297,8 @@ def test_chunk_qwen_tp_matrix(H: int, T: int, dtype: torch.dtype):
 
     Rationale for varying H at all: grid is B*H, and autotune picks BK/BV/num_warps/num_stages
     per grid size, so H selects the code path. Upstream never goes past H=8. The CI subset keeps
-    only the head counts that bracket the autotune prune buckets -- see "CI scope" above.
+    one guard per head count reachable at a realistic TP plus the off/top-bucket probes -- see
+    ``_matrix_cases``.
     """
     B, D, scale = 1, HEAD_DIM, HEAD_DIM ** -0.5
     q, k, v, beta, g, h0 = _make_inputs(B, T, H, D, dtype)
