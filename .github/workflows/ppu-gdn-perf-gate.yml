@@ -49,9 +49,10 @@ name: ppu-gdn-perf-gate
 
 on:
   pull_request:
-    # A release branch only (vX.Y.Z). The base is checked again in Decide
-    # scope, because pull_request_review cannot filter on it.
-    branches: ['v*']
+    # Coarse shape filter; the authoritative digit-strict ^v[0-9]+\.[0-9]+\.[0-9]+$
+    # check runs in Decide scope (a glob cannot match digits, and pull_request_review
+    # cannot filter on the base at all).
+    branches: ['v*.*.*']
     # edited/unlabeled: the blocking policy reads the title and the labels, so a
     # retitled or relabelled PR has to be re-decided instead of keeping whatever
     # the previous run reported.
@@ -67,7 +68,7 @@ on:
         required: false
         default: 'main'
       tier:
-        description: 'Grid to run: fast = H=32/T=16384 only, full = H=16/32/64/128 at T=16384'
+        description: 'Grid to run: fast = H=32/T=16384 only, full = H=4/8/12/16/24/32/64/128 at T=16384'
         type: choice
         options: ['full', 'fast']
         default: 'full'
@@ -509,19 +510,30 @@ jobs:
           echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
           if [ "$FULL" = "1" ]; then
             echo "tier=full" >> "$GITHUB_OUTPUT"
-            echo "heads=16,32,64,128" >> "$GITHUB_OUTPUT"
-            echo "seqlens=16384" >> "$GITHUB_OUTPUT"
+            # Per-rank HV = HV_global/TP reachable at a realistic TP: {4,8,12,16,24,32} (see #6).
+            # 64/128 stay as large-grid stress points. Points rise 4 -> 8; watch the 180-min budget.
+            heads=4,8,12,16,24,32,64,128
+            seqlens=16384
+            echo "heads=$heads" >> "$GITHUB_OUTPUT"
+            echo "seqlens=$seqlens" >> "$GITHUB_OUTPUT"
             echo "sweeps=4" >> "$GITHUB_OUTPUT"
             echo "pod_timeout=180" >> "$GITHUB_OUTPUT"
-            echo "::notice::full tier ($why): H=16/32/64/128 at T=16384, pod budget 180 min"
+            echo "::notice::full tier ($why): H=4/8/12/16/24/32/64/128 at T=16384, pod budget 180 min"
           else
             echo "tier=fast" >> "$GITHUB_OUTPUT"
-            echo "heads=32" >> "$GITHUB_OUTPUT"
-            echo "seqlens=16384" >> "$GITHUB_OUTPUT"
+            heads=32
+            seqlens=16384
+            echo "heads=$heads" >> "$GITHUB_OUTPUT"
+            echo "seqlens=$seqlens" >> "$GITHUB_OUTPUT"
             echo "sweeps=4" >> "$GITHUB_OUTPUT"
             echo "pod_timeout=60" >> "$GITHUB_OUTPUT"
             echo "::notice::fast tier: H=32 T=16384 only, pod budget 60 min; a perf or refactor declaration runs the full grid instead"
           fi
+          # Grid fingerprint for the replay marker: a tier-internal grid change
+          # (e.g. full going 4 -> 8 heads) must re-measure, not replay a verdict
+          # cut on the old grid. Dots keep it one space-free token.
+          grid=$(printf 'H%s.T%s' "$heads" "$seqlens" | tr ',' '.')
+          echo "grid=$grid" >> "$GITHUB_OUTPUT"
 
           # One campaign answers one head, under one policy, on one grid, and
           # the marker left next to the stored verdict says which. An event
@@ -557,16 +569,18 @@ jobs:
             stored=$(sed -n '1p' "$STORED" | tr -d '\r')
             s_block=$(printf '%s' "$stored" | sed -n 's/.*block=\([a-z]*\).*/\1/p')
             s_tier=$(printf '%s' "$stored" | sed -n 's/.*tier=\([a-z]*\).*/\1/p')
-            if [ "$s_block" = "$cur_block" ] && [ "$s_tier" = "$cur_tier" ]; then
+            s_grid=$(printf '%s' "$stored" | sed -n 's/.*grid=\([^ ]*\).*/\1/p')
+            if [ "$s_block" = "$cur_block" ] && [ "$s_tier" = "$cur_tier" ] \
+               && [ "$s_grid" = "$grid" ]; then
               echo "run=false" >> "$GITHUB_OUTPUT"
               echo "replay=true" >> "$GITHUB_OUTPUT"
               echo "::notice::$BOARD already measured this head with block=$cur_block" \
-                   "on the $cur_tier grid; replaying that verdict"
+                   "on the $cur_tier grid $grid; replaying that verdict"
               exit 0
             fi
             echo "::notice::stored $BOARD result is block=${s_block:-unknown}" \
-                 "tier=${s_tier:-unknown}, this event needs block=$cur_block" \
-                 "tier=$cur_tier; measuring again"
+                 "tier=${s_tier:-unknown} grid=${s_grid:-none}, this event needs" \
+                 "block=$cur_block tier=$cur_tier grid=$grid; measuring again"
           elif [ -f "$STORED" ] && [ "$EVENT" != "workflow_dispatch" ]; then
             # Say why a stored verdict is being walked past: without this the
             # only trace of the extra campaign is a notice nobody looks for.
@@ -760,8 +774,9 @@ jobs:
             if [ -f "$OUT/gate.json" ]; then
               mkdir -p "$HEADS"
               cp -f "$OUT/gate.json" "$HEADS/$BOARD.gate.json"
-              printf 'block=%s tier=%s\n' "${{ steps.scope.outputs.block }}" \
-                "${{ steps.scope.outputs.tier }}" > "$HEADS/$BOARD.policy"
+              printf 'block=%s tier=%s grid=%s\n' "${{ steps.scope.outputs.block }}" \
+                "${{ steps.scope.outputs.tier }}" "${{ steps.scope.outputs.grid }}" \
+                > "$HEADS/$BOARD.policy"
             fi
             # Keep the tail in the job log too, so a crash is diagnosable even
             # without the artifact.
@@ -890,8 +905,8 @@ jobs:
             echo "::notice::no stored verdict for ${HEAD_SHA:0:12} on ${{ matrix.runner }}; nothing to re-enforce"
             exit 0
           fi
-          # The marker is one line, `block=<true|false> tier=<fast|full>`. A
-          # leftover one-token file from an older run has no tier, and the
+          # The marker is one line, `block=<true|false> tier=<fast|full> grid=<fingerprint>`.
+          # A leftover one-token file from an older run has no tier, and the
           # scope step would not have replayed it.
           BLOCK=$(sed -n '1s/.*block=\([a-z]*\).*/\1/p' "$SRC.policy")
           if [ -z "$BLOCK" ]; then
