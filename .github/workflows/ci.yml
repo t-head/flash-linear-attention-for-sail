@@ -3,7 +3,7 @@ name: CI Pipeline
 on:
   workflow_dispatch:
   pull_request:
-    branches: ['main', '0.5.2', 'v0.5.2']
+    branches: ['main', 'v0.5.2']
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   precheck:
     name: Pre-check
-    if: github.event_name != 'workflow_dispatch' && (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == '0.5.2' || github.event.pull_request.base.ref == 'v0.5.2')
+    if: github.event_name != 'workflow_dispatch' && (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'v0.5.2')
     uses: t-head/.github/.github/workflows/user-precheck.yml@main
 
   smoke-test:

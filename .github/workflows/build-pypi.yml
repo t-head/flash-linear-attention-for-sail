@@ -1,0 +1,85 @@
+# Build PyPI packages (sdist + wheel) for the split packages (fla-core and
+# flash-linear-attention), validate them, and keep them as run artifacts.
+# Same build path as the release pipeline (scripts/build_packages.py), so for
+# same-repo PRs a green run means the release build produces the same packages.
+# Note: workflow_dispatch needs this file on the default branch (main) before
+# the "Run workflow" button shows up. main tracks upstream while development
+# happens on the v* branches, so the push/tag triggers below are what actually
+# fire day to day; tag pushes only trigger on tags whose commit tree contains
+# this file.
+
+name: Build PyPI Packages
+
+on:
+  workflow_dispatch:
+  push:
+    # Development lines are v0.5.2 / v0.4.1_v0.1.0_release and future v* ones;
+    # main tracks upstream, so pushes to it are not ours to build.
+    branches: ['v*']
+    # Existing tags are not v*-prefixed (e.g. 0.4.1+v0.1.0), so match all
+    tags: ['*']
+  pull_request:
+    branches: ['main', 'v0.5.2', 'v0.4.1_v0.1.0_release']
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-pypi-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build packages
+    # Fork PRs carry no release signal; dispatch and tag pushes always run
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          python -m pip install -U pip
+          python -m pip install build twine
+
+      - name: Build packages
+        run: python scripts/build_packages.py
+
+      - name: Check packages
+        run: twine check --strict dist-packages/*
+
+      - name: Smoke-install wheels (no deps)
+        run: |
+          python -m pip install --no-deps --force-reinstall dist-packages/*.whl
+          python -c "import importlib.metadata as md; [print(f'OK {n} {md.version(n)}') for n in ('fla-core', 'flash-linear-attention')]"
+
+      - name: Collect artifact summary
+        run: |
+          {
+            echo "### PyPI packages built"
+            echo ""
+            echo "- Commit: \`${{ github.event.pull_request.head.sha || github.sha }}\`"
+            echo ""
+            echo "| Package | Size |"
+            echo "| --- | --- |"
+            for f in dist-packages/*; do
+              echo "| \`${f##*/}\` | $(du -h "$f" | cut -f1) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pypi-packages-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist-packages/*
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
