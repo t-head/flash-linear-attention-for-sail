@@ -49,9 +49,10 @@ name: ppu-gdn-perf-gate
 
 on:
   pull_request:
-    # A release branch only (vX.Y.Z). The base is checked again in Decide
-    # scope, because pull_request_review cannot filter on it.
-    branches: ['v*']
+    # Coarse shape filter; the authoritative digit-strict ^v[0-9]+\.[0-9]+\.[0-9]+$
+    # check runs in Decide scope (a glob cannot match digits, and pull_request_review
+    # cannot filter on the base at all).
+    branches: ['v*.*.*']
     # edited/unlabeled: the blocking policy reads the title and the labels, so a
     # retitled or relabelled PR has to be re-decided instead of keeping whatever
     # the previous run reported.
@@ -67,7 +68,7 @@ on:
         required: false
         default: 'main'
       tier:
-        description: 'Grid to run: fast = H=32/T=16384 only, full = H=16/32/64/128 at T=16384'
+        description: 'Grid to run: fast = H=32/T=16384 only, full = H=4/8/12/16/24/32/64/128 at T=16384'
         type: choice
         options: ['full', 'fast']
         default: 'full'
@@ -509,11 +510,13 @@ jobs:
           echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
           if [ "$FULL" = "1" ]; then
             echo "tier=full" >> "$GITHUB_OUTPUT"
-            echo "heads=16,32,64,128" >> "$GITHUB_OUTPUT"
+            # Per-rank HV = HV_global/TP reachable at a realistic TP: {4,8,12,16,24,32} (see #6).
+            # 64/128 stay as large-grid stress points. Points rise 4 -> 8; watch the 180-min budget.
+            echo "heads=4,8,12,16,24,32,64,128" >> "$GITHUB_OUTPUT"
             echo "seqlens=16384" >> "$GITHUB_OUTPUT"
             echo "sweeps=4" >> "$GITHUB_OUTPUT"
             echo "pod_timeout=180" >> "$GITHUB_OUTPUT"
-            echo "::notice::full tier ($why): H=16/32/64/128 at T=16384, pod budget 180 min"
+            echo "::notice::full tier ($why): H=4/8/12/16/24/32/64/128 at T=16384, pod budget 180 min"
           else
             echo "tier=fast" >> "$GITHUB_OUTPUT"
             echo "heads=32" >> "$GITHUB_OUTPUT"

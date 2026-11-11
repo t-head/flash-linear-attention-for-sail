@@ -11,7 +11,7 @@
 #                   Set it to the empty string when the job already runs INSIDE
 #                   the GPU container (e.g. t-head/ci-infra/cluster-run).
 #   PERF_DEVICE     device index inside container (default: 0)
-#   PERF_HEADS      grid heads  (default: 16,32,64,128 = the CI full tier;
+#   PERF_HEADS      grid heads  (default: 4,8,12,16,24,32,64,128 = the CI full tier;
 #                   the CI fast tier passes 32)
 #   PERF_SEQLENS    grid sequence lengths         (default: 16384)
 #   PERF_SWEEPS     full-grid sweeps per arm      (default: 4, first dropped)
@@ -78,7 +78,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 BENCH=${BENCH_SCRIPT:-$HERE/benchmark_gdn_all.py}
 CONTAINER=${PERF_CONTAINER-ppu-bench}
 DEVICE=${PERF_DEVICE:-0}
-HEADS=${PERF_HEADS:-16,32,64,128}
+HEADS=${PERF_HEADS:-4,8,12,16,24,32,64,128}
 SEQLENS=${PERF_SEQLENS:-16384}
 SWEEPS=${PERF_SWEEPS:-4}
 GATE_RETRY=${PERF_GATE_RETRY:-1}
