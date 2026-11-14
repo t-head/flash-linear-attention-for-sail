@@ -11,8 +11,13 @@
 #                   Set it to the empty string when the job already runs INSIDE
 #                   the GPU container (e.g. t-head/ci-infra/cluster-run).
 #   PERF_DEVICE     device index inside container (default: 0)
-#   PERF_HEADS      grid heads  (default: 4,8,12,16,24,32,64,128 = the CI full tier;
-#                   the CI fast tier passes 32)
+#   PERF_HEADS      grid heads, group=1 only (default: 4,8,12,16,24,32,64,128 =
+#                   the CI full tier; the CI fast tier passes 32). Ignored when
+#                   PERF_SHAPES is set.
+#   PERF_SHAPES     grid shapes spec 'HVxHg,...' (a bare int means group=1). When
+#                   set it replaces PERF_HEADS, so a GQA (HV!=H) point can join
+#                   the grid: the benchmark's resolve_shapes gives --shapes
+#                   priority over --heads. Both CI tiers set this to cover GQA.
 #   PERF_SEQLENS    grid sequence lengths         (default: 16384)
 #   PERF_SWEEPS     full-grid sweeps per arm      (default: 4, first dropped)
 #                   The verdict is the median of the rest, so a single disturbed
@@ -63,7 +68,8 @@
 #                   read 6 us (6.3%) apart between the arms, while its 370 us
 #                   reading read 0.4 us apart. A bare 2% bound would fail the
 #                   short reading on noise, so the floor is 8 us (default: 0.008)
-#   BENCH_SCRIPT    path to benchmark_gdn_all.py  (default: sibling file)
+#   BENCH_SCRIPT    path to benchmark_gdn_all.py  (default: <repo>/benchmarks/
+#                   benchmark_gdn_all.py, the relocated home of the harness)
 #   PREFLIGHT_ONLY  1 = resolve the base arm and exit
 #
 # Exit: 0 pass | 2 regression | 3 infra/config | 1 wrapper misuse
@@ -74,11 +80,13 @@ TARGET=${2:?usage: ci_perf_gate.sh <pr-checkout> <target-ref> <artifact-dir>}
 OUT=${3:?usage: ci_perf_gate.sh <pr-checkout> <target-ref> <artifact-dir>}
 shift 3
 
-HERE=$(cd "$(dirname "$0")" && pwd)
-BENCH=${BENCH_SCRIPT:-$HERE/benchmark_gdn_all.py}
+# The harness lives in the checkout's benchmarks/, not beside this wrapper, so
+# resolve it against the PR checkout ($REPO) instead of this script's directory.
+BENCH=${BENCH_SCRIPT:-$REPO/benchmarks/benchmark_gdn_all.py}
 CONTAINER=${PERF_CONTAINER-ppu-bench}
 DEVICE=${PERF_DEVICE:-0}
 HEADS=${PERF_HEADS:-4,8,12,16,24,32,64,128}
+SHAPES=${PERF_SHAPES:-}
 SEQLENS=${PERF_SEQLENS:-16384}
 SWEEPS=${PERF_SWEEPS:-4}
 GATE_RETRY=${PERF_GATE_RETRY:-1}
@@ -110,8 +118,12 @@ if command -v flock >/dev/null; then
 fi
 
 COMMON=(--opt-repo "$REPO" --base-mode git --base-ref "$TARGET"
-        --device "$DEVICE" --heads "$HEADS" --seq-lens "$SEQLENS"
+        --device "$DEVICE" --seq-lens "$SEQLENS"
         --profile-iters "$PROFILE_ITERS" --out-dir "$OUT")
+# --shapes (a 'HVxHg,...' spec) supersedes --heads in the benchmark's
+# resolve_shapes, so pass exactly one: the shapes spec when the caller set one
+# (it can carry GQA HV!=H points), else the group=1 head list.
+if [ -n "$SHAPES" ]; then COMMON+=(--shapes "$SHAPES"); else COMMON+=(--heads "$HEADS"); fi
 [ -n "$CONTAINER" ] && COMMON+=(--docker-container "$CONTAINER")
 
 if [ "${PREFLIGHT_ONLY:-0}" = "1" ]; then
@@ -119,8 +131,8 @@ if [ "${PREFLIGHT_ONLY:-0}" = "1" ]; then
   exit $?
 fi
 
-echo "[ci] base=$TARGET opt=$REPO heads=$HEADS T=$SEQLENS sweeps=$SWEEPS retry=$GATE_RETRY" \
-     "tol=$TOL cp_tol=$TOL_CP level=$GATE_LEVEL"
+echo "[ci] base=$TARGET opt=$REPO shapes=${SHAPES:-<none>} heads=$HEADS T=$SEQLENS" \
+     "sweeps=$SWEEPS retry=$GATE_RETRY tol=$TOL cp_tol=$TOL_CP level=$GATE_LEVEL"
 # The verdict judges the e2e phases and the CP pre-process units for
 # regressions, and at kernel level every kernel's own time as well. The CP units
 # only run under cp_context, so they are timed through their wrappers in the

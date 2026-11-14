@@ -140,21 +140,28 @@ def _l2norm(x, eps=1e-6):
     return (x_f32 * rstd).to(x.dtype)
 
 
-def prepare_inputs(T, H):
+def prepare_inputs(T, H, HV=None):
+    """Tensors of one grid point. H is the key-head count (Hg); HV the value-head
+    count. HV=None means group=1 (HV==H, non-GQA), which keeps every head-only
+    caller and the CI grid byte-for-byte unchanged. A GQA point passes HV>H: q/k
+    carry Hg heads, v/g/beta/h0/do/dht carry HV -- the contract the op and the CP
+    wrappers fold on (``if H != HV``).
+    """
     import torch
     import torch.nn.functional as F
     device = "cuda"
     K = V = HEAD_DIM
+    HV = H if HV is None else HV
     scale = K ** (-0.5)
     torch.manual_seed(42)
     q = _l2norm(torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16))
     k = _l2norm(torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16))
-    v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
-    g = F.logsigmoid(torch.randn(B, T, H, device=device, dtype=torch.float32)) / 16
-    beta = torch.randn(B, T, H, device=device, dtype=torch.float32).sigmoid()
-    h0 = torch.randn(B, H, K, V, device=device, dtype=torch.float32)
+    v = torch.randn(B, T, HV, V, device=device, dtype=torch.bfloat16)
+    g = F.logsigmoid(torch.randn(B, T, HV, device=device, dtype=torch.float32)) / 16
+    beta = torch.randn(B, T, HV, device=device, dtype=torch.float32).sigmoid()
+    h0 = torch.randn(B, HV, K, V, device=device, dtype=torch.float32)
     do = torch.randn_like(v)
-    dht = torch.randn(B, H, K, V, device=device, dtype=torch.float32) / 8
+    dht = torch.randn(B, HV, K, V, device=device, dtype=torch.float32) / 8
     cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=device)
     return dict(q=q, k=k, v=v, g=g, beta=beta, scale=scale, h0=h0, do=do,
                 dht=dht, cu_seqlens=cu_seqlens)
@@ -444,11 +451,105 @@ def parse_kernels(spec):
     return items
 
 
-class GridCtx:
-    """Lazily built fwd/bwd intermediates for one (H, T) grid point."""
+# ---------------------------------------------------------------------------
+# head shapes: a point is (Hg, HV). group=1 (HV==Hg) is the non-GQA grid the CI
+# gate has always run; HV>Hg is a GQA point, where q/k carry Hg heads and
+# v/g/beta/h0/do/dht carry HV and the kernels fold the group (``if H != HV``).
+# The issue-#31 training pairs are listed (HV, Hg); --shapes spells them HVxHg.
+# ---------------------------------------------------------------------------
+TRAIN_HV_HG = ((32, 16), (16, 8), (8, 4), (4, 2), (24, 8), (16, 4), (8, 2))
+GROUP1_BASELINE = (4, 8, 12, 16, 24, 32, 64, 128)
 
-    def __init__(self, T, H):
-        self.d = prepare_inputs(T, H)
+
+def parse_shapes_spec(spec):
+    """'HVxHg,...' -> [(Hg, HV), ...]; a bare int means group=1 (HV==Hg)."""
+    out = []
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "x" in tok.lower():
+            hv_s, h_s = tok.lower().split("x", 1)
+            hv, h = int(hv_s), int(h_s)
+        else:
+            hv = h = int(tok)
+        if h <= 0 or hv < h:
+            raise SystemExit(f"bad shape '{tok}': need HV>=Hg>0 (format HVxHg)")
+        if hv % h:
+            raise SystemExit(f"bad shape '{tok}': HV={hv} is not a multiple of Hg={h}")
+        out.append((h, hv))
+    return out
+
+
+def shapes_to_spec(shapes):
+    """[(Hg, HV), ...] -> canonical 'HVxHg,...' string (driver -> worker)."""
+    return ",".join(f"{hv}x{h}" for h, hv in shapes)
+
+
+def resolve_shapes(args):
+    """The (Hg, HV) grid to measure: --shapes-preset > --shapes > --heads.
+
+    Deduplicated and sorted by (Hg, HV), so a group=1-only grid keeps the
+    ascending-head order the CI tables have always printed.
+    """
+    preset = getattr(args, "shapes_preset", "") or ""
+    if preset:
+        if preset != "train":
+            raise SystemExit(f"unknown --shapes-preset '{preset}' (only 'train')")
+        shapes = [(hg, hv) for hv, hg in TRAIN_HV_HG]
+        shapes += [(h, h) for h in GROUP1_BASELINE]
+    elif getattr(args, "shapes", "") or "":
+        shapes = parse_shapes_spec(args.shapes)
+    else:
+        shapes = [(h, h) for h in (int(x) for x in args.heads.split(",") if x.strip())]
+    if not shapes:
+        raise SystemExit("no head shapes to measure")
+    return sorted(set(shapes))
+
+
+def pt_key(rec):
+    """Point key of a result record: (Hg, HV, T). An old record with no HV is
+    group=1, so HV defaults to H and its key/order/labels are unchanged."""
+    h = rec["H"]
+    return (h, rec.get("HV", h), rec["T"])
+
+
+def shape_label(H, HV):
+    """Row label of a point: '8' for group=1 (byte-identical to today), '8x16'
+    (HgxHV) for a GQA point."""
+    return str(H) if HV == H else f"{H}x{HV}"
+
+
+def shape_col(H, HV):
+    """Column label of a per-kernel table: 'H8' for group=1 (unchanged),
+    'H8/HV16' for a GQA point."""
+    return f"H{H}" if HV == H else f"H{H}/HV{HV}"
+
+
+def point_prefix(H, HV):
+    """Campaign-log prefix: 'H=  8' for group=1 (unchanged), adds HV when GQA."""
+    return f"H={H:3d}" if HV == H else f"H={H:3d} HV={HV:3d}"
+
+
+def pt_str(H, HV, T):
+    """Gate-report point tag: 'H=8 T=4096' for group=1 (byte-identical to the
+    pre-GQA string), 'H=8 HV=16 T=4096' for a GQA point."""
+    return f"H={H}" + (f" HV={HV}" if HV != H else "") + f" T={T}"
+
+
+def _with_hv(d, H, HV):
+    """Add HV to a JSON-bound dict only for a GQA point, so a group=1 record
+    keeps the exact pre-GQA schema (and the CI gate.json stays byte-identical)."""
+    if HV != H:
+        d["HV"] = HV
+    return d
+
+
+class GridCtx:
+    """Lazily built fwd/bwd intermediates for one (Hg, HV, T) grid point."""
+
+    def __init__(self, T, H, HV=None):
+        self.d = prepare_inputs(T, H, HV)
         self._fwd_done = False
         self._bwd_done = False
         self.g = self.w = self.u = self.A = None
@@ -588,18 +689,19 @@ def unit_fn(ctx, unit):
     raise ValueError(f"unknown kernel unit: {unit}")
 
 
-def measure_units(args, units, heads, seqlens):
+def measure_units(args, units, shapes, seqlens):
     """Time each unit alone (CUDA events) and record its device ms (profiler)."""
     results = []
-    for H in heads:
+    for (H, HV) in shapes:
         for T in seqlens:
             cleanup_cuda()
-            rec = dict(H=H, T=T, mode="kernel", kernels={})
+            pfx = point_prefix(H, HV)
+            rec = dict(H=H, HV=HV, T=T, mode="kernel", kernels={})
             try:
-                ctx = GridCtx(T, H)
+                ctx = GridCtx(T, H, HV)
             except Exception as e:  # noqa: BLE001
                 rec["error"] = f"{type(e).__name__}: {e}"
-                print(f"[grid] H={H:3d} T={T:6d}  ERROR ctx: {rec['error']}", flush=True)
+                print(f"[grid] {pfx} T={T:6d}  ERROR ctx: {rec['error']}", flush=True)
                 results.append(rec)
                 continue
             for unit in units:
@@ -616,13 +718,13 @@ def measure_units(args, units, heads, seqlens):
                     other = sum(v["ms"] for k, v in prof.items() if not is_fla_kernel(k))
                     rec["kernels"][unit] = dict(wall=wall, ms=sum(parts.values()),
                                                 other_ms=other, parts=parts)
-                    print(f"[unit] H={H:3d} T={T:6d} {unit:14s} wall={wall:8.3f} "
+                    print(f"[unit] {pfx} T={T:6d} {unit:14s} wall={wall:8.3f} "
                           f"dev={rec['kernels'][unit]['ms']:8.3f} other={other:6.3f} "
                           f"parts={{{', '.join(parts)}}}", flush=True)
                 except Exception as e:  # noqa: BLE001 - keep going
                     msg = f"{type(e).__name__}: {e}"
                     rec["kernels"][unit] = dict(error=msg)
-                    print(f"[unit] H={H:3d} T={T:6d} {unit:14s} ERROR {msg}", flush=True)
+                    print(f"[unit] {pfx} T={T:6d} {unit:14s} ERROR {msg}", flush=True)
             results.append(rec)
             del ctx
             cleanup_cuda()
@@ -680,7 +782,7 @@ def cmd_bench(args):
     # the worker may be started with cwd=<repo>; never trust a relative --out
     args.out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    heads = [int(x) for x in args.heads.split(",")]
+    shapes = resolve_shapes(args)
     seqlens = [int(x) for x in args.seq_lens.split(",")]
     units = parse_kernels(args.kernels)
     kernel_mode = units != ["all"]
@@ -696,7 +798,9 @@ def cmd_bench(args):
                 triton_cache=os.environ.get("TRITON_CACHE_DIR", "<default>"),
                 warmup=args.warmup, repeats=args.repeats,
                 profile_iters=args.profile_iters, cp=bool(args.cp), cp_units=list(CP_UNITS),
-                heads=heads, seqlens=seqlens, time=time.strftime("%F %T"))
+                heads=sorted({h for h, _ in shapes}),
+                shapes=[[h, hv] for h, hv in shapes],
+                seqlens=seqlens, time=time.strftime("%F %T"))
     if args.cp:
         # What this arm can do, as opposed to what was asked for: a baseline
         # without fla/ops/cp is skipped by the gate, not reported as infra.
@@ -709,15 +813,16 @@ def cmd_bench(args):
           f"cache={meta['triton_cache']}",
           flush=True)
     if kernel_mode:
-        results = measure_units(args, units, heads, seqlens)
+        results = measure_units(args, units, shapes, seqlens)
     else:
         results = []
-        for H in heads:
+        for (H, HV) in shapes:
             for T in seqlens:
                 cleanup_cuda()
-                rec = dict(H=H, T=T, mode="module")
+                pfx = point_prefix(H, HV)
+                rec = dict(H=H, HV=HV, T=T, mode="module")
                 try:
-                    d = prepare_inputs(T, H)
+                    d = prepare_inputs(T, H, HV)
                     fwd_fn, bwd_fn = _make_fns(d, gdr_fn)
                     rec["e2e"] = dict(fwd=bench_event(fwd_fn, args.warmup, args.repeats),
                                       bwd=bench_event(bwd_fn, args.warmup, args.repeats))
@@ -736,7 +841,7 @@ def cmd_bench(args):
                         try:
                             rec["cp"] = measure_cp(d, args.warmup, args.repeats,
                                                    args.profile_iters)
-                            print(f"[cp] H={H:3d} T={T:6d}  fwd={rec['cp']['fwd']:.3f} "
+                            print(f"[cp] {pfx} T={T:6d}  fwd={rec['cp']['fwd']:.3f} "
                                   f"bwd={rec['cp']['bwd']:.3f} "
                                   f"total={rec['cp']['total']:.3f} "
                                   f"nk_fwd={len(rec['cp']['profile']['fwd'])} "
@@ -744,15 +849,15 @@ def cmd_bench(args):
                                   flush=True)
                         except Exception as e:  # noqa: BLE001 - keep the e2e numbers
                             rec["cp_error"] = f"{type(e).__name__}: {e}"
-                            print(f"[cp] H={H:3d} T={T:6d}  ERROR {rec['cp_error']}", flush=True)
+                            print(f"[cp] {pfx} T={T:6d}  ERROR {rec['cp_error']}", flush=True)
                     del d, fwd_fn, bwd_fn
-                    print(f"[grid] H={H:3d} T={T:6d}  e2e_fwd={rec['e2e']['fwd']:.3f} "
+                    print(f"[grid] {pfx} T={T:6d}  e2e_fwd={rec['e2e']['fwd']:.3f} "
                           f"e2e_bwd={rec['e2e']['bwd']:.3f} total={rec['e2e']['total']:.3f} "
                           f"nk_fwd={len(rec['profile']['fwd'])} nk_bwd={len(rec['profile']['bwd'])}",
                           flush=True)
                 except Exception as e:  # noqa: BLE001 - long campaign: keep going
                     rec["error"] = f"{type(e).__name__}: {e}"
-                    print(f"[grid] H={H:3d} T={T:6d}  ERROR {rec['error']}", flush=True)
+                    print(f"[grid] {pfx} T={T:6d}  ERROR {rec['error']}", flush=True)
                 results.append(rec)
                 cleanup_cuda()
     _dump_json(args.out, dict(meta=meta, results=results))
@@ -988,11 +1093,11 @@ def _run_logged(cmd, arm, log_path, cwd=None, env=None):
     return proc.returncode
 
 
-def run_worker(args, arm, repo, tag, cache, out_json, heads_s, seqlens_s,
+def run_worker(args, arm, repo, tag, cache, out_json, shapes_s, seqlens_s,
                log_path=None):
     worker = [args.python, "-u", os.path.abspath(__file__), "--mode", "bench",
               "--arm", arm, "--repo", repo, "--tag", tag, "--out", out_json,
-              "--heads", heads_s, "--seq-lens", seqlens_s,
+              "--shapes", shapes_s, "--seq-lens", seqlens_s,
               "--kernels", args.kernels,
               "--warmup", str(args.warmup), "--repeats", str(args.repeats),
               "--profile-iters", str(args.profile_iters)]
@@ -1023,8 +1128,8 @@ def cmd_all(args):
     if args.base_archive:
         args.base_archive = os.path.abspath(args.base_archive)
     os.makedirs(args.out_dir, exist_ok=True)
-    heads_s = args.heads
-    heads = [int(x) for x in heads_s.split(",")]
+    shapes = resolve_shapes(args)
+    shapes_s = shapes_to_spec(shapes)
     progress = os.path.join(args.out_dir, "campaign.log")
 
     def log(msg):
@@ -1051,7 +1156,7 @@ def cmd_all(args):
     preflight(args, [(name, repo) for name, repo, _ in arms], log)
 
     caches = {arm: make_cache(args, f"tc_{arm}_grid_") for arm, _, _ in arms}
-    log(f"campaign start arms={[a[0] for a in arms]} heads={heads} "
+    log(f"campaign start arms={[a[0] for a in arms]} shapes={shapes_s} "
         f"seqlens={args.seq_lens} kernels={args.kernels} sweeps={args.sweeps} "
         f"out={args.out_dir}")
     log(f"caches={caches}")
@@ -1061,18 +1166,20 @@ def cmd_all(args):
         # CI: N full-grid sweeps per arm; the gate medians the paired speedups
         for s in range(args.sweeps):
             for arm, repo, tag in arms:
-                jobs.append((f"grid_{arm}_s{s}", arm, repo, tag, heads_s))
+                jobs.append((f"grid_{arm}_s{s}", arm, repo, tag, shapes_s))
         log(f"sweep mode: {args.sweeps} full grid(s) per arm")
     else:
-        # legacy: one worker per H, each measuring only that H
-        for H in heads:
+        # legacy: one worker per shape, each measuring only that shape
+        for (H, HV) in shapes:
+            name_h = f"H{H}" if HV == H else f"H{H}x{HV}"
             for arm, repo, tag in arms:
-                jobs.append((f"grid_{arm}_H{H}", arm, repo, tag, str(H)))
-    for name, arm, repo, tag, head_spec in jobs:
+                jobs.append((f"grid_{arm}_{name_h}", arm, repo, tag,
+                             shapes_to_spec([(H, HV)])))
+    for name, arm, repo, tag, shape_spec in jobs:
         out_json = os.path.join(args.out_dir, name + ".json")
         ts = time.time()
         rc = run_worker(args, arm, repo, tag, caches[arm], out_json,
-                        head_spec, args.seq_lens, log_path=progress)
+                        shape_spec, args.seq_lens, log_path=progress)
         log(f"[{name}] rc={rc} elapsed={time.time() - ts:.0f}s")
         if rc != 0:
             log(f"ABORT: {name} failed (rc={rc}); partial JSONs kept in {args.out_dir}")
@@ -1110,7 +1217,7 @@ def cmd_all(args):
             ts = time.time()
             rcr = run_worker(args, arm, repo, tag, caches[arm],
                              os.path.join(args.out_dir, name + ".json"),
-                             heads_s, args.seq_lens, log_path=progress)
+                             shapes_s, args.seq_lens, log_path=progress)
             log(f"[{name}] rc={rcr} elapsed={time.time() - ts:.0f}s")
             if rcr != 0:
                 break
@@ -1320,9 +1427,9 @@ def load_arm(out_dir, prefix, drop=0):
             if "error" in r:
                 print(f"[warn] error in {fp}: {r['error']}")
                 continue
-            samples.setdefault((r["H"], r["T"]), []).append(r)
+            samples.setdefault(pt_key(r), []).append(r)
     # Report the median of the sweep samples, the same quantity the gate judges;
-    # keying by (H, T) alone would keep whichever sweep loaded last.
+    # keying by (H, HV, T) alone would keep whichever sweep loaded last.
     for pt, recs in samples.items():
         data[pt] = _combine(recs)
     return data, metas, rids
@@ -1344,7 +1451,7 @@ def spd(base, opt):
 NO_PAIRS = (None, None)
 
 
-def paired_spd(pairs, H, T, container, key, base_ms, opt_ms):
+def paired_spd(pairs, H, HV, T, container, key, base_ms, opt_ms):
     """Speedup as the gate computes it: median of the per-sweep ratios.
 
     Dividing two per-arm medians is a different number and can land on the
@@ -1357,8 +1464,8 @@ def paired_spd(pairs, H, T, container, key, base_ms, opt_ms):
         return None
     vals = []
     for b, o in zip(sb, so):
-        pb = (b.get((H, T)) or {}).get(container) or {}
-        po = (o.get((H, T)) or {}).get(container) or {}
+        pb = (b.get((H, HV, T)) or {}).get(container) or {}
+        po = (o.get((H, HV, T)) or {}).get(container) or {}
         if pb.get(key) and po.get(key):
             vals.append(pb[key] / po[key])
     if sb and len(vals) == min(len(sb), len(so)):
@@ -1430,28 +1537,28 @@ def kernel_gain_rows(sb, so, pts, tol_rel, tol_abs, phases=("fwd", "bwd")):
     otherwise be judged by their wrapper sum alone.
     """
     rows, unpaired = [], []
-    for H, T in pts:
+    for H, HV, T in pts:
         for ph in phases:
             names = set()
             for src in (sb, so):
                 for sweep in src:
-                    names |= set(profile_rows(sweep.get((H, T)), ph))
+                    names |= set(profile_rows(sweep.get((H, HV, T)), ph))
             for name in sorted(names):
                 if not is_fla_kernel(name):
                     continue
                 pairs, in_base, in_opt = [], False, False
                 for s_b, s_o in zip(sb, so):
-                    pb = profile_rows(s_b.get((H, T)), ph).get(name)
-                    po = profile_rows(s_o.get((H, T)), ph).get(name)
+                    pb = profile_rows(s_b.get((H, HV, T)), ph).get(name)
+                    po = profile_rows(s_o.get((H, HV, T)), ph).get(name)
                     in_base = in_base or bool((pb or {}).get("ms"))
                     in_opt = in_opt or bool((po or {}).get("ms"))
                     if (pb or {}).get("ms") and (po or {}).get("ms"):
                         pairs.append((pb["ms"], po["ms"]))
                 if not pairs:
-                    unpaired.append(dict(
+                    unpaired.append(_with_hv(dict(
                         H=H, T=T, phase=ph, kernel=short(name),
                         why="launched by one arm only" if in_base != in_opt
-                        else "never timed in the same sweep"))
+                        else "never timed in the same sweep"), H, HV))
                     continue
                 base_ms = median([b for b, _ in pairs])
                 opt_ms = median([o for _, o in pairs])
@@ -1471,7 +1578,7 @@ def kernel_gain_rows(sb, so, pts, tol_rel, tol_abs, phases=("fwd", "bwd")):
                 # twice the breach or wider reads as unstable.
                 spread = max(margins) - min(margins) if len(margins) > 1 else 0.0
                 rows.append(dict(
-                    H=H, T=T, phase=ph, kernel=name, short=short(name),
+                    H=H, HV=HV, T=T, phase=ph, kernel=name, short=short(name),
                     speedup=median([b / o for b, o in pairs]),
                     base_ms=base_ms, opt_ms=opt_ms,
                     delta_ms=median(deltas), margin_ms=median(margins),
@@ -1500,10 +1607,12 @@ def kernel_gain_rows(sb, so, pts, tol_rel, tol_abs, phases=("fwd", "bwd")):
         for p in pts_u:
             if not p["margin_ms"] > 1e-9:
                 continue
-            row = dict(H=p["H"], T=p["T"], phase=p["phase"], speedup=p["speedup"],
-                       base_ms=p["base_ms"], opt_ms=p["opt_ms"],
-                       delta_ms=p["delta_ms"], margin_ms=p["margin_ms"],
-                       spread_ms=p["spread_ms"], tol_ms=p["tol_ms"], rule=p["rule"])
+            row = _with_hv(dict(
+                H=p["H"], T=p["T"], phase=p["phase"], speedup=p["speedup"],
+                base_ms=p["base_ms"], opt_ms=p["opt_ms"],
+                delta_ms=p["delta_ms"], margin_ms=p["margin_ms"],
+                spread_ms=p["spread_ms"], tol_ms=p["tol_ms"], rule=p["rule"]),
+                p["H"], p["HV"])
             (unstable if point_is_unstable(p["margin_ms"], p["spread_ms"])
              else regressed).append(row)
         u["unstable"], u["regressed"] = unstable, regressed
@@ -1555,7 +1664,7 @@ def kernel_breakdown_lines(units, judged, tol_rel, tol_abs):
     return out
 
 
-def paired_kernel_spd(pairs, H, T, phase, names, base_ms, opt_ms):
+def paired_kernel_spd(pairs, H, HV, T, phase, names, base_ms, opt_ms):
     """Speedup of one kernel (or a sum of kernels) over the paired sweeps.
 
     The same quantity the verdict judges: median of the per-sweep ratios.
@@ -1569,8 +1678,8 @@ def paired_kernel_spd(pairs, H, T, phase, names, base_ms, opt_ms):
         return None
     vals = []
     for b, o in zip(sb, so):
-        pb = profile_rows(b.get((H, T)), phase)
-        po = profile_rows(o.get((H, T)), phase)
+        pb = profile_rows(b.get((H, HV, T)), phase)
+        po = profile_rows(o.get((H, HV, T)), phase)
         if names is None:
             vb = sum(v["ms"] for k, v in pb.items() if not is_fla_kernel(k))
             vo = sum(v["ms"] for k, v in po.items() if not is_fla_kernel(k))
@@ -1587,12 +1696,12 @@ def paired_kernel_spd(pairs, H, T, phase, names, base_ms, opt_ms):
     return spd(base_ms, opt_ms)
 
 
-def kernel_union_rows(grid_base, grid_opt, phase, T, heads):
+def kernel_union_rows(grid_base, grid_opt, phase, T, shapes):
     """Ordered kernel list: by summed opt+base ms at T, descending."""
     totals = {}
-    for H in heads:
+    for (H, HV) in shapes:
         for src in (grid_opt, grid_base):
-            rec = src.get((H, T))
+            rec = src.get((H, HV, T))
             if not rec:
                 continue
             for k, v in profile_rows(rec, phase).items():
@@ -1602,9 +1711,9 @@ def kernel_union_rows(grid_base, grid_opt, phase, T, heads):
     return [k for k, _ in sorted(totals.items(), key=lambda x: -x[1])]
 
 
-def kernel_cell(grid_base, grid_opt, H, T, phase, k, pick):
-    rb = grid_base.get((H, T))
-    ro = grid_opt.get((H, T))
+def kernel_cell(grid_base, grid_opt, H, HV, T, phase, k, pick):
+    rb = grid_base.get((H, HV, T))
+    ro = grid_opt.get((H, HV, T))
     if pick == "fla":
         bv = profile_rows(rb, phase).get(k)
         ov = profile_rows(ro, phase).get(k)
@@ -1636,7 +1745,8 @@ def _meta_line(name, metas):
     else:
         tag = ", dirty tree" if dirty else ""
     return (f"- {name}: {m.get('fla_file', '?')} @ {m.get('commit', '?')} "
-            f"(tag {m.get('tag', '?')}{tag})")
+            f"(tag {m.get('tag', '?')}, device {m.get('device', '?')}, "
+            f"torch {m.get('torch', '?')}{tag})")
 
 
 def kernel_ms(rec, unit):
@@ -1646,15 +1756,15 @@ def kernel_ms(rec, unit):
     return v.get("ms") if v else None
 
 
-def paired_unit_spd(pairs, H, T, unit, base_ms, opt_ms):
+def paired_unit_spd(pairs, H, HV, T, unit, base_ms, opt_ms):
     """Speedup of one launch unit over the paired sweeps (--kernels runs)."""
     sb, so = pairs
     if sb is None:
         return None
     vals = []
     for b, o in zip(sb, so):
-        vb = kernel_ms(b.get((H, T)), unit)
-        vo = kernel_ms(o.get((H, T)), unit)
+        vb = kernel_ms(b.get((H, HV, T)), unit)
+        vo = kernel_ms(o.get((H, HV, T)), unit)
         if vb and vo:
             vals.append(vb / vo)
     if sb and len(vals) == min(len(sb), len(so)):
@@ -1662,9 +1772,9 @@ def paired_unit_spd(pairs, H, T, unit, base_ms, opt_ms):
     return spd(base_ms, opt_ms)
 
 
-def _kernel_cell(gb, go, H, T, unit, pairs=None):
-    b = kernel_ms(gb.get((H, T)), unit)
-    o = kernel_ms(go.get((H, T)), unit)
+def _kernel_cell(gb, go, H, HV, T, unit, pairs=None):
+    b = kernel_ms(gb.get((H, HV, T)), unit)
+    o = kernel_ms(go.get((H, HV, T)), unit)
     if b is None and o is None:
         return "-"
     # The table has to show the number the gate judges; the two per-arm
@@ -1675,7 +1785,7 @@ def _kernel_cell(gb, go, H, T, unit, pairs=None):
     if pairs is NO_PAIRS:
         s = None
     else:
-        s = (paired_unit_spd(pairs, H, T, unit, b, o) if pairs else None) or spd(b, o)
+        s = (paired_unit_spd(pairs, H, HV, T, unit, b, o) if pairs else None) or spd(b, o)
     bs = f"{b:.3f}" if b is not None else "n/a"
     os_ = f"{o:.3f}" if o is not None else "n/a"
     return f"{bs}->{os_} ({s:.2f}x)" if s else f"{bs}->{os_}"
@@ -1688,8 +1798,8 @@ def aggregate_kernels(args, gb, go, mb, mo, pairs=None):
     if not gb and not go:
         print(f"[error] no kernel-mode records in {args.out_dir}")
         return 1
-    heads = sorted({H for H, _ in list(gb) + list(go)})
-    ts = sorted({T for _, T in list(gb) + list(go)})
+    shapes = sorted({(H, HV) for H, HV, _ in list(gb) + list(go)})
+    ts = sorted({T for _, _, T in list(gb) + list(go)})
     tag_opt = (mo[0].get("tag") if mo else None) or "opt"
     tag_base = (mb[0].get("tag") if mb else None) or "base"
 
@@ -1722,10 +1832,10 @@ def aggregate_kernels(args, gb, go, mb, mo, pairs=None):
     for T in ts:
         w(f"## K_{T}. single-kernel @ T={T} — cell 'base -> opt (speedup)'")
         w("")
-        w("| unit | " + " | ".join(f"H{H}" for H in heads) + " |")
-        w("|" + "---|" * (len(heads) + 1))
+        w("| unit | " + " | ".join(shape_col(H, HV) for H, HV in shapes) + " |")
+        w("|" + "---|" * (len(shapes) + 1))
         for unit in units:
-            cells = [_kernel_cell(gb, go, H, T, unit, pairs) for H in heads]
+            cells = [_kernel_cell(gb, go, H, HV, T, unit, pairs) for H, HV in shapes]
             if all(c == "-" for c in cells):
                 continue
             w(f"| {unit} | " + " | ".join(cells) + " |")
@@ -1788,8 +1898,8 @@ def run_aggregate(args):
     else:
         pairs = NO_PAIRS
 
-    heads = sorted({H for H, _ in list(gb) + list(go)})
-    ts = sorted({T for _, T in list(gb) + list(go)})
+    shapes = sorted({(H, HV) for H, HV, _ in list(gb) + list(go)})
+    ts = sorted({T for _, _, T in list(gb) + list(go)})
     tag_opt = (mo[0].get("tag") if mo else None) or "opt"
     tag_base = (mb[0].get("tag") if mb else None) or "base"
     if "kernel" in {m.get("mode", "module") for m in mb + mo}:
@@ -1801,13 +1911,40 @@ def run_aggregate(args):
     lines = []
     w = lines.append
     no_pair = pairs is NO_PAIRS
-    w(f"# GDN: {tag_opt} vs {tag_base} — aggregated tables")
-    w("")
-    w("speedup = median of the per-sweep paired ratios, base/opt (> 1 = opt faster)"
-      if not no_pair else
-      "the arms never answered one round in common: no speedup below is a paired "
-      "measurement, and the columns are left blank rather than filled with a "
-      "ratio of two independent medians")
+    # Cross-hardware detection: when the two arms record different devices the
+    # ratio below is a cross-platform number, not a same-board A/B, and the
+    # header has to say so -- a raw-ms table cannot tell a hardware gap from a
+    # version gap on its own. --compare-mode auto picks the wording from the
+    # devices each arm recorded; impl/device force it. A same-device CI run stays
+    # on the impl wording, byte for byte.
+    dev_b = next((m.get("device") for m in mb
+                  if not m.get("unreadable") and m.get("device")), None)
+    dev_o = next((m.get("device") for m in mo
+                  if not m.get("unreadable") and m.get("device")), None)
+    cmp_mode = getattr(args, "compare_mode", "auto")
+    if cmp_mode == "auto":
+        cmp_mode = "device" if (dev_b and dev_o and dev_b != dev_o) else "impl"
+    if cmp_mode == "device":
+        w(f"# GDN cross-hardware: {tag_opt} vs {tag_base} — aggregated tables")
+        w("")
+        w(f"ratio = median of the per-round paired ratios, base/opt = "
+          f"{tag_base}_ms / {tag_opt}_ms (> 1 = the '{tag_opt}' arm is faster)"
+          if not no_pair else
+          "the arms answered no round in common: the ratio columns below are left "
+          "blank rather than filled with a ratio of two independent medians")
+        w("CROSS-HARDWARE: the two arms ran on different devices (see the device")
+        w("line below), so every ratio here mixes a hardware gap with any")
+        w("implementation/version gap and is NOT a controlled same-board A/B.")
+        w("Read the absolute ms columns and the device/commit provenance before")
+        w("labelling either arm 'faster'.")
+    else:
+        w(f"# GDN: {tag_opt} vs {tag_base} — aggregated tables")
+        w("")
+        w("speedup = median of the per-sweep paired ratios, base/opt (> 1 = opt faster)"
+          if not no_pair else
+          "the arms never answered one round in common: no speedup below is a paired "
+          "measurement, and the columns are left blank rather than filled with a "
+          "ratio of two independent medians")
     w(f"grid: base_pts={len(gb)} opt_pts={len(go)}"
       + (f"  cp: base_pts={len(cb)} opt_pts={len(co)}" if args.include_cp else ""))
     for name, metas in (("base", mb), ("opt", mo)):
@@ -1828,17 +1965,17 @@ def run_aggregate(args):
     w("")
     w("| H | T | base_fwd | base_bwd | base_total | opt_fwd | opt_bwd | opt_total | fwd x | bwd x | total x |")
     w("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for H in heads:
+    for (H, HV) in shapes:
         for T in ts:
-            rb, ro = gb.get((H, T)), go.get((H, T))
+            rb, ro = gb.get((H, HV, T)), go.get((H, HV, T))
             if not rb or not ro:
                 continue
             b, o = rb["e2e"], ro["e2e"]
-            w(f"| {H} | {T} | {fmt3(b['fwd'])} | {fmt3(b['bwd'])} | {fmt3(b['total'])} | "
+            w(f"| {shape_label(H, HV)} | {T} | {fmt3(b['fwd'])} | {fmt3(b['bwd'])} | {fmt3(b['total'])} | "
               f"{fmt3(o['fwd'])} | {fmt3(o['bwd'])} | {fmt3(o['total'])} | "
-              f"{fmt3(paired_spd(pairs, H, T, 'e2e', 'fwd', b['fwd'], o['fwd']))} | "
-              f"{fmt3(paired_spd(pairs, H, T, 'e2e', 'bwd', b['bwd'], o['bwd']))} | "
-              f"{fmt3(paired_spd(pairs, H, T, 'e2e', 'total', b['total'], o['total']))} |")
+              f"{fmt3(paired_spd(pairs, H, HV, T, 'e2e', 'fwd', b['fwd'], o['fwd']))} | "
+              f"{fmt3(paired_spd(pairs, H, HV, T, 'e2e', 'bwd', b['bwd'], o['bwd']))} | "
+              f"{fmt3(paired_spd(pairs, H, HV, T, 'e2e', 'total', b['total'], o['total']))} |")
     w("")
 
     # ---------------- CP pre-process units (part of the grid records) ----------------
@@ -1847,17 +1984,17 @@ def run_aggregate(args):
         w("")
         w("| H | T | base_fwd | base_bwd | opt_fwd | opt_bwd | fwd x | bwd x | total x |")
         w("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for H in heads:
+        for (H, HV) in shapes:
             for T in ts:
-                rb, ro = gb.get((H, T)), go.get((H, T))
+                rb, ro = gb.get((H, HV, T)), go.get((H, HV, T))
                 if not rb or not ro or "cp" not in rb or "cp" not in ro:
                     continue
                 b, o = rb["cp"], ro["cp"]
-                w(f"| {H} | {T} | {fmt3(b['fwd'])} | {fmt3(b['bwd'])} | "
+                w(f"| {shape_label(H, HV)} | {T} | {fmt3(b['fwd'])} | {fmt3(b['bwd'])} | "
                   f"{fmt3(o['fwd'])} | {fmt3(o['bwd'])} | "
-                  f"{fmt3(paired_spd(pairs, H, T, 'cp', 'fwd', b['fwd'], o['fwd']))} | "
-                  f"{fmt3(paired_spd(pairs, H, T, 'cp', 'bwd', b['bwd'], o['bwd']))} | "
-                  f"{fmt3(paired_spd(pairs, H, T, 'cp', 'total', b['total'], o['total']))} |")
+                  f"{fmt3(paired_spd(pairs, H, HV, T, 'cp', 'fwd', b['fwd'], o['fwd']))} | "
+                  f"{fmt3(paired_spd(pairs, H, HV, T, 'cp', 'bwd', b['bwd'], o['bwd']))} | "
+                  f"{fmt3(paired_spd(pairs, H, HV, T, 'cp', 'total', b['total'], o['total']))} |")
         w("")
 
     # ---------------- Table 2/3: per-kernel at each T ----------------
@@ -1866,29 +2003,29 @@ def run_aggregate(args):
         w(f"## {label}_{phase}_{T}. per-kernel {phase} @ T={T}, "
           "cell 'base -> opt (speedup)'")
         w("")
-        w("| kernel | " + " | ".join(f"H{H}" for H in heads) + " |")
-        w("|" + "---|" * (len(heads) + 1))
-        union = kernel_union_rows(gb, go, phase, T, heads)
+        w("| kernel | " + " | ".join(shape_col(H, HV) for H, HV in shapes) + " |")
+        w("|" + "---|" * (len(shapes) + 1))
+        union = kernel_union_rows(gb, go, phase, T, shapes)
         for k in union:
             cells = []
-            for H in heads:
-                b, o = kernel_cell(gb, go, H, T, phase, k, "fla")
+            for (H, HV) in shapes:
+                b, o = kernel_cell(gb, go, H, HV, T, phase, k, "fla")
                 if b is None and o is None:
                     cells.append("-")
                     continue
-                s = paired_kernel_spd(pairs, H, T, phase, (k,), b, o)
+                s = paired_kernel_spd(pairs, H, HV, T, phase, (k,), b, o)
                 bs = f"{b:.3f}" if b is not None else "n/a"
                 os_ = f"{o:.3f}" if o is not None else "n/a"
                 cells.append(f"{bs}->{os_} ({s:.2f}x)" if s else f"{bs}->{os_}")
             w("| " + short(k) + " | " + " | ".join(cells) + " |")
         # other bucket
         cells = []
-        for H in heads:
-            b, o = kernel_cell(gb, go, H, T, phase, None, "other")
+        for (H, HV) in shapes:
+            b, o = kernel_cell(gb, go, H, HV, T, phase, None, "other")
             if b is None and o is None:
                 cells.append("-")
                 continue
-            s = paired_kernel_spd(pairs, H, T, phase, None, b, o)
+            s = paired_kernel_spd(pairs, H, HV, T, phase, None, b, o)
             bs = f"{b:.3f}" if b is not None else "-"
             os_ = f"{o:.3f}" if o is not None else "-"
             cells.append(f"{bs}->{os_} ({s:.2f}x)" if s else f"{bs}->{os_}")
@@ -1909,16 +2046,16 @@ def run_aggregate(args):
                 qwk = [k for k in union if k == "chunk_bwd_kernel_dqkwg"]
                 if dwk and qwk:
                     cells = []
-                    for H in heads:
-                        b1, o1 = kernel_cell(gb, go, H, T, phase, qwk[0], "fla")
-                        b2, o2 = kernel_cell(gb, go, H, T, phase, dwk[0], "fla")
+                    for (H, HV) in shapes:
+                        b1, o1 = kernel_cell(gb, go, H, HV, T, phase, qwk[0], "fla")
+                        b2, o2 = kernel_cell(gb, go, H, HV, T, phase, dwk[0], "fla")
                         bb = None if (b1 is None and b2 is None) else (b1 or 0.0) + (b2 or 0.0)
                         oo = None if (o1 is None and o2 is None) else (o1 or 0.0) + (o2 or 0.0)
                         if bb is None and oo is None:
                             cells.append("-")
                             continue
                         s = paired_kernel_spd(
-                            pairs, H, T, phase, (qwk[0], dwk[0]), bb, oo)
+                            pairs, H, HV, T, phase, (qwk[0], dwk[0]), bb, oo)
                         bs = f"{bb:.3f}" if bb is not None else "n/a"
                         os_ = f"{oo:.3f}" if oo is not None else "n/a"
                         cells.append(f"{bs}->{os_} ({s:.2f}x)" if s else f"{bs}->{os_}")
@@ -1937,8 +2074,8 @@ def run_aggregate(args):
 
     # ---------------- Table 4: CP kernels (optional input) ----------------
     if args.include_cp and (cb or co):
-        cp_heads = sorted({H for H, _ in list(cb) + list(co)})
-        cp_ts = sorted({T for _, T in list(cb) + list(co)})
+        cp_shapes = sorted({(H, HV) for H, HV, _ in list(cb) + list(co)})
+        cp_ts = sorted({T for _, _, T in list(cb) + list(co)})
         for T in cp_ts:
             w(f"## T4_cp_{T}. CP pre-process kernels @ T={T} — cell 'base -> opt (speedup) [path]'")
             w("")
@@ -1947,8 +2084,8 @@ def run_aggregate(args):
                 w("")
                 w("| H | base(ms) | opt(ms) | speedup | path base->opt |")
                 w("|---:|---:|---:|---:|---|")
-                for H in cp_heads:
-                    rb, ro = cb.get((H, T)), co.get((H, T))
+                for (H, HV) in cp_shapes:
+                    rb, ro = cb.get((H, HV, T)), co.get((H, HV, T))
                     if not rb or not ro:
                         continue
                     pb = rb.get(phase)
@@ -1956,7 +2093,7 @@ def run_aggregate(args):
                     if not pb or not po:
                         continue
                     s = spd(pb["median"], po["median"])
-                    w(f"| {H} | {pb['median']:.4f} | {po['median']:.4f} | {s:.2f}x | "
+                    w(f"| {shape_label(H, HV)} | {pb['median']:.4f} | {po['median']:.4f} | {s:.2f}x | "
                       f"{pb['path']}->{po['path']} |")
                 w("")
 
@@ -1988,7 +2125,7 @@ def load_sweeps(out_dir, prefix):
     for fp in files:
         meta, results = _grid_of(fp)
         metas.append(meta)
-        sweeps.append({(r["H"], r["T"]): r for r in results})
+        sweeps.append({pt_key(r): r for r in results})
     return sweeps, metas, [_round_of(fp) for fp in files]
 
 
@@ -2160,8 +2297,11 @@ def run_gate(args):
     ho = [bool(m.get("unreadable")) for m in mok]
     grid = set()
     for m in (mb0, mo0):
-        if m.get("heads") and m.get("seqlens"):
-            grid |= {(int(h), int(t)) for h in m["heads"] for t in m["seqlens"]}
+        if m.get("shapes") and m.get("seqlens"):
+            grid |= {(int(s[0]), int(s[1]), int(t))
+                     for s in m["shapes"] for t in m["seqlens"]}
+        elif m.get("heads") and m.get("seqlens"):
+            grid |= {(int(h), int(h), int(t)) for h in m["heads"] for t in m["seqlens"]}
     for arm, sw, sets, holes, rids in (("base", sb, ok[:nb], hb, rid_b),
                                        ("opt", so, ok[nb:], ho, rid_o)):
         for i, (s, ks) in enumerate(zip(sw, sets)):
@@ -2176,16 +2316,17 @@ def run_gate(args):
                                 f"({meta['error']})")
                 continue
             failed = []
-            for (H, T) in sorted(set(s) - ks):
-                miss = [f for f in fields if f not in s[(H, T)]]
-                failed.append((H, T, s[(H, T)].get("error") or "missing " + "/".join(miss)))
-            for H, T, err in failed[:6]:
-                problems.append(f"{label}: H={H} T={T} measurement failed ({err})")
+            for (H, HV, T) in sorted(set(s) - ks):
+                miss = [f for f in fields if f not in s[(H, HV, T)]]
+                failed.append((H, HV, T,
+                               s[(H, HV, T)].get("error") or "missing " + "/".join(miss)))
+            for H, HV, T, err in failed[:6]:
+                problems.append(f"{label}: {pt_str(H, HV, T)} measurement failed ({err})")
             if len(failed) > 6:
                 problems.append(f"{label}: ... and {len(failed) - 6} more failed point(s)")
             absent = sorted(grid - set(s)) if grid else []
-            for H, T in absent[:6]:
-                problems.append(f"{label}: H={H} T={T} not measured")
+            for H, HV, T in absent[:6]:
+                problems.append(f"{label}: {pt_str(H, HV, T)} not measured")
             if len(absent) > 6:
                 problems.append(f"{label}: ... and {len(absent) - 6} more unmeasured point(s)")
 
@@ -2232,16 +2373,16 @@ def run_gate(args):
     # campaign its report, so the empty case is skipped and the holes named above
     # carry the run out as infra.
     if idx:
-        for H, T in pts:
+        for H, HV, T in pts:
             for ph in phases:
                 field, key = PHASE_FIELDS[ph]
-                sp = [sb[i][(H, T)][field][key] / so[j][(H, T)][field][key]
+                sp = [sb[i][(H, HV, T)][field][key] / so[j][(H, HV, T)][field][key]
                       for i, j in idx]
-                cells.append(dict(
+                cells.append(_with_hv(dict(
                     H=H, T=T, phase=ph, speedup=median(sp), min=min(sp), max=max(sp),
-                    base_ms=median([sb[i][(H, T)][field][key] for i, _ in idx]),
-                    opt_ms=median([so[j][(H, T)][field][key] for _, j in idx]),
-                    reason=None))
+                    base_ms=median([sb[i][(H, HV, T)][field][key] for i, _ in idx]),
+                    opt_ms=median([so[j][(H, HV, T)][field][key] for _, j in idx]),
+                    reason=None), H, HV))
 
     def cell_tol(phase):
         return args.gate_tol_cp if PHASE_FIELDS[phase][0] == "cp" else args.gate_tol
@@ -2331,13 +2472,15 @@ def run_gate(args):
                        if kernel_mode else [])
     for u, p in kernel_unstable:
         problems.append(
-            f"{u['short']} {p['phase']} H={p['H']} T={p['T']} is over its "
+            f"{u['short']} {p['phase']} {pt_str(p['H'], p.get('HV', p['H']), p['T'])} "
+            f"is over its "
             f"{p['tol_ms']:.3f} ms bound by {p['margin_ms']:.3f} ms, but its "
             f"sweeps scatter {p['spread_ms']:.3f} ms, twice the breach or "
             f"wider: the point cannot resolve the bar it is held to; {remedy}")
     for c in unstable_points:
         problems.append(
-            f"H={c['H']} T={c['T']} {c['phase']} reads {c['speedup']:.3f}x, "
+            f"{pt_str(c['H'], c.get('HV', c['H']), c['T'])} {c['phase']} reads "
+            f"{c['speedup']:.3f}x, "
             f"{c['margin'] * 100:.2f}% below its {c['tol']:.3f} bar, while its "
             f"own sweeps span {c['min']:.3f}..{c['max']:.3f}x: that scatter is "
             f"twice the breach or wider; {remedy}")
@@ -2405,7 +2548,8 @@ def run_gate(args):
                    failing=[dict(H=c["H"], T=c["T"], phase=c["phase"],
                                  reason=c["reason"], speedup=c["speedup"],
                                  base_ms=c["base_ms"], opt_ms=c["opt_ms"],
-                                 sweep_min=c["min"], sweep_max=c["max"])
+                                 sweep_min=c["min"], sweep_max=c["max"],
+                                 **({"HV": c["HV"]} if "HV" in c else {}))
                             for c in sorted(failing, key=lambda c: c["speedup"])],
                    base=dict(tag=mb0.get("tag"), commit=mb0.get("commit"),
                              fla_file=mb0.get("fla_file"), dirty=mb0.get("dirty"),
@@ -2485,7 +2629,7 @@ def run_gate(args):
                   "| H | T | phase | base ms | opt ms | speedup | regression | sweeps min..max |",
                   "|---:|---:|---|---:|---:|---:|---:|---|"]
         for c in sorted(regressions, key=lambda c: c["speedup"]):
-            lines.append(f"| {c['H']} | {c['T']} | {c['phase']} | {c['base_ms']:.3f} | "
+            lines.append(f"| {shape_label(c['H'], c.get('HV', c['H']))} | {c['T']} | {c['phase']} | {c['base_ms']:.3f} | "
                          f"{c['opt_ms']:.3f} | {c['speedup']:.3f}x | "
                          f"-{(1 - c['speedup']) * 100:.1f}% | "
                          f"{c['min']:.3f}..{c['max']:.3f} |")
@@ -2512,7 +2656,7 @@ def run_gate(args):
                   "|---:|---:|---|---|---:|---:|---:|---:|---:|---|"]
         for u in kernel_regressions:
             for p in u["regressed"]:
-                lines.append(f"| {p['H']} | {p['T']} | {p['phase']} | {u['short']} | "
+                lines.append(f"| {shape_label(p['H'], p.get('HV', p['H']))} | {p['T']} | {p['phase']} | {u['short']} | "
                              f"{p['base_ms']:.3f} | {p['opt_ms']:.3f} | "
                              f"{p['delta_ms']:.3f} | {p['tol_ms']:.3f} | "
                              f"{p['margin_ms']:.3f} | {p['rule']} |")
@@ -2520,7 +2664,7 @@ def run_gate(args):
         lines += ["", f"## Kernels not comparable ({len(kernel_unpaired)})", "",
                   "| H | T | phase | kernel | why |", "|---:|---:|---|---|---|"]
         for r in kernel_unpaired:
-            lines.append(f"| {r['H']} | {r['T']} | {r['phase']} | {r['kernel']} | "
+            lines.append(f"| {shape_label(r['H'], r.get('HV', r['H']))} | {r['T']} | {r['phase']} | {r['kernel']} | "
                          f"{r['why']} |")
     if cells:
         lines += ["", "## All points (median of paired sweeps)",
@@ -2528,9 +2672,9 @@ def run_gate(args):
                   "|---:|---:|" + "---:|" * len(phases)]
         by_pt = {}
         for c in cells:
-            by_pt.setdefault((c["H"], c["T"]), {})[c["phase"]] = c["speedup"]
-        for (H, T), d in sorted(by_pt.items()):
-            lines.append(f"| {H} | {T} | "
+            by_pt.setdefault((c["H"], c.get("HV", c["H"]), c["T"]), {})[c["phase"]] = c["speedup"]
+        for (H, HV, T), d in sorted(by_pt.items()):
+            lines.append(f"| {shape_label(H, HV)} | {T} | "
                          + " | ".join(f"{d[ph]:.3f}" for ph in phases) + " |")
     else:
         lines += ["", "## All points (median of paired sweeps)", "",
@@ -2618,6 +2762,12 @@ def build_parser():
                     help="resolve --base-mode, print the base identity, then exit")
     ap.add_argument("--heads", default="8,16,32,48,64,128")
     ap.add_argument("--seq-lens", default="4096,8192,16384")
+    ap.add_argument("--shapes", default="",
+                    help="GQA head shapes as 'HVxHg,...' (e.g. 16x8,8x4); a bare "
+                         "int means group=1 (HV==Hg). Overrides --heads when set")
+    ap.add_argument("--shapes-preset", default="",
+                    help="'train' = the issue-#31 training (HV,Hg) pairs plus the "
+                         "group=1 baseline; overrides --shapes and --heads")
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--repeats", type=int, default=50)
     ap.add_argument("--profile-iters", type=int, default=5)
@@ -2692,6 +2842,14 @@ def build_parser():
                     help="do not fail the gate on tracked changes in either tree")
     ap.add_argument("--include-cp", action="store_true",
                     help="aggregate also cp_{opt,base}_H*.json into T4 tables")
+    ap.add_argument("--compare-mode", choices=("auto", "impl", "device"), default="auto",
+                    help="how to word the aggregate header. 'impl' = a same-board "
+                         "implementation A/B (base/opt, today's CI wording); 'device' "
+                         "= cross-hardware, where the two arms ran on different GPUs "
+                         "so the ratio mixes a hardware gap with a version gap; 'auto' "
+                         "(default) picks 'device' when the devices the arms recorded "
+                         "differ and 'impl' otherwise, so a same-device CI run is "
+                         "unchanged and a PPU-vs-NVIDIA table labels itself")
     ap.add_argument("--no-cp", dest="cp", action="store_false",
                     help="skip the CP pre-process units measured inside the module grid")
     ap.add_argument("--kernels", default="all",

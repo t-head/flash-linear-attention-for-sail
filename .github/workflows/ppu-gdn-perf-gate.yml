@@ -7,11 +7,12 @@ name: ppu-gdn-perf-gate
 #   exit 0 = PASS / exit 2 = regression or shortfall / exit 3 = infra problem
 #
 # Tiers follow the declaration. A perf or refactor claim is judged on the full
-# grid -- four head counts at T=16384 -- because that claim is the reason the
-# gate exists and one (H,T) point cannot carry a blocking verdict. Every other
-# change runs the fast grid (H=32, T=16384) once and gets the report without a
-# block. The `perf-full` label, a [perf-full] subject, or the dispatch input can
-# still ask for the full grid on an undeclared run.
+# grid -- the group=1 head counts plus GQA (HV!=H) head shapes at T=16384 --
+# because that claim is the reason the gate exists and one (H,HV,T) point cannot
+# carry a blocking verdict. Every other change runs the fast grid (H=32 and one
+# GQA point H=8/HV=16, T=16384) once and gets the report without a block. The
+# `perf-full` label, a [perf-full] subject, or the dispatch input can still ask
+# for the full grid on an undeclared run.
 #
 # Verdict: the report is produced for every GDN change. The check only fails
 # when the PR declares what it is:
@@ -68,7 +69,7 @@ on:
         required: false
         default: 'main'
       tier:
-        description: 'Grid to run: fast = H=32/T=16384 only, full = H=4/8/12/16/24/32/64/128 at T=16384'
+        description: 'Grid to run: fast = H=32 + GQA 8x16 at T=16384, full = H=4/8/12/16/24/32/64/128 + GQA 2x4/8x16/16x32 at T=16384'
         type: choice
         options: ['full', 'fast']
         default: 'full'
@@ -98,9 +99,11 @@ concurrency:
 env:
   SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
   # Two tiers, decided in "Decide scope":
-  #   full - four head counts at T=16384, for a declared perf/refactor change
-  #          (a declared verdict blocks) and for any run that asks for it
-  #   fast - one (H,T) point, for every other change: one report, no block
+  #   full - the group=1 head counts plus GQA (HV!=H) head shapes at T=16384,
+  #          for a declared perf/refactor change (a declared verdict blocks) and
+  #          for any run that asks for it
+  #   fast - H=32 and one GQA point at T=16384, for every other change: one
+  #          report, no block
   # The grid and the pod budget follow the tier. Profiling runs in both: the
   # verdict judges each kernel on its own time, which needs the per-kernel
   # timings from the same pass. Both knobs are spelled out here instead of
@@ -123,11 +126,14 @@ env:
   #   fla/ops/backends/          dispatch registry: picks the backend per op
   #   fla/utils/                 autotune_cache_kwargs, input_guard, device flags
   #   fla/layers/gated_deltanet.py and the gate itself
+  #   benchmarks/benchmark_gdn_all.py  the gate's benchmark harness (relocated
+  #                                    here from scripts/perf-gate/ so it sits
+  #                                    with the other benchmarks)
   # fla/ops/cp holds the context-parallel pre-process kernels. They only run
   # behind chunk_gated_delta_rule(cp_context=...), so they never show up in the
   # e2e grid and are judged through the cp_fwd/cp_bwd phases instead; without
   # this path a CP-only PR would skip the gate entirely.
-  PERF_PATHS: '^(fla/ops/(gated_delta_rule|common|cp|utils|backends)/|fla/utils/|fla/layers/gated_deltanet\.py|\.github/workflows/scripts/perf-gate/|\.github/workflows/ppu-gdn-perf-gate\.yml)'
+  PERF_PATHS: '^(fla/ops/(gated_delta_rule|common|cp|utils|backends)/|fla/utils/|fla/layers/gated_deltanet\.py|benchmarks/benchmark_gdn_all\.py|\.github/workflows/scripts/perf-gate/|\.github/workflows/ppu-gdn-perf-gate\.yml)'
   # The triton_ascend backends are Huawei NPU kernels: they never run on PPU, so
   # a change confined to them cannot move the numbers this gate measures.
   PERF_EXCLUDE: '(^|/)triton_ascend/'
@@ -511,28 +517,33 @@ jobs:
           if [ "$FULL" = "1" ]; then
             echo "tier=full" >> "$GITHUB_OUTPUT"
             # Per-rank HV = HV_global/TP reachable at a realistic TP: {4,8,12,16,24,32} (see #6).
-            # 64/128 stay as large-grid stress points. Points rise 4 -> 8; watch the 180-min budget.
-            heads=4,8,12,16,24,32,64,128
+            # 64/128 stay as large-grid stress points. On top of the group=1 heads,
+            # three GQA (HV!=H) shapes from #31's TRAIN_HV_HG exercise the head-group
+            # fold the group=1 grid never reaches: 2x4, 8x16, 16x32 (Hg x HV, spelled
+            # HVxHg in the spec). 8 group=1 + 3 GQA = 11 points; watch the 180-min budget.
+            shapes=4,8,12,16,24,32,64,128,4x2,16x8,32x16
             seqlens=16384
-            echo "heads=$heads" >> "$GITHUB_OUTPUT"
+            echo "shapes=$shapes" >> "$GITHUB_OUTPUT"
             echo "seqlens=$seqlens" >> "$GITHUB_OUTPUT"
             echo "sweeps=4" >> "$GITHUB_OUTPUT"
             echo "pod_timeout=180" >> "$GITHUB_OUTPUT"
-            echo "::notice::full tier ($why): H=4/8/12/16/24/32/64/128 at T=16384, pod budget 180 min"
+            echo "::notice::full tier ($why): H=4/8/12/16/24/32/64/128 + GQA 2x4/8x16/16x32 at T=16384, pod budget 180 min"
           else
             echo "tier=fast" >> "$GITHUB_OUTPUT"
-            heads=32
+            # group=1 H=32 plus one GQA point (H=8/HV=16) so the fast report also
+            # touches the head-group fold; see #31.
+            shapes=32,16x8
             seqlens=16384
-            echo "heads=$heads" >> "$GITHUB_OUTPUT"
+            echo "shapes=$shapes" >> "$GITHUB_OUTPUT"
             echo "seqlens=$seqlens" >> "$GITHUB_OUTPUT"
             echo "sweeps=4" >> "$GITHUB_OUTPUT"
             echo "pod_timeout=60" >> "$GITHUB_OUTPUT"
-            echo "::notice::fast tier: H=32 T=16384 only, pod budget 60 min; a perf or refactor declaration runs the full grid instead"
+            echo "::notice::fast tier: H=32 + GQA 8x16 at T=16384, pod budget 60 min; a perf or refactor declaration runs the full grid instead"
           fi
           # Grid fingerprint for the replay marker: a tier-internal grid change
-          # (e.g. full going 4 -> 8 heads) must re-measure, not replay a verdict
+          # (e.g. full adding a GQA shape) must re-measure, not replay a verdict
           # cut on the old grid. Dots keep it one space-free token.
-          grid=$(printf 'H%s.T%s' "$heads" "$seqlens" | tr ',' '.')
+          grid=$(printf 'S%s.T%s' "$shapes" "$seqlens" | tr ',' '.')
           echo "grid=$grid" >> "$GITHUB_OUTPUT"
 
           # One campaign answers one head, under one policy, on one grid, and
@@ -722,11 +733,13 @@ jobs:
               echo "[ci] retired $BOARD's stored verdict into $HEADS/invalidated/$stamp.*"
             fi
 
-            # Grid comes from the tier decided above.
-            PERF_HEADS="${{ steps.scope.outputs.heads }}"
+            # Grid comes from the tier decided above. PERF_SHAPES carries the
+            # 'HVxHg,...' spec (group=1 heads plus any GQA point); the wrapper
+            # passes it as --shapes, which supersedes --heads in the benchmark.
+            PERF_SHAPES="${{ steps.scope.outputs.shapes }}"
             PERF_SEQLENS="${{ steps.scope.outputs.seqlens }}"
             PERF_SWEEPS="${{ steps.scope.outputs.sweeps }}"
-            export PERF_HEADS PERF_SEQLENS PERF_SWEEPS
+            export PERF_SHAPES PERF_SEQLENS PERF_SWEEPS
             # The report headline names the board with this label, the same one
             # the checks page shows, so a reader can tell the two apart.
             export PERF_BOARD="${{ matrix.runner }}"
@@ -736,7 +749,7 @@ jobs:
             # guard leaves its own margin for.
             export PERF_POD_TIMEOUT="${{ steps.scope.outputs.pod_timeout }}"
             export PERF_POD_START="${{ steps.scope.outputs.started_at }}"
-            echo "::notice::tier=${{ steps.scope.outputs.tier }} H=$PERF_HEADS T=$PERF_SEQLENS sweeps=$PERF_SWEEPS pod=${PERF_POD_TIMEOUT}m"
+            echo "::notice::tier=${{ steps.scope.outputs.tier }} shapes=$PERF_SHAPES T=$PERF_SEQLENS sweeps=$PERF_SWEEPS pod=${PERF_POD_TIMEOUT}m"
 
             # Mirror the campaign log every 20s: if the pod is killed at the
             # timeout we still learn which point it died on.
