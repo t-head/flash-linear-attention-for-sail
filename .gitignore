@@ -56,3 +56,6 @@ __pycache__
 
 # autotune debug patches
 *.patch
+
+# GDN perf-gate benchmark outputs (default --out-dir)
+benchmarks/out/
