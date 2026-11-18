@@ -31,6 +31,12 @@ rocm = ["torch>=2.7.0"]
 xpu  = ["torch>=2.7.0"]
 npu  = ["torch==2.7.1", "torch_npu==2.7.1.post4", "torchvision==0.22.1", "triton-ascend==3.2.1"]
 cpu  = ["torch>=2.7.0", "triton>=3.3"]
+# pla (https://github.com/t-head/pla) ships the PPU CUDA kernels the `pla`
+# gated-delta-rule backend routes to. It builds PPU/CUDA extensions at install
+# time and is only on the vendor index, so it is an opt-in extra, not a base dep.
+# Install pla from the vendor index first, then this fork, so pip cannot resolve a
+# same-named public package; ENVs.md documents the exact commands.
+ppu  = ["pla>=1.0.0"]
 tilelang = ["tilelang>=0.1.9"]
 conv1d = ["causal-conv1d>=1.4.0"]
 benchmark = ["matplotlib", "pandas", "datasets>=3.3.0"]

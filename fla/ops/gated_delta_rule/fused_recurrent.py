@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.ops.backends import dispatch
 from fla.ops.utils.op import exp
 from fla.ops.utils.softplus import softplus
 from fla.utils import input_guard
@@ -304,6 +305,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         )
 
 
+@dispatch('gated_delta_rule')
 def fused_recurrent_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,

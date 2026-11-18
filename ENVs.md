@@ -55,6 +55,9 @@ Each backend is gated by a single env var below.
 | `FLA_FLASH_KDA`                | unset (`1`) | `0` / `1`  | Enable the [FlashKDA](https://github.com/MoonshotAI/FlashKDA) CUTLASS forward for `chunk_kda` (inference only). Requires `flash_kda`.    |
 | `FLA_INTRACARD_CP`             | unset (`0`) | `0` / `1`  | Opt in to the intra-card context-parallel backend for shared delta-rule ops (`chunk_gated_delta_rule_fwd_h`). Inference + varlen only.  |
 | `FLA_INTRACARD_MAX_SPLITS`     | `32`        | int ≥ 1    | Max number of sub-sequences per original sequence used by the intra-card CP backend. Caps merge-chain depth to control precision loss.  |
+| `FLA_PLA_GDN`                  | unset (`1`) | `0` / `1`  | Enable the [T-Head PLA](https://github.com/t-head/pla) CUDA backend for gated delta rule on PPU boards (prefill `chunk_gated_delta_rule`; decode `fused_recurrent_gated_delta_rule` is separately opt-in via `FLA_PLA_GDN_DECODE`). Set to `0` to force the Triton path. Requires the `pla` package. Install it from the vendor index first, then this fork, so pip cannot resolve a same-named public package: `pip install "pla>=1.0.0" -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple` and then `pip install -e .`; falls back to Triton automatically if `pla` is absent or fails to import. |
+| `FLA_PLA_GDN_TRAIN`            | unset (`0`) | `0` / `1`  | Opt in to the hybrid PLA training path (PLA forward + Triton backward) for `chunk_gated_delta_rule`. Off by default: PLA v1.0.0 ships no backward, so training stays on Triton unless this is set to `1`. |
+| `FLA_PLA_GDN_DECODE`           | unset (`0`) | `0` / `1`  | Opt in to routing GDN decode (`fused_recurrent_gated_delta_rule`) to PLA. Off by default: the adapter's state-layout transpose copies make PLA decode slower than Triton, so only prefill is routed unless this is set to `1`. Requires `FLA_PLA_GDN` to be on. |
 
 ---
 
