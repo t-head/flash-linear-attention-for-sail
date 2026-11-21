@@ -1,0 +1,126 @@
+name: PPU GDN perf gate
+
+# Not a required check, which is why it can filter on paths: a path-filtered
+# required check would stay pending on unrelated PRs. If this ever becomes
+# required, drop `paths` and gate inside the job instead.
+# The paths are the GDN call path `benchmarks/gdn_perf.py` measures, including
+# `ops/backends/`, which picks the implementation `dispatch` runs. A change
+# elsewhere under `fla/` cannot move these timings.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ['v0.4.2']
+    paths:
+      - 'fla/ops/gated_delta_rule/**'
+      - 'fla/ops/common/**'
+      - 'fla/ops/utils/**'
+      - 'fla/ops/cp/**'
+      - 'fla/ops/backends/**'
+      - 'fla/modules/**'
+      - 'fla/layers/gated_deltanet.py'
+      # Backend detection and the multiprocessor / shared-memory helpers the
+      # autotune configs read live here, so they change which kernel config wins.
+      - 'fla/utils.py'
+      - 'benchmarks/gdn_perf.py'
+      - '.github/workflows/ppu-gdn-perf-gate.yml'
+      - 'setup.py'
+      - 'pyproject.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ppu-gdn-perf-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  gdn-perf:
+    name: GDN A/B perf (ZW-M890P)
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # fetch-depth 0 so the base worktree can be created without a fetch.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Measure on PPU
+        id: perf
+        uses: t-head/ci-infra/cluster-run@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=ZW-M890P"
+          namespace: ppu-sched
+          timeout_minutes: 240
+          container_options: |
+            cpus: "31"
+            memory: "256Gi"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+
+            unset PIP_INDEX_URL
+            export GIT_CONFIG_GLOBAL=/dev/null
+
+            source /usr/local/PPU_SDK/envsetup.sh
+            export OMP_NUM_THREADS=1
+            export MKL_NUM_THREADS=1
+
+            # Kernels compile from source, so both arms are imported straight
+            # from their worktree and no wheel is installed.
+            pip install setuptools wheel einops 'transformers>=4.45.0'
+
+            BASE_REF="${{ github.event.pull_request.base.ref }}"
+            if [ -z "$BASE_REF" ]; then
+              BASE_REF="v0.4.2"
+            fi
+
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
+            mkdir -p "$NAS_RESULT_DIR"
+
+            set +e
+            # Fixed grid: the defaults sweep 18 shapes x 2 modes and would not fit
+            # the job timeout with a full autotune sweep per arm and round.
+            python benchmarks/gdn_perf.py gate \
+              --base-ref "origin/$BASE_REF" \
+              --workdir "$NAS_RESULT_DIR/work" \
+              --rounds 2 --heads 8,32,64,128 --seq-lens 4096,8192 \
+              2>&1 | tee "$NAS_RESULT_DIR/gate.log"
+            GATE_EXIT_CODE=${PIPESTATUS[0]}
+            set -euo pipefail
+
+            cp "$NAS_RESULT_DIR/work/gate.md" "$NAS_RESULT_DIR/gate.md" || true
+            cp "$NAS_RESULT_DIR/work/gate.json" "$NAS_RESULT_DIR/gate.json" || true
+            exit "$GATE_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Perf summary
+        if: always()
+        shell: bash
+        run: |
+          NAS_RESULT_DIR="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
+          if [ -f "$NAS_RESULT_DIR/gate.md" ]; then
+            cat "$NAS_RESULT_DIR/gate.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "gate.md not found under $NAS_RESULT_DIR" >> "$GITHUB_STEP_SUMMARY"
+            tail -60 "$NAS_RESULT_DIR/gate.log" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdn-perf-gate
+          path: |
+            /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.md
+            /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.json
+            /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.log
+          if-no-files-found: warn
