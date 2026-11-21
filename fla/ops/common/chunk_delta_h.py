@@ -1,5 +1,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -7,9 +9,21 @@ import triton.language as tl
 from fla.ops.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 from fla.ops.utils.op import exp, exp2
-from fla.utils import IS_NVIDIA_HOPPER, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_NVIDIA_HOPPER, IS_PPU, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
+
+# Stage the repeatedly read k/w blocks through the PPU AIU, which loads a block without
+# going through the per-lane addresses. FLA_PPU_DISABLE_AIU=1 forces the plain tl.load path.
+_IS_AIU_ENABLED = IS_PPU and os.environ.get('FLA_PPU_DISABLE_AIU', '0') != '1'
+
+
+def aiu_operands_ok(*operands: torch.Tensor) -> bool:
+    """Whether the AIU path can read these operands.
+
+    aiu_load reads 16-bit elements; on a wider dtype it would read half a row.
+    """
+    return _IS_AIU_ENABLED and all(op.dtype.itemsize <= 2 for op in operands)
 
 
 @triton.heuristics({
@@ -55,6 +69,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
+    USE_AIU: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRANSPOSE_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -100,6 +115,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         h0 = h0 + i_nh * K*V
     if STORE_FINAL_STATE:
         ht = ht + i_nh * K*V
+
+    # Resolve the element types once, so each aiu_load / cast site has a single source.
+    DT_K = k.dtype.element_ty
+    DT_W = w.dtype.element_ty
 
     # load initial state
     if USE_INITIAL_STATE:
@@ -154,29 +173,41 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 p_h4 = tl.make_block_ptr(h + i_t_int64 * H*K*V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
-        p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
-        b_w = tl.load(p_w, boundary_check=(0, 1))
+        if USE_AIU and K % 64 == 0:
+            b_w = tl.aiu_load(w, (i_t * BT, 0), (BT, 64), (T, H*K), DT_W, (1, 0))
+        else:
+            p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
+            b_w = tl.load(p_w, boundary_check=(0, 1))
         if TRANSPOSE_STATE:
             b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
         else:
             b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
         if K > 64:
-            p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_w = tl.aiu_load(w, (i_t * BT, 64), (BT, 64), (T, H*K), DT_W, (1, 0))
+            else:
+                p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
+                b_w = tl.load(p_w, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype))
             else:
                 b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
         if K > 128:
-            p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_w = tl.aiu_load(w, (i_t * BT, 128), (BT, 64), (T, H*K), DT_W, (1, 0))
+            else:
+                p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
+                b_w = tl.load(p_w, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_v += tl.dot(b_w, tl.trans(b_h3).to(b_w.dtype))
             else:
                 b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
         if K > 192:
-            p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_w = tl.aiu_load(w, (i_t * BT, 192), (BT, 64), (T, H*K), DT_W, (1, 0))
+            else:
+                p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
+                b_w = tl.load(p_w, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_v += tl.dot(b_w, tl.trans(b_h4).to(b_w.dtype))
             else:
@@ -263,29 +294,41 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         b_v = b_v.to(k.dtype.element_ty)
 
-        p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (0, i_t * BT), (64, BT), (0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        if USE_AIU and K % 64 == 0:
+            b_k = tl.aiu_load(k, (0, i_t * BT), (64, BT), (H*K, T), DT_K, (0, 1))
+        else:
+            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (0, i_t * BT), (64, BT), (0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
         if TRANSPOSE_STATE:
             b_h1 += tl.trans(tl.dot(b_k, b_v))
         else:
             b_h1 += tl.dot(b_k, b_v)
         if K > 64:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (64, i_t * BT), (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (64, i_t * BT), (64, BT), (H*K, T), DT_K, (0, 1))
+            else:
+                p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (64, i_t * BT), (64, BT), (0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_h2 += tl.trans(tl.dot(b_k, b_v))
             else:
                 b_h2 += tl.dot(b_k, b_v)
         if K > 128:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (128, i_t * BT), (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (128, i_t * BT), (64, BT), (H*K, T), DT_K, (0, 1))
+            else:
+                p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (128, i_t * BT), (64, BT), (0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_h3 += tl.trans(tl.dot(b_k, b_v))
             else:
                 b_h3 += tl.dot(b_k, b_v)
         if K > 192:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (192, i_t * BT), (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (192, i_t * BT), (64, BT), (H*K, T), DT_K, (0, 1))
+            else:
+                p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (192, i_t * BT), (64, BT), (0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_h4 += tl.trans(tl.dot(b_k, b_v))
             else:
@@ -361,6 +404,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
+    USE_AIU: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRANSPOSE_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -404,6 +448,8 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     dh += (boh * H + i_h).to(tl.int64) * K*V
     if USE_GK:
         gk += (bos * H + i_h).to(tl.int64) * K
+
+    DT_K = k.dtype.element_ty
 
     if USE_INITIAL_STATE:
         dh0 += i_nh * K*V
@@ -480,8 +526,11 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         b_do = tl.load(p_do, boundary_check=(0, 1))
 
         # Update dv
-        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        if USE_AIU and K % 64 == 0:
+            b_k = tl.aiu_load(k, (i_t * BT, 0), (BT, 64), (T, H*K), DT_K, (1, 0))
+        else:
+            p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
         if USE_GK:
             o_k1 = tl.arange(0, 64)
             b_gk_last1 = tl.load(gk + last_idx * H*K + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
@@ -491,8 +540,11 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             b_dv = tl.dot(b_k, b_dh1.to(b_k.dtype))
 
         if K > 64:
-            p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (i_t * BT, 64), (BT, 64), (T, H*K), DT_K, (1, 0))
+            else:
+                p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
             if USE_GK:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(gk + last_idx * H*K + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
@@ -502,8 +554,11 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 b_dv += tl.dot(b_k, b_dh2.to(b_k.dtype))
 
         if K > 128:
-            p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (i_t * BT, 128), (BT, 64), (T, H*K), DT_K, (1, 0))
+            else:
+                p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 128), (BT, 64), (1, 0))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
             if USE_GK:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(gk + last_idx * H*K + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
@@ -513,8 +568,11 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 b_dv += tl.dot(b_k, b_dh3.to(b_k.dtype))
 
         if K > 192:
-            p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            if USE_AIU and K % 64 == 0:
+                b_k = tl.aiu_load(k, (i_t * BT, 192), (BT, 64), (T, H*K), DT_K, (1, 0))
+            else:
+                p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 192), (BT, 64), (1, 0))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
             if USE_GK:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(gk + last_idx * H*K + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
@@ -688,6 +746,8 @@ def chunk_gated_delta_rule_fwd_h(
         final_state = k.new_zeros(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
+    use_aiu = K % 64 == 0 and aiu_operands_ok(k, w)
+
     def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
@@ -707,6 +767,7 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         USE_EXP2=use_exp2,
+        USE_AIU=use_aiu,
         TRANSPOSE_STATE=transpose_state_layout,
     )
     return h, v_new, final_state
@@ -748,6 +809,9 @@ def chunk_gated_delta_rule_bwd_dhu(
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.empty_like(dv)
 
+    # aiu_load reads 16-bit elements; on wider dtypes it would read half a row.
+    use_aiu = K % 64 == 0 and aiu_operands_ok(k)
+
     def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)
     chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64[grid](
         q=q,
@@ -770,6 +834,7 @@ def chunk_gated_delta_rule_bwd_dhu(
         V=V,
         BT=BT,
         USE_EXP2=use_exp2,
+        USE_AIU=use_aiu,
         TRANSPOSE_STATE=transpose_state_layout,
     )
     return dh, dh0, dv2

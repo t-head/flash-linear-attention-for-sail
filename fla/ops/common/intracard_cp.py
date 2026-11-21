@@ -16,7 +16,7 @@ from typing import NamedTuple
 import torch
 import triton
 
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+from fla.ops.common.chunk_delta_h import aiu_operands_ok, chunk_gated_delta_rule_fwd_kernel_h_blockdim64
 from fla.ops.cp.chunk_delta_h import pre_process_fwd_kernel_merged
 from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_offsets
 from fla.utils import get_multiprocessor_count
@@ -107,11 +107,13 @@ def _raw_chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), N * H)
 
+    # Same predicate as the default path: the kernel has no default for USE_AIU.
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k, v=u, w=w, v_new=v_new,
         g=g, gk=gk, h=h, h0=initial_state, ht=final_state,
         cu_seqlens=cu_seqlens, chunk_offsets=chunk_offsets,
         T=T, H=H, K=K, V=V, BT=BT, USE_EXP2=use_exp2,
+        USE_AIU=K % 64 == 0 and aiu_operands_ok(k, w),
         TRANSPOSE_STATE=transpose_state_layout,
     )
     return h, v_new, final_state
