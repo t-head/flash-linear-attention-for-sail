@@ -167,27 +167,23 @@ def prepare_wy_repr_bwd_kernel(
         p_g = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
         b_g_exp = tl.exp(b_g)
+        b_bg = b_b * b_g_exp
         b_dg = tl.zeros([BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_dw = tl.make_block_ptr(dw + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         # [BT, BK]
         b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_dw = tl.load(p_dw, boundary_check=(0, 1))
         if USE_G:
-            b_kbg = b_k * (b_b * b_g_exp)[:, None]
+            b_kbg = (b_k * b_bg[:, None]).to(b_dw.dtype)
         else:
             b_kbg = b_k * b_b[:, None]
-        b_dw = tl.load(p_dw, boundary_check=(0, 1))
 
-        b_dA += tl.dot(b_dw, tl.trans(b_kbg).to(b_dw.dtype))
-        b_dkbg = tl.dot(b_A, b_dw)
-        if USE_G:
-            b_dk = b_dkbg * (b_g_exp * b_b)[:, None]
-            b_db += tl.sum(b_dkbg * b_k * b_g_exp[:, None], 1)
-            b_dg += tl.sum(b_dkbg * b_kbg, 1)
-        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+        # Only dA is accumulated here; dkbg = A @ dw is deferred to the third
+        # loop, which removes the dk store/reload round-trip.
+        b_dA = tl.dot(b_dw, tl.trans(b_kbg), acc=b_dA)
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(v + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
@@ -205,38 +201,46 @@ def prepare_wy_repr_bwd_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    b_dA = tl.where(m_A, b_dA, 0)
-    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
+    b_dA = tl.dot(tl.where(m_A, b_dA, 0).to(b_A.dtype), b_A)
     b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
 
     if USE_G:
         b_dA *= exp(b_g[:, None] - b_g[None, :])
 
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
     b_dA = tl.where(m_A, -b_dA, 0).to(k.dtype.element_ty)
 
-    tl.debug_barrier()
+    # Fold beta into dA once so both dots below share b_k as the B operand:
+    # dA^T @ (k * beta) == (dA * beta)^T @ k.
+    b_dAbt = tl.trans((b_dA * b_b[:, None]).to(b_dA.dtype))
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_dk = tl.make_block_ptr(dk + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dw = tl.make_block_ptr(dw + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kt = tl.trans(b_k)
-        b_kb = b_k * b_b[:, None]
+        b_dw = tl.load(p_dw, boundary_check=(0, 1), eviction_policy='evict_first')
 
-        b_A += tl.dot(b_k, b_kt)
         b_dkb = tl.dot(b_dA, b_k)
-        b_db += tl.sum(b_dkb * b_k, 1)
-        b_dk = b_dkb * b_b[:, None] + tl.trans(tl.dot(tl.trans(b_kb).to(b_dA.dtype), b_dA))
-        b_dk += tl.load(p_dk, boundary_check=(0, 1))
+        b_dAkb = tl.dot(b_dAbt, b_k)
+        b_dkbg = tl.dot(b_A, b_dw)
+
+        if USE_G:
+            b_dk = b_dkb * b_b[:, None] + b_dAkb + b_dkbg * b_bg[:, None]
+            b_t = b_g_exp * tl.sum(b_dkbg * b_k, 1)
+            b_db += b_t
+            b_dg += b_t * b_b
+            b_t = tl.sum(b_dkb * b_k, 1)
+            b_db += b_t
+            b_dg += b_t * b_b
+            b_dg -= tl.sum(b_k * b_dAkb, 1)
+        else:
+            b_dk = b_dkb * b_b[:, None] + b_dAkb + b_dkbg * b_b[:, None]
+            b_db += tl.sum(b_dkb * b_k, 1)
 
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_db, b_db.to(p_db.dtype.element_ty), boundary_check=(0,))
 
-    b_A *= b_b[:, None]
     if USE_G:
-        b_AdA = b_dA * b_A
         p_dg = tl.make_block_ptr(dg + (bos*H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_dg += tl.sum(b_AdA, axis=1) - tl.sum(b_AdA, axis=0)
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
 
 
