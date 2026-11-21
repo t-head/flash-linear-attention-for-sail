@@ -6,10 +6,22 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_NVIDIA_HOPPER, IS_PPU, autotune_cache_kwargs, check_shared_mem
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+
+_FWD_O_DEFAULT_CONFIGS = [
+    triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
+    triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+]
+_FWD_O_PPU_CONFIGS = [
+    triton.Config({'BK': BK, 'BV': 128}, num_warps=num_warps, num_stages=num_stages)
+    for BK in [32, 128]
+    for num_warps in [4, 8]
+    for num_stages in [2, 3, 4]
+]
 
 
 @triton.heuristics({
@@ -18,11 +30,7 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
-    ],
+    configs=_FWD_O_PPU_CONFIGS if IS_PPU else _FWD_O_DEFAULT_CONFIGS,
     key=['H', 'K', 'V', 'BT', 'TRANSPOSE_STATE'],
     **autotune_cache_kwargs,
 )
@@ -132,7 +140,7 @@ def chunk_fwd_kernel_o(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in NUM_WARPS
+        for num_warps in ([4, 8] if IS_PPU else NUM_WARPS)
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G', 'USE_G_GAMMA', 'USE_DW', 'TRANSPOSE_STATE'],
@@ -412,7 +420,10 @@ def chunk_bwd_kernel_dv(
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
+    # PPU pins one config here; the wrapper derives the tile shape from K and V.
     configs=[
+        triton.Config({}, num_warps=2, num_stages=3),
+    ] if IS_PPU else [
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
@@ -609,15 +620,20 @@ def chunk_bwd_dv_local(
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    # H100 can have larger block size
-    if check_shared_mem('hopper', k.device.index):
-        CONST_TILING = 128
-    elif check_shared_mem('ada', k.device.index):
-        CONST_TILING = 64
+    if IS_PPU:
+        # The kernel above pins one tile shape, so the block widths no longer come from CONST_TILING.
+        BK = min(max(triton.next_power_of_2(K), 16), 128)
+        BV = min(max(triton.next_power_of_2(V) // 2, 16), 64)
     else:
-        CONST_TILING = 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+        # H100 can have larger block size
+        if check_shared_mem('hopper', k.device.index):
+            CONST_TILING = 128
+        elif check_shared_mem('ada', k.device.index):
+            CONST_TILING = 64
+        else:
+            CONST_TILING = 32
+        BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+        BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     dv = torch.empty_like(do)
