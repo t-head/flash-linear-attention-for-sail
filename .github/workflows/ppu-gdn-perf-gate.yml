@@ -46,9 +46,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # fetch-depth 0 so the base worktree can be created without a fetch.
+          # Full history so the pod can build the base worktree from the merge
+          # base sha resolved below.
           fetch-depth: 0
-          persist-credentials: false
+
+      - name: Resolve base
+        id: base
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'v0.4.2' }}
+        run: |
+          set -euo pipefail
+          # Pass a sha, not origin/<branch>: a pull_request checkout maps the PR
+          # ref, so the remote tracking branch is not guaranteed to exist.
+          git fetch --no-tags origin "$BASE_REF"
+          sha=$(git merge-base HEAD FETCH_HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE_REF@${sha:0:9} head=$(git rev-parse --short HEAD)"
+          # The pod runs this HEAD, so drop the credential it would inherit.
+          git config --local --unset-all 'http.https://github.com/.extraheader' 2>/dev/null || true
 
       - name: Measure on PPU
         id: perf
@@ -82,27 +98,25 @@ jobs:
             # from their worktree and no wheel is installed.
             pip install setuptools wheel einops 'transformers>=4.45.0'
 
-            BASE_REF="${{ github.event.pull_request.base.ref }}"
-            if [ -z "$BASE_REF" ]; then
-              BASE_REF="v0.4.2"
-            fi
-
             NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
             mkdir -p "$NAS_RESULT_DIR"
+            # Worktree and cold Triton caches stay on the pod's local disk;
+            # only the published results go to the shared NAS.
+            OUT=/tmp/gdn-perf-out
 
             set +e
             # Fixed grid: the defaults sweep 18 shapes x 2 modes and would not fit
             # the job timeout with a full autotune sweep per arm and round.
             python benchmarks/gdn_perf.py gate \
-              --base-ref "origin/$BASE_REF" \
-              --workdir "$NAS_RESULT_DIR/work" \
+              --base-ref "${{ steps.base.outputs.sha }}" \
+              --workdir "$OUT" \
               --rounds 2 --heads 8,32,64,128 --seq-lens 4096,8192 \
               2>&1 | tee "$NAS_RESULT_DIR/gate.log"
             GATE_EXIT_CODE=${PIPESTATUS[0]}
             set -euo pipefail
 
-            cp "$NAS_RESULT_DIR/work/gate.md" "$NAS_RESULT_DIR/gate.md" || true
-            cp "$NAS_RESULT_DIR/work/gate.json" "$NAS_RESULT_DIR/gate.json" || true
+            cp "$OUT/gate.md" "$NAS_RESULT_DIR/gate.md" || true
+            cp "$OUT/gate.json" "$NAS_RESULT_DIR/gate.json" || true
             # Read back by "Enforce verdict". A container that never starts
             # leaves no file, which is treated as advisory.
             echo "$GATE_EXIT_CODE" > "$NAS_RESULT_DIR/exit_code"
