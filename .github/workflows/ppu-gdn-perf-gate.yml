@@ -88,15 +88,20 @@ jobs:
             cd /workspace/source
 
             unset PIP_INDEX_URL
-            export GIT_CONFIG_GLOBAL=/dev/null
+            # The pod sees the runner's checkout under a different uid, so git
+            # refuses to read it until the path is whitelisted.
+            git config --global --add safe.directory /workspace/source 2>/dev/null || true
 
             source /usr/local/PPU_SDK/envsetup.sh
             export OMP_NUM_THREADS=1
             export MKL_NUM_THREADS=1
 
             # Kernels compile from source, so both arms are imported straight
-            # from their worktree and no wheel is installed.
-            pip install setuptools wheel einops 'transformers>=4.45.0'
+            # from their worktree and no wheel is installed. fla.ops pulls einops
+            # at import time and the image ships it, so only reach for the network
+            # when it is missing: installing transformers here can pull a newer
+            # numpy and break the image's torch ABI.
+            python3 -c 'import einops' 2>/dev/null || pip install -q einops
 
             NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
             mkdir -p "$NAS_RESULT_DIR"
@@ -145,6 +150,19 @@ jobs:
             /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.json
             /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.log
           if-no-files-found: warn
+
+      # The pod's log needs a login to read. Surface its tail as annotations so
+      # a failure is diagnosable straight from the run page.
+      - name: Report log tail
+        if: always()
+        shell: bash
+        run: |
+          log="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.log"
+          [ -s "$log" ] || exit 0
+          while IFS= read -r line; do
+            line="${line//'%'/'%25'}"
+            echo "::warning::$line"
+          done < <(tail -10 "$log")
 
       # The gate exits 2 on a regression and 3 when it could not measure. Only
       # the former is a verdict on the code; a pod that never starts, an image
