@@ -184,9 +184,18 @@ jobs:
         run: |
           NAS_RESULT_DIR="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
           code=$(cat "$NAS_RESULT_DIR/exit_code" 2>/dev/null || true)
-          if [ "$code" = "2" ]; then
-            echo "::error::GDN perf gate reported a regression"
-            exit 1
-          fi
-          echo "::warning::GDN perf gate has no verdict (exit=${code:-no-result}); advisory"
+          case "$code" in
+            0)
+              echo "::notice::GDN perf gate passed"
+              ;;
+            2)
+              echo "::error::GDN perf gate reported a regression"
+              exit 1
+              ;;
+            *)
+              # A missing file means the pod never ran; 1/3/4 mean the gate
+              # could not produce a comparison. Neither is a verdict on the code.
+              echo "::warning::GDN perf gate has no verdict (exit=${code:-no-result}); advisory"
+              ;;
+          esac
 
