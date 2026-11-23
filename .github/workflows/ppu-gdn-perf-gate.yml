@@ -98,10 +98,18 @@ jobs:
 
             # Kernels compile from source, so both arms are imported straight
             # from their worktree and no wheel is installed. fla.ops pulls einops
-            # at import time and the image ships it, so only reach for the network
-            # when it is missing: installing transformers here can pull a newer
-            # numpy and break the image's torch ABI.
+            # at import time and the image ships it, so only reach for the
+            # network when it is actually missing.
             python3 -c 'import einops' 2>/dev/null || pip install -q einops
+
+            # This branch's fla/__init__.py imports fla.models eagerly, and those
+            # models subclass transformers.PreTrainedModel, so importing fla needs
+            # the package. numpy stays pinned to the image's copy: a dependency
+            # bump here would swap the numpy torch was built against.
+            if ! python3 -c 'import transformers' 2>/dev/null; then
+              pip install -q "transformers<5" \
+                "numpy==$(python3 -c 'import numpy; print(numpy.__version__)')"
+            fi
 
             NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
             mkdir -p "$NAS_RESULT_DIR"
@@ -151,9 +159,11 @@ jobs:
             /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.log
           if-no-files-found: warn
 
-      # The pod's log needs a login to read. Surface its tail as annotations so
-      # a failure is diagnosable straight from the run page.
-      - name: Report log tail
+      # The pod's log needs a login to read. Surface the error lines as
+      # annotations so a failure is diagnosable straight from the run page.
+      # A plain tail would miss the child's traceback: the gate parent prints
+      # its own traceback last, so the useful cause is further up the log.
+      - name: Report failures
         if: always()
         shell: bash
         run: |
@@ -162,7 +172,7 @@ jobs:
           while IFS= read -r line; do
             line="${line//'%'/'%25'}"
             echo "::warning::$line"
-          done < <(tail -10 "$log")
+          done < <(grep -aE 'Error|error|Exception|Traceback|No module|not found|Killed|denied' "$log" | tail -8)
 
       # The gate exits 2 on a regression and 3 when it could not measure. Only
       # the former is a verdict on the code; a pod that never starts, an image
