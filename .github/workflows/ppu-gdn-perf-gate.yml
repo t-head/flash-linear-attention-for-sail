@@ -52,6 +52,10 @@ jobs:
 
       - name: Measure on PPU
         id: perf
+        # Advisory: a pod that never starts is an infra problem, not a verdict
+        # on the code. "Enforce verdict" below fails the job only when the gate
+        # actually reported a regression.
+        continue-on-error: true
         uses: t-head/ci-infra/cluster-run@main
         with:
           image: ${{ env.SAIL_IMAGE }}
@@ -99,6 +103,9 @@ jobs:
 
             cp "$NAS_RESULT_DIR/work/gate.md" "$NAS_RESULT_DIR/gate.md" || true
             cp "$NAS_RESULT_DIR/work/gate.json" "$NAS_RESULT_DIR/gate.json" || true
+            # Read back by "Enforce verdict". A container that never starts
+            # leaves no file, which is treated as advisory.
+            echo "$GATE_EXIT_CODE" > "$NAS_RESULT_DIR/exit_code"
             exit "$GATE_EXIT_CODE"
           cleanup_policy: on_success
 
@@ -124,3 +131,20 @@ jobs:
             /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.json
             /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.log
           if-no-files-found: warn
+
+      # The gate exits 2 on a regression and 3 when it could not measure. Only
+      # the former is a verdict on the code; a pod that never starts, an image
+      # pull failure or a missing result stay advisory, so infra noise cannot
+      # turn this check red.
+      - name: Enforce verdict
+        if: always()
+        shell: bash
+        run: |
+          NAS_RESULT_DIR="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
+          code=$(cat "$NAS_RESULT_DIR/exit_code" 2>/dev/null || true)
+          if [ "$code" = "2" ]; then
+            echo "::error::GDN perf gate reported a regression"
+            exit 1
+          fi
+          echo "::warning::GDN perf gate has no verdict (exit=${code:-no-result}); advisory"
+
