@@ -172,7 +172,7 @@ jobs:
           while IFS= read -r line; do
             line="${line//'%'/'%25'}"
             echo "::warning::$line"
-          done < <(grep -aE 'Error|error|Exception|Traceback|No module|not found|Killed|denied' "$log" | tail -8)
+          done < <(grep -aE 'Traceback|Error|Exception|No module|not found|Killed|denied|error:' "$log" | tail -8)
 
       # The gate exits 2 on a regression and 3 when it could not measure. Only
       # the former is a verdict on the code; a pod that never starts, an image
@@ -193,9 +193,9 @@ jobs:
               exit 1
               ;;
             *)
-              # A missing file means the pod never ran; 1/3/4 mean the gate
-              # could not produce a comparison. Neither is a verdict on the code.
+              # A missing file means the pod never ran; 1 is an uncaught error,
+              # 3 means the arms were not comparable and 4 means a point was not
+              # measured. None of them is a verdict on the code.
               echo "::warning::GDN perf gate has no verdict (exit=${code:-no-result}); advisory"
               ;;
           esac
-
