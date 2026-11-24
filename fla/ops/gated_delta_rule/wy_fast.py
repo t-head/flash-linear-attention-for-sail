@@ -6,7 +6,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import IS_NVIDIA_BLACKWELL, IS_PPU, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_NVIDIA_BLACKWELL, IS_PPU, IS_PPU_810E, IS_PPU_M890, autotune_cache_kwargs, check_shared_mem
 
 if IS_NVIDIA_BLACKWELL:
     """
@@ -35,18 +35,33 @@ else:
         return tl.dot(a, b)
 
 
+def _rwu_fwd_autotune_configs() -> list[triton.Config]:
+    # Each PPU board tunes over only its own winners: a shared union lets a cold-start tune
+    # land on the other board's tile (#29). Other devices keep the generic sweep.
+    if IS_PPU_M890:
+        return [
+            triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),     # H <= 48
+            triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=5),   # H >= 64
+        ]
+    if IS_PPU_810E:
+        return [
+            triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=4),     # H <= 48
+            triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=1),    # H >= 64
+        ]
+    return [
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ]
+
+
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
-    # The PPU grid measured neutral here, so this kernel keeps the default sweep.
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    configs=_rwu_fwd_autotune_configs(),
+    key=['H', 'K', 'V', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -255,8 +270,6 @@ def recompute_w_u_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -279,8 +292,6 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
     )
     return w, u
 
