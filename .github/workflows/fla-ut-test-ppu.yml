@@ -118,7 +118,11 @@ jobs:
             pip3 install build
             python scripts/build_packages.py
             pip3 install --no-deps dist-packages/*.whl
-            pip3 install 'transformers>=4.45.0' einops
+            # Pinned: an unbounded resolve pulled 5.24, whose CacheLayerMixin rename
+            # broke fla/models/utils.py. Bump this on purpose, after testing it.
+            # New transformers releases are still covered by reusable-ci-tests.yml,
+            # which installs the package unpinned on the NVIDIA runners.
+            pip3 install 'transformers==5.24.0' einops
 
             # The suite below imports `fla` from the checkout, so this is the only
             # place the wheels this job built are exercised. Run it outside the
