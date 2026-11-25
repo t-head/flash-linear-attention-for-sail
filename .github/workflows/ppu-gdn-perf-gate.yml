@@ -28,6 +28,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ppu-gdn-perf-${{ github.event.pull_request.number || github.ref }}
@@ -37,8 +38,25 @@ env:
   SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
 
 jobs:
+  # The pod runs PR-controlled code and mounts the shared NAS read-write, so this
+  # workflow waits for the same approval ci.yml puts in front of the PPU unit
+  # tests. The reusable gate polls, so an approval inside its window starts the
+  # run; after that a new push restarts it.
+  precheck:
+    name: Pre-check
+    if: github.event_name != 'workflow_dispatch' && github.event.pull_request.base.ref == 'v0.4.2'
+    uses: t-head/.github/.github/workflows/user-precheck.yml@main
+
+  review:
+    name: Perf Gate Review
+    needs: precheck
+    uses: t-head/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
   gdn-perf:
     name: GDN A/B perf (ZW-M890P)
+    needs: [precheck, review]
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || (needs.precheck.result == 'success' && needs.review.result == 'success')) }}
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
