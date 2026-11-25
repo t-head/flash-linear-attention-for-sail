@@ -27,7 +27,7 @@ env:
   # imports `gla/chunk.py` -- and anything else is covered by the NVIDIA/Intel
   # workflows, which run the dependent op and model tests on every PR.
   # Keep in sync with casecmd.list.
-  UT_PATHS: '^(fla/(__init__\.py|utils\.py|ops/(__init__\.py|backends/|utils/|common/|cp/|gated_delta_rule/|delta_rule/|comba/|simple_gla/|kda/|gla/)|layers/(__init__\.py|gated_deltanet\.py|utils\.py)|models/(__init__\.py|gated_deltanet/)|modules/(conv/|convolution\.py|l2norm\.py|layernorm\.py|layernorm_gated\.py|fused_norm_gate\.py))|tests/|scripts/build_packages\.py|setup\.py|pyproject\.toml|\.github/workflows/(ci|fla-ut-test-ppu|ppu-gdn-perf-gate)\.yml|\.github/workflows/scripts/(casecmd\.list|pr-fla-ut\.py))'
+  UT_PATHS: '^(fla/(__init__\.py|utils\.py|ops/(__init__\.py|backends/|utils/|common/|cp/|gated_delta_rule/|delta_rule/|comba/|simple_gla/|kda/|gla/)|layers/(__init__\.py|gated_deltanet\.py|utils\.py)|models/(__init__\.py|utils\.py|gated_deltanet/)|modules/(conv/|convolution\.py|l2norm\.py|layernorm\.py|layernorm_gated\.py|fused_norm_gate\.py))|tests/|scripts/build_packages\.py|setup\.py|pyproject\.toml|\.github/workflows/(ci|fla-ut-test-ppu|ppu-gdn-perf-gate)\.yml|\.github/workflows/scripts/(casecmd\.list|pr-fla-ut\.py))'
 
 jobs:
   build-test:
