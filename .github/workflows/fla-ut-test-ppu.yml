@@ -27,7 +27,7 @@ env:
   # imports `gla/chunk.py` -- and anything else is covered by the NVIDIA/Intel
   # workflows, which run the dependent op and model tests on every PR.
   # Keep in sync with casecmd.list.
-  UT_PATHS: '^(fla/(__init__\.py|utils\.py|ops/(__init__\.py|backends/|utils/|common/|cp/|gated_delta_rule/|delta_rule/|comba/|simple_gla/|kda/|gla/)|layers/(__init__\.py|gated_deltanet\.py|utils\.py)|models/(__init__\.py|utils\.py|gated_deltanet/)|modules/(conv/|convolution\.py|l2norm\.py|layernorm\.py|layernorm_gated\.py|fused_norm_gate\.py))|tests/|scripts/build_packages\.py|setup\.py|pyproject\.toml|\.github/workflows/(ci|fla-ut-test-ppu|ppu-gdn-perf-gate)\.yml|\.github/workflows/scripts/(casecmd\.list|pr-fla-ut\.py))'
+  UT_PATHS: '^(fla/(__init__\.py|utils\.py|ops/(__init__\.py|backends/|utils/|common/|cp/|gated_delta_rule/|delta_rule/|comba/|simple_gla/|kda/|gla/)|layers/(__init__\.py|gated_deltanet\.py|utils\.py)|models/(__init__\.py|utils\.py|gated_deltanet/)|modules/(__init__\.py|conv/|convolution\.py|l2norm\.py|layernorm\.py|layernorm_gated\.py|fused_norm_gate\.py|mlp\.py|activations\.py))|tests/|scripts/build_packages\.py|setup\.py|pyproject\.toml|\.github/workflows/(ci|fla-ut-test-ppu|ppu-gdn-perf-gate)\.yml|\.github/workflows/scripts/(casecmd\.list|pr-fla-ut\.py))'
 
 jobs:
   build-test:
@@ -173,17 +173,23 @@ jobs:
               raise SystemExit(0 if skipped else 1)
 
           tree = ET.parse(path)
+          counts = {}
           for tc in tree.getroot().iter("testcase"):
               name = tc.get("name", "?")
               secs = float(tc.get("time") or 0)
               failure = tc.find("failure")
               error = tc.find("error")
+              skipped = tc.find("skipped")
               if failure is not None:
                   status, node = "FAIL", failure
               elif error is not None:
                   status, node = "ERROR", error
+              elif skipped is not None:
+                  # A deadline-skipped case never ran; calling it PASS would hide that.
+                  status, node = "SKIPPED", skipped
               else:
                   status, node = "PASS", None
+              counts[status] = counts.get(status, 0) + 1
               print(f"- {status} `{name}` ({secs:.0f}s)")
               if node is None:
                   continue
@@ -196,4 +202,9 @@ jobs:
                   for line in tail:
                       print(f"    {line}")
                   print("    ```")
+          print("")
+          print("- " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+          if not any(counts.get(s) for s in ("PASS", "FAIL", "ERROR")):
+              print("::error::no case ran, every case was skipped")
+              raise SystemExit(1)
           PY
