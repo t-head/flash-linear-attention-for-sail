@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -50,9 +51,10 @@ def group_of(kernel_name: str) -> str:
 
 
 def git(repo, *args) -> str:
+    # stderr is inherited on purpose: a git failure should say why it failed.
     return subprocess.run(
         ['git', '-C', str(repo), *args],
-        check=True, capture_output=True, text=True,
+        check=True, stdout=subprocess.PIPE, text=True,
     ).stdout.strip()
 
 
@@ -100,17 +102,17 @@ def make_runner(heads: int, seq_len: int, dim: int, dtype: str, device: str, bac
     return run
 
 
-def profile_us(run, warmup: int, iters: int) -> dict[str, float]:
+def profile_us(run, warmup: int, iters: int, device: str) -> dict[str, float]:
     """Device microseconds per call, grouped by kernel."""
     import torch
 
     for _ in range(warmup):
         run()
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
         for _ in range(iters):
             run()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
 
     totals: dict[str, float] = defaultdict(float)
     for evt in prof.key_averages():
@@ -142,7 +144,7 @@ def measure(args) -> dict:
                 key = f'H{H}_T{T}/{mode}'
                 try:
                     run = make_runner(H, T, args.dim, args.dtype, args.device, mode == 'fwd_bwd')
-                    reps = [profile_us(run, args.warmup, args.iters) for _ in range(args.reps)]
+                    reps = [profile_us(run, args.warmup, args.iters, args.device) for _ in range(args.reps)]
                 except RuntimeError as exc:
                     # A shape that does not fit is reported, never silently dropped.
                     print(f'[measure] {key}: skipped ({str(exc).splitlines()[0]})', flush=True)
@@ -164,7 +166,7 @@ def measure(args) -> dict:
         'fla_file': str(Path(fla.__file__).resolve()),
         'git_sha': git(repo, 'rev-parse', 'HEAD'),
         'git_subject': git(repo, 'log', '-1', '--format=%s'),
-        'device': torch.cuda.get_device_name(0),
+        'device': torch.cuda.get_device_name(args.device),
         'torch': torch.__version__,
         'triton': triton.__version__,
         'dtype': args.dtype,
@@ -190,16 +192,26 @@ def run_measure(arm_dir: Path, out: Path, args) -> dict:
     if env.get('PYTHONPATH'):
         arm_path = f"{arm_path}{os.pathsep}{env['PYTHONPATH']}"
     env['PYTHONPATH'] = arm_path
-    env['TRITON_CACHE_DIR'] = tempfile.mkdtemp(prefix=f'triton-{arm_dir.name}-', dir=str(out.parent))
+    cache_dir = Path(tempfile.mkdtemp(prefix=f'triton-{arm_dir.name}-', dir=str(out.parent)))
+    env['TRITON_CACHE_DIR'] = str(cache_dir)
     cmd = [
         sys.executable, str(Path(__file__).resolve()), 'measure',
         '--repo', str(arm_dir), '--out', str(out),
         '--heads', args.heads, '--seq-lens', args.seq_lens,
-        '--dim', str(args.dim), '--dtype', args.dtype,
+        '--dim', str(args.dim), '--dtype', args.dtype, '--device', args.device,
         '--iters', str(args.iters), '--reps', '1', '--warmup', str(args.warmup),
     ]
     print(f"[gate] {arm_dir.name}: TRITON_CACHE_DIR={env['TRITON_CACHE_DIR']}", flush=True)
-    subprocess.run(cmd, env=env, check=True)
+    try:
+        subprocess.run(cmd, env=env, check=True)
+    except BaseException:
+        # Keep the cache of a failed arm: it is the only record of what it compiled.
+        print(f'[gate] {arm_dir.name}: kept {cache_dir}', flush=True)
+        raise
+    if not args.keep_caches:
+        # A cold cache per arm and round is the point; keeping it after the
+        # measurement just leaks compiled kernels across runs.
+        shutil.rmtree(cache_dir, ignore_errors=True)
     return json.loads(out.read_text())
 
 
@@ -404,6 +416,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument('--min-delta-us', type=float, default=8.0)
     g.add_argument('--self-check', action='store_true')
     g.add_argument('--self-check-tol', type=float, default=0.10)
+    g.add_argument('--keep-caches', action='store_true',
+                   help='keep the per-arm Triton caches instead of removing them')
     add_shape_flags(g)
     return parser
 
