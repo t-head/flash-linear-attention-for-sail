@@ -137,16 +137,24 @@ def run_cases(caselist_path: str, build_dir: str, output_xml: str = OUTPUT_XML, 
     passed = 0
     start_time = time.time()
 
+    def skip_for_deadline(cmd: str) -> None:
+        junit_case = TestCase(name=derive_test_name(cmd), classname="flaTest")
+        reason = "Not run: overall deadline exceeded"
+        junit_case.add_skipped_info(reason)
+        all_cases.append(junit_case)
+        failures.append(("SKIPPED", derive_test_name(cmd), reason, ""))
+        write_xml(xml_path, all_cases)
+
     for i, cmd in enumerate(test_commands, 1):
-        if deadline and time.time() - start_time > deadline:
-            junit_case = TestCase(name=derive_test_name(cmd), classname="flaTest")
-            reason = "Not run: overall deadline exceeded"
-            junit_case.add_skipped_info(reason)
-            all_cases.append(junit_case)
-            failures.append(("SKIPPED", derive_test_name(cmd), reason, ""))
-            write_xml(xml_path, all_cases)
+        remaining = deadline - (time.time() - start_time) if deadline else None
+        if remaining is not None and remaining <= 0:
+            skip_for_deadline(cmd)
             continue
-        junit_case, status, reason, output = run_one_case(i, cmd, len(test_commands), timeout)
+        # A case starting near the deadline gets only what is left of the budget:
+        # the full per-case timeout could overrun the pod reservation and take the
+        # remaining results with it.
+        case_timeout = min(timeout, remaining) if remaining is not None else timeout
+        junit_case, status, reason, output = run_one_case(i, cmd, len(test_commands), case_timeout)
         all_cases.append(junit_case)
         if status == "PASS":
             passed += 1

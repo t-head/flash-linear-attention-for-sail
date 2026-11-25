@@ -105,11 +105,16 @@ def test_invalid_utf8_does_not_abort_run(tmp_path):
     assert cases[1].find("failure") is None
 
 
-def test_deadline_skips_remaining_commands(tmp_path):
+def test_deadline_caps_case_timeout_and_skips_rest(tmp_path):
+    started = time.time()
     proc, xml_path = run_runner(tmp_path, ["sleep 2", "echo late"], deadline=1)
+    elapsed = time.time() - started
     assert proc.returncode == 1
     cases = parse_cases(xml_path)
-    assert cases[0].find("failure") is None
+    # The case started with a second of budget left, so it is killed there instead
+    # of running its full 30 s timeout past the deadline.
+    assert "Timeout after" in cases[0].find("failure").get("message", "")
+    assert elapsed < 10
     skipped = cases[1].find("skipped")
     assert skipped is not None
     assert "deadline" in (skipped.get("message", "") or "")
