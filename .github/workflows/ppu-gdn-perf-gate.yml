@@ -55,16 +55,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Keep in sync with fla-ut-test-ppu.yml: same boards, same sizing.
-        # `runner` is the check name the branch ruleset requires; `board` is the
-        # `board-type` label the scheduler exposes for the same 810E series.
+        # Keep in sync with fla-ut-test-ppu.yml: same boards, same sizing. The
+        # name is both the check name the ruleset requires and the `board-type`
+        # label the scheduler selects on.
         include:
           - runner: ZW-M890P
-            board: ZW-M890P
             cpus: "31"
             memory: "256Gi"
           - runner: ZW-810E
-            board: OAM-810E
             cpus: "11"
             memory: "112Gi"
     env:
@@ -126,7 +124,7 @@ jobs:
           image: ${{ env.SAIL_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: "board-type=${{ matrix.board }}"
+          node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
           timeout_minutes: 240
           container_options: |

@@ -91,11 +91,7 @@ jobs:
           image: ${{ env.SAIL_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
-          # The branch ruleset requires this check to be named `Build & Test
-          # (ZW-810E)`, which is `matrix.runner`. The scheduler exposes the same
-          # 810E series as `board-type=OAM-810E` -- the label this gate already ran
-          # a 209-minute suite on -- so the board is mapped here rather than renamed.
-          node_selector: "board-type=${{ matrix.runner == 'ZW-810E' && 'OAM-810E' || matrix.runner }}"
+          node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
           timeout_minutes: 300
           container_options: |
