@@ -68,7 +68,7 @@ def _prune_dhu_configs(configs, named_args, **kwargs):
     K = {**named_args, **kwargs}['K']
     widths = [c.kwargs['BK'] for c in configs if 'BK' in c.kwargs]
     configs = [c for c in configs if 'BK' in c.kwargs and 4 * c.kwargs['BK'] >= K]
-    if K > 192:
+    if IS_PPU and K > 192:
         configs = [c for c in configs if c.kwargs['BK'] >= 128]
     if not configs:
         # An empty sweep fails inside autotune with no hint about the shape.
