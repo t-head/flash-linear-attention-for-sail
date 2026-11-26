@@ -7,7 +7,20 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import autotune_cache_kwargs
+from fla.utils import IS_PPU, autotune_cache_kwargs
+
+_DEFAULT_CONFIGS = [
+    triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
+    for BK in [32, 64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
+# PPU grid: narrow BK with a fixed warp count.
+_PPU_CONFIGS = [
+    triton.Config({'BK': BK}, num_warps=4, num_stages=num_stages)
+    for BK in [32, 64]
+    for num_stages in [3, 4, 5]
+]
 
 
 @triton.heuristics({
@@ -15,12 +28,7 @@ from fla.utils import autotune_cache_kwargs
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_PPU_CONFIGS if IS_PPU else _DEFAULT_CONFIGS,
     key=['H', 'K', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )

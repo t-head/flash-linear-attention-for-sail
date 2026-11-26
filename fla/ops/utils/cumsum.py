@@ -6,9 +6,11 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils.index import prepare_chunk_indices
-from fla.utils import autotune_cache_kwargs, check_shared_mem, input_guard
+from fla.utils import IS_PPU, autotune_cache_kwargs, check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+_LS_CONFIGS = [triton.Config({}, num_warps=w) for w in ([1, 2, 4] if IS_PPU else [1, 2, 4, 8])]
 
 
 @triton.heuristics({
@@ -16,10 +18,7 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8]
-    ],
+    configs=_LS_CONFIGS,
     key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,
 )
@@ -120,7 +119,6 @@ def chunk_local_cumsum_vector_kernel(
     if HAS_SCALE:
         b_o *= scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-
 
 
 @triton.heuristics({

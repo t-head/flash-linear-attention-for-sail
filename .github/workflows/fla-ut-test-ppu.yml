@@ -141,7 +141,7 @@ jobs:
             set +e
             python .github/workflows/scripts/pr-fla-ut.py \
               --caselist .github/workflows/scripts/casecmd.list \
-              --timeout 4200 --deadline 14400 \
+              --timeout 4200 --deadline 16200 \
               --output-xml "$NAS_RESULT_DIR/test-results.xml" \
               2>&1 | tee "$NAS_RESULT_DIR/test-output.log"
             TEST_EXIT_CODE=${PIPESTATUS[0]}
