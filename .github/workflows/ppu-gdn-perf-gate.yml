@@ -1,30 +1,17 @@
 name: PPU GDN perf gate
 
-# Not a required check, which is why it can filter on paths: a path-filtered
-# required check would stay pending on unrelated PRs. If this ever becomes
-# required, drop `paths` and gate inside the job instead.
-# The paths are the GDN call path `benchmarks/gdn_perf.py` measures, including
-# `ops/backends/`, which picks the implementation `dispatch` runs. A change
-# elsewhere under `fla/` cannot move these timings.
+# `GDN perf gate (ZW-M890P)` and `GDN perf gate (ZW-810E)` are required by the
+# branch ruleset, so both have to be reported on every PR: a `paths:` filter
+# would leave them pending forever on a PR outside the filter. The scope is
+# decided inside the job instead -- a diff that cannot move a GDN timing starts
+# no pod and still reports a conclusion.
+#
+# The scope below is the GDN call path `benchmarks/gdn_perf.py` measures,
+# including `ops/backends/`, which picks the implementation `dispatch` runs.
 on:
   workflow_dispatch:
   pull_request:
     branches: ['v0.4.2']
-    paths:
-      - 'fla/ops/gated_delta_rule/**'
-      - 'fla/ops/common/**'
-      - 'fla/ops/utils/**'
-      - 'fla/ops/cp/**'
-      - 'fla/ops/backends/**'
-      - 'fla/modules/**'
-      - 'fla/layers/gated_deltanet.py'
-      # Backend detection and the multiprocessor / shared-memory helpers the
-      # autotune configs read live here, so they change which kernel config wins.
-      - 'fla/utils.py'
-      - 'benchmarks/gdn_perf.py'
-      - '.github/workflows/ppu-gdn-perf-gate.yml'
-      - 'setup.py'
-      - 'pyproject.toml'
 
 permissions:
   contents: read
@@ -36,6 +23,10 @@ concurrency:
 
 env:
   SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+  # Same call path the gate measures. Backend detection and the multiprocessor /
+  # shared-memory helpers the autotune configs read live in fla/utils.py, so
+  # they change which kernel config wins.
+  PERF_PATHS: '^(fla/(__init__\.py|utils\.py|ops/(__init__\.py|backends/|utils/|common/|cp/|gated_delta_rule/)|modules/|layers/(__init__\.py|gated_deltanet\.py))|benchmarks/gdn_perf\.py|setup\.py|pyproject\.toml|\.github/workflows/ppu-gdn-perf-gate\.yml)'
 
 jobs:
   # The pod runs PR-controlled code and mounts the shared NAS read-write, so this
@@ -54,13 +45,33 @@ jobs:
     secrets: inherit
 
   gdn-perf:
-    name: GDN A/B perf (ZW-M890P)
+    name: GDN perf gate (${{ matrix.runner }})
     needs: [precheck, review]
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || (needs.precheck.result == 'success' && needs.review.result == 'success')) }}
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with fla-ut-test-ppu.yml: same boards, same sizing.
+        # `runner` is the check name the branch ruleset requires; `board` is the
+        # `board-type` label the scheduler exposes for the same 810E series.
+        include:
+          - runner: ZW-M890P
+            board: ZW-M890P
+            cpus: "31"
+            memory: "256Gi"
+          - runner: ZW-810E
+            board: OAM-810E
+            cpus: "11"
+            memory: "112Gi"
+    env:
+      # Results travel over the shared NAS: container side /mnt/wl_nas, runner
+      # side /wl_nas. One directory per board, so the two cannot overwrite each
+      # other's verdict.
+      NAS_RESULT_DIR: /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,8 +95,28 @@ jobs:
           # The pod runs this HEAD, so drop the credential it would inherit.
           git config --local --unset-all 'http.https://github.com/.extraheader' 2>/dev/null || true
 
+          # A board costs about half an hour, so decide first whether this diff
+          # can move a timing the gate reports. See the header for why this is
+          # not a `paths:` filter.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::manual run, measuring both arms"
+            exit 0
+          fi
+          # --no-renames so moving a file out of a gated directory still counts.
+          changed=$(git diff --name-only --no-renames "$sha" HEAD)
+          hits=$(printf '%s\n' "$changed" | grep -E "$PERF_PATHS" || true)
+          if [ -n "$hits" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::GDN perf path changed: $(printf '%s\n' "$hits" | paste -sd' ')"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::nothing on the GDN perf path changed, gate skipped"
+          fi
+
       - name: Measure on PPU
         id: perf
+        if: steps.base.outputs.run == 'true'
         # Advisory: a pod that never starts is an infra problem, not a verdict
         # on the code. "Enforce verdict" below fails the job only when the gate
         # actually reported a regression.
@@ -95,12 +126,12 @@ jobs:
           image: ${{ env.SAIL_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: "board-type=ZW-M890P"
+          node_selector: "board-type=${{ matrix.board }}"
           namespace: ppu-sched
           timeout_minutes: 240
           container_options: |
-            cpus: "31"
-            memory: "256Gi"
+            cpus: "${{ matrix.cpus }}"
+            memory: "${{ matrix.memory }}"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -129,7 +160,7 @@ jobs:
                 "numpy==$(python3 -c 'import numpy; print(numpy.__version__)')"
             fi
 
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/${{ matrix.runner }}"
             mkdir -p "$NAS_RESULT_DIR"
             # Worktree and cold Triton caches stay on the pod's local disk;
             # only the published results go to the shared NAS.
@@ -158,7 +189,10 @@ jobs:
         if: always()
         shell: bash
         run: |
-          NAS_RESULT_DIR="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
+          if [ "${{ steps.base.outputs.run }}" != 'true' ]; then
+            echo "GDN perf gate (${{ matrix.runner }}) skipped: nothing on the measured path changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ -f "$NAS_RESULT_DIR/gate.md" ]; then
             cat "$NAS_RESULT_DIR/gate.md" >> "$GITHUB_STEP_SUMMARY"
           else
@@ -167,14 +201,14 @@ jobs:
           fi
 
       - name: Upload results
-        if: always()
+        if: always() && steps.base.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: gdn-perf-gate
+          name: gdn-perf-gate-${{ matrix.runner }}
           path: |
-            /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.md
-            /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.json
-            /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.log
+            ${{ env.NAS_RESULT_DIR }}/gate.md
+            ${{ env.NAS_RESULT_DIR }}/gate.json
+            ${{ env.NAS_RESULT_DIR }}/gate.log
           if-no-files-found: warn
 
       # The pod's log needs a login to read. Surface the error lines as
@@ -182,10 +216,10 @@ jobs:
       # A plain tail would miss the child's traceback: the gate parent prints
       # its own traceback last, so the useful cause is further up the log.
       - name: Report failures
-        if: always()
+        if: always() && steps.base.outputs.run == 'true'
         shell: bash
         run: |
-          log="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/gate.log"
+          log="$NAS_RESULT_DIR/gate.log"
           [ -s "$log" ] || exit 0
           while IFS= read -r line; do
             line="${line//'%'/'%25'}"
@@ -200,7 +234,10 @@ jobs:
         if: always()
         shell: bash
         run: |
-          NAS_RESULT_DIR="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn"
+          if [ "${{ steps.base.outputs.run }}" != 'true' ]; then
+            echo "::notice::GDN perf gate (${{ matrix.runner }}) skipped: nothing on the measured path changed"
+            exit 0
+          fi
           code=$(cat "$NAS_RESULT_DIR/exit_code" 2>/dev/null || true)
           case "$code" in
             0)

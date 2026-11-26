@@ -6,7 +6,7 @@ on:
       matrix:
         required: false
         type: string
-        default: '["ZW-M890P", "OAM-810E"]'
+        default: '["ZW-M890P", "ZW-810E"]'
       # Base branch of the pull request. Empty means a manual run, which stays
       # unscoped. No default on purpose: a default would silently scope a manual
       # run against the wrong branch.
@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "OAM-810E"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,12 +91,16 @@ jobs:
           image: ${{ env.SAIL_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: "board-type=${{ matrix.runner }}"
+          # The branch ruleset requires this check to be named `Build & Test
+          # (ZW-810E)`, which is `matrix.runner`. The scheduler exposes the same
+          # 810E series as `board-type=OAM-810E` -- the label this gate already ran
+          # a 209-minute suite on -- so the board is mapped here rather than renamed.
+          node_selector: "board-type=${{ matrix.runner == 'ZW-810E' && 'OAM-810E' || matrix.runner }}"
           namespace: ppu-sched
           timeout_minutes: 300
           container_options: |
-            cpus: "${{ matrix.runner == 'OAM-810E' && '11' || '31' }}"
-            memory: "${{ matrix.runner == 'OAM-810E' && '112Gi' || '256Gi' }}"
+            cpus: "${{ matrix.runner == 'ZW-810E' && '11' || '31' }}"
+            memory: "${{ matrix.runner == 'ZW-810E' && '112Gi' || '256Gi' }}"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -107,7 +111,7 @@ jobs:
 
             # PPU SDK and torch are pre-installed in the docker image.
             source /usr/local/PPU_SDK/envsetup.sh
-            export MAX_JOBS=${{ matrix.runner == 'OAM-810E' && '11' || '31' }}
+            export MAX_JOBS=${{ matrix.runner == 'ZW-810E' && '11' || '31' }}
             export OMP_NUM_THREADS=1
             export MKL_NUM_THREADS=1
 
