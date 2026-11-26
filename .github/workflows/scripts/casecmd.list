@@ -3,8 +3,9 @@
 # Every path below exists on the v0.4.2 branch and does not use the 0.5.x layout.
 # Cases 1-11 are GDN with the kernels it builds on; 12-15 are the operators that
 # share chunk_o.py and chunk_delta_h.py with it; 16 is the FLALayer cache API that
-# the modeling case drives. tests/context_parallel/test_cp_gdn.py is deliberately
-# absent: it needs 2/4/8 cards, the pod reserves one, so it would only ever skip.
+# the modeling case drives. 17-18 are the Qwen-shaped matrix and the recompute_w_u
+# tile check. tests/context_parallel/test_cp_gdn.py is deliberately absent: it
+# needs 2/4/8 cards, the pod reserves one, so it would only ever skip.
 
 python -m pytest -v tests/ops/test_gated_delta.py -k "fused_recurrent and not transpose" --durations=30
 python -m pytest -v tests/ops/test_gated_delta.py -k "test_chunk and not varlen and not transpose" --durations=30
@@ -22,3 +23,7 @@ python -m pytest -v tests/ops/test_comba.py -k "test_chunk" --durations=30
 python -m pytest -v tests/ops/test_simple_gla.py -k "test_chunk" --durations=30
 python -m pytest -v tests/ops/test_kda.py -k "test_chunk" --durations=30
 python -m pytest -v tests/models/test_cache.py --durations=30
+# No FLA_CI_ENV in this gate, so the Qwen file cannot infer a scope by itself and
+# would fall back to the full matrix, which does not fit the board reservation.
+python -m pytest -v tests/ops/test_wy_fast.py --durations=30
+FLA_TEST_GDN_QWEN_SCOPE=ci python -m pytest -v tests/ops/test_gated_delta_qwen.py --durations=30
