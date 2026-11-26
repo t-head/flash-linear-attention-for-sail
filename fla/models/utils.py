@@ -124,8 +124,12 @@ class FLALayer(CacheLayerMixin):
     def get_seq_length(self, cache_position=None) -> int:
         return self._seen_tokens
 
-    def get_max_cache_shape(self) -> int:
+    def get_max_length(self) -> int:
         return -1
+
+    def get_max_cache_shape(self) -> int:
+        # transformers>=5.24 renamed the abstract method to `get_max_length`.
+        return self.get_max_length()
 
     def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
         return 0, 0
@@ -376,8 +380,11 @@ class FLACache(HFCacheBase):
             return 0
         return self.layers[layer_idx or 0].get_seq_length()
 
-    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+    def get_max_length(self, layer_idx: int = 0) -> int:
         return -1
+
+    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+        return self.get_max_length(layer_idx)
 
     def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
         # kv_length = past_seen + current_query_length

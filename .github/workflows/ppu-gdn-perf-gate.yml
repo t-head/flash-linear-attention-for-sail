@@ -1,0 +1,254 @@
+name: PPU GDN perf gate
+
+# `GDN perf gate (ZW-M890P)` and `GDN perf gate (ZW-810E)` are required by the
+# branch ruleset, so both have to be reported on every PR: a `paths:` filter
+# would leave them pending forever on a PR outside the filter. The scope is
+# decided inside the job instead -- a diff that cannot move a GDN timing starts
+# no pod and still reports a conclusion.
+#
+# The scope below is the GDN call path `benchmarks/gdn_perf.py` measures,
+# including `ops/backends/`, which picks the implementation `dispatch` runs.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ['v0.4.2']
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ppu-gdn-perf-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+  # Same call path the gate measures. Backend detection and the multiprocessor /
+  # shared-memory helpers the autotune configs read live in fla/utils.py, so
+  # they change which kernel config wins.
+  PERF_PATHS: '^(fla/(__init__\.py|utils\.py|ops/(__init__\.py|backends/|utils/|common/|cp/|gated_delta_rule/)|modules/|layers/(__init__\.py|gated_deltanet\.py))|benchmarks/gdn_perf\.py|setup\.py|pyproject\.toml|\.github/workflows/ppu-gdn-perf-gate\.yml)'
+
+jobs:
+  # The pod runs PR-controlled code and mounts the shared NAS read-write, so this
+  # workflow waits for the same approval ci.yml puts in front of the PPU unit
+  # tests. The reusable gate polls, so an approval inside its window starts the
+  # run; after that a new push restarts it.
+  precheck:
+    name: Pre-check
+    if: github.event_name != 'workflow_dispatch' && github.event.pull_request.base.ref == 'v0.4.2'
+    uses: t-head/.github/.github/workflows/user-precheck.yml@main
+
+  review:
+    name: Perf Gate Review
+    needs: precheck
+    uses: t-head/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  gdn-perf:
+    name: GDN perf gate (${{ matrix.runner }})
+    needs: [precheck, review]
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || (needs.precheck.result == 'success' && needs.review.result == 'success')) }}
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with fla-ut-test-ppu.yml: same boards, same sizing. The
+        # name is both the check name the ruleset requires and the `board-type`
+        # label the scheduler selects on.
+        include:
+          - runner: ZW-M890P
+            cpus: "31"
+            memory: "256Gi"
+          - runner: ZW-810E
+            cpus: "11"
+            memory: "112Gi"
+    env:
+      # Results travel over the shared NAS: container side /mnt/wl_nas, runner
+      # side /wl_nas. One directory per board, so the two cannot overwrite each
+      # other's verdict.
+      NAS_RESULT_DIR: /wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the pod can build the base worktree from the merge
+          # base sha resolved below.
+          fetch-depth: 0
+
+      - name: Resolve base
+        id: base
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'v0.4.2' }}
+        run: |
+          set -euo pipefail
+          # Pass a sha, not origin/<branch>: a pull_request checkout maps the PR
+          # ref, so the remote tracking branch is not guaranteed to exist.
+          git fetch --no-tags origin "$BASE_REF"
+          sha=$(git merge-base HEAD FETCH_HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE_REF@${sha:0:9} head=$(git rev-parse --short HEAD)"
+          # The pod runs this HEAD, so drop the credential it would inherit.
+          git config --local --unset-all 'http.https://github.com/.extraheader' 2>/dev/null || true
+
+          # A board costs about half an hour, so decide first whether this diff
+          # can move a timing the gate reports. See the header for why this is
+          # not a `paths:` filter.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::manual run, measuring both arms"
+            exit 0
+          fi
+          # --no-renames so moving a file out of a gated directory still counts.
+          changed=$(git diff --name-only --no-renames "$sha" HEAD)
+          hits=$(printf '%s\n' "$changed" | grep -E "$PERF_PATHS" || true)
+          if [ -n "$hits" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::GDN perf path changed: $(printf '%s\n' "$hits" | paste -sd' ')"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::nothing on the GDN perf path changed, gate skipped"
+          fi
+
+      - name: Measure on PPU
+        id: perf
+        if: steps.base.outputs.run == 'true'
+        # Advisory: a pod that never starts is an infra problem, not a verdict
+        # on the code. "Enforce verdict" below fails the job only when the gate
+        # actually reported a regression.
+        continue-on-error: true
+        uses: t-head/ci-infra/cluster-run@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: 240
+          container_options: |
+            cpus: "${{ matrix.cpus }}"
+            memory: "${{ matrix.memory }}"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+
+            unset PIP_INDEX_URL
+            # The pod sees the runner's checkout under a different uid, so git
+            # refuses to read it until the path is whitelisted.
+            git config --global --add safe.directory /workspace/source 2>/dev/null || true
+
+            source /usr/local/PPU_SDK/envsetup.sh
+            export OMP_NUM_THREADS=1
+            export MKL_NUM_THREADS=1
+
+            # Kernels compile from source, so both arms are imported straight
+            # from their worktree and no wheel is installed. fla.ops pulls einops
+            # at import time and the image ships it, so only reach for the
+            # network when it is actually missing.
+            python3 -c 'import einops' 2>/dev/null || pip install -q einops
+
+            # This branch's fla/__init__.py imports fla.models eagerly, and those
+            # models subclass transformers.PreTrainedModel, so importing fla needs
+            # the package. numpy stays pinned to the image's copy: a dependency
+            # bump here would swap the numpy torch was built against.
+            if ! python3 -c 'import transformers' 2>/dev/null; then
+              pip install -q "transformers<5" \
+                "numpy==$(python3 -c 'import numpy; print(numpy.__version__)')"
+            fi
+
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/perf-gdn/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR"
+            # Worktree and cold Triton caches stay on the pod's local disk;
+            # only the published results go to the shared NAS.
+            OUT=/tmp/gdn-perf-out
+
+            set +e
+            # Fixed grid: the defaults sweep 18 shapes x 2 modes and would not fit
+            # the job timeout with a full autotune sweep per arm and round.
+            python benchmarks/gdn_perf.py gate \
+              --base-ref "${{ steps.base.outputs.sha }}" \
+              --workdir "$OUT" \
+              --rounds 2 --heads 8,32,64,128 --seq-lens 4096,8192 \
+              2>&1 | tee "$NAS_RESULT_DIR/gate.log"
+            GATE_EXIT_CODE=${PIPESTATUS[0]}
+            set -euo pipefail
+
+            cp "$OUT/gate.md" "$NAS_RESULT_DIR/gate.md" || true
+            cp "$OUT/gate.json" "$NAS_RESULT_DIR/gate.json" || true
+            # Read back by "Enforce verdict". A container that never starts
+            # leaves no file, which is treated as advisory.
+            echo "$GATE_EXIT_CODE" > "$NAS_RESULT_DIR/exit_code"
+            exit "$GATE_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Perf summary
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.base.outputs.run }}" != 'true' ]; then
+            echo "GDN perf gate (${{ matrix.runner }}) skipped: nothing on the measured path changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -f "$NAS_RESULT_DIR/gate.md" ]; then
+            cat "$NAS_RESULT_DIR/gate.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "gate.md not found under $NAS_RESULT_DIR" >> "$GITHUB_STEP_SUMMARY"
+            tail -60 "$NAS_RESULT_DIR/gate.log" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          fi
+
+      - name: Upload results
+        if: always() && steps.base.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdn-perf-gate-${{ matrix.runner }}
+          path: |
+            ${{ env.NAS_RESULT_DIR }}/gate.md
+            ${{ env.NAS_RESULT_DIR }}/gate.json
+            ${{ env.NAS_RESULT_DIR }}/gate.log
+          if-no-files-found: warn
+
+      # The pod's log needs a login to read. Surface the error lines as
+      # annotations so a failure is diagnosable straight from the run page.
+      # A plain tail would miss the child's traceback: the gate parent prints
+      # its own traceback last, so the useful cause is further up the log.
+      - name: Report failures
+        if: always() && steps.base.outputs.run == 'true'
+        shell: bash
+        run: |
+          log="$NAS_RESULT_DIR/gate.log"
+          [ -s "$log" ] || exit 0
+          while IFS= read -r line; do
+            line="${line//'%'/'%25'}"
+            echo "::warning::$line"
+          done < <(grep -aE 'Traceback|Error|Exception|No module|not found|Killed|denied|error:' "$log" | tail -8)
+
+      # The gate exits 2 on a regression and 3 when it could not measure. Only
+      # the former is a verdict on the code; a pod that never starts, an image
+      # pull failure or a missing result stay advisory, so infra noise cannot
+      # turn this check red.
+      - name: Enforce verdict
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.base.outputs.run }}" != 'true' ]; then
+            echo "::notice::GDN perf gate (${{ matrix.runner }}) skipped: nothing on the measured path changed"
+            exit 0
+          fi
+          code=$(cat "$NAS_RESULT_DIR/exit_code" 2>/dev/null || true)
+          case "$code" in
+            0)
+              echo "::notice::GDN perf gate passed"
+              ;;
+            2)
+              echo "::error::GDN perf gate reported a regression"
+              exit 1
+              ;;
+            *)
+              # A missing file means the pod never ran; 1 is an uncaught error,
+              # 3 means the arms were not comparable and 4 means a point was not
+              # measured. None of them is a verdict on the code.
+              echo "::warning::GDN perf gate has no verdict (exit=${code:-no-result}); advisory"
+              ;;
+          esac

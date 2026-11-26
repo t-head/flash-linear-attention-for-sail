@@ -1,0 +1,24 @@
+# FLA 0.4.2 PR chunk-kernel quick-test commands
+# Each non-empty, non-comment line is executed as a shell command.
+# Every path below exists on the v0.4.2 branch and does not use the 0.5.x layout.
+# Cases 1-11 are GDN with the kernels it builds on; 12-15 are the operators that
+# share chunk_o.py and chunk_delta_h.py with it; 16 is the FLALayer cache API that
+# the modeling case drives. tests/context_parallel/test_cp_gdn.py is deliberately
+# absent: it needs 2/4/8 cards, the pod reserves one, so it would only ever skip.
+
+python -m pytest -v tests/ops/test_gated_delta.py -k "fused_recurrent and not transpose" --durations=30
+python -m pytest -v tests/ops/test_gated_delta.py -k "test_chunk and not varlen and not transpose" --durations=30
+python -m pytest -v tests/ops/test_gated_delta.py -k "transpose_state" --durations=30
+python -m pytest -v tests/ops/test_gated_delta.py -k "chunk_varlen" --durations=30
+python -m pytest -v tests/ops/test_solve_tril.py --durations=30
+python -m pytest -v tests/ops/test_index.py --durations=30
+python -m pytest -v tests/ops/test_utils.py -k "cumsum or pooling or pack" --durations=30
+python -m pytest -v tests/ops/test_intracard_cache.py --durations=30
+python -m pytest -v tests/modules/test_conv.py --durations=30
+python -m pytest -v tests/modules/test_l2norm.py --durations=30
+python -m pytest -v tests/models/test_modeling_gated_deltanet.py --durations=30
+python -m pytest -v tests/ops/test_delta.py -k "test_chunk" --durations=30
+python -m pytest -v tests/ops/test_comba.py -k "test_chunk" --durations=30
+python -m pytest -v tests/ops/test_simple_gla.py -k "test_chunk" --durations=30
+python -m pytest -v tests/ops/test_kda.py -k "test_chunk" --durations=30
+python -m pytest -v tests/models/test_cache.py --durations=30

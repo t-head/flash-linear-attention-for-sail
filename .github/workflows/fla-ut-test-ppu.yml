@@ -1,0 +1,210 @@
+name: fla ut test
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        required: false
+        type: string
+        default: '["ZW-M890P", "ZW-810E"]'
+      # Base branch of the pull request. Empty means a manual run, which stays
+      # unscoped. No default on purpose: a default would silently scope a manual
+      # run against the wrong branch.
+      base_ref:
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+  # This is the chunk-kernel PPU suite: GDN plus the operators that share
+  # chunk_o.py / chunk_delta_h.py with it (delta_rule, comba, simple_gla, kda).
+  # The paths below are the files whose changes those cases can catch -- KDA also
+  # imports `gla/chunk.py` -- and anything else is covered by the NVIDIA/Intel
+  # workflows, which run the dependent op and model tests on every PR.
+  # Keep in sync with casecmd.list.
+  UT_PATHS: '^(fla/(__init__\.py|utils\.py|ops/(__init__\.py|backends/|utils/|common/|cp/|gated_delta_rule/|delta_rule/|comba/|simple_gla/|kda/|gla/)|layers/(__init__\.py|gated_deltanet\.py|utils\.py)|models/(__init__\.py|utils\.py|gated_deltanet/)|modules/(__init__\.py|conv/|convolution\.py|l2norm\.py|layernorm\.py|layernorm_gated\.py|fused_norm_gate\.py|mlp\.py|activations\.py))|tests/|scripts/build_packages\.py|setup\.py|pyproject\.toml|\.github/workflows/(ci|fla-ut-test-ppu|ppu-gdn-perf-gate)\.yml|\.github/workflows/scripts/(casecmd\.list|pr-fla-ut\.py))'
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A board costs hours, so skip the suite when the diff cannot reach it.
+      # Not an on.paths filter: a workflow that never triggers leaves its required
+      # check pending, while a skipped step still reports a conclusion.
+      - name: Decide scope
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ inputs.base_ref }}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::no PR base ref, so this is a manual run; the whole suite runs"
+            exit 0
+          fi
+          BASE_REF="${{ inputs.base_ref }}"
+          BASE_REF="${BASE_REF#origin/}"
+          # fetch-depth 0 already brings the base and this job keeps no credentials.
+          # An unresolvable base runs the suite: a scoping problem must never turn
+          # into missing coverage.
+          if ! git rev-parse --verify -q "origin/$BASE_REF" >/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::origin/$BASE_REF is not in the checkout, so the diff cannot be scoped; running the whole suite"
+            exit 0
+          fi
+          BASE_SHA=$(git merge-base HEAD "origin/$BASE_REF")
+          echo "base=$BASE_REF@$(git rev-parse --short "$BASE_SHA") head=$(git rev-parse --short HEAD)"
+
+          # --no-renames so moving a file out of a gated directory still counts.
+          changed=$(git diff --name-only --no-renames "$BASE_SHA" HEAD)
+          hits=$(printf '%s\n' "$changed" | grep -E "$UT_PATHS" || true)
+          if [ -n "$hits" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::GDN-related files: $(printf '%s\n' "$hits" | paste -sd' ')"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no GDN-related changes, GDN suite skipped"
+          fi
+
+      - name: Build and Test on PPU
+        id: ppu-test
+        if: steps.scope.outputs.run == 'true'
+        uses: t-head/ci-infra/cluster-run@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: 300
+          container_options: |
+            cpus: "${{ matrix.runner == 'ZW-810E' && '11' || '31' }}"
+            memory: "${{ matrix.runner == 'ZW-810E' && '112Gi' || '256Gi' }}"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+
+            # Use public dependency sources without image-baked URL rewrites.
+            unset PIP_INDEX_URL
+            export GIT_CONFIG_GLOBAL=/dev/null
+
+            # PPU SDK and torch are pre-installed in the docker image.
+            source /usr/local/PPU_SDK/envsetup.sh
+            export MAX_JOBS=${{ matrix.runner == 'ZW-810E' && '11' || '31' }}
+            export OMP_NUM_THREADS=1
+            export MKL_NUM_THREADS=1
+
+            pip install setuptools wheel junit-xml rich
+            pip install --upgrade pytest
+
+            echo "=== BUILD ==="
+            pip3 install build
+            python scripts/build_packages.py
+            pip3 install --no-deps dist-packages/*.whl
+            # Pinned: an unbounded resolve pulled 5.24, whose CacheLayerMixin rename
+            # broke fla/models/utils.py. Bump this on purpose, after testing it.
+            # New transformers releases are still covered by reusable-ci-tests.yml,
+            # which installs the package unpinned on the NVIDIA runners.
+            pip3 install 'transformers==5.24.0' einops
+
+            # The suite below imports `fla` from the checkout, so this is the only
+            # place the wheels this job built are exercised. Run it outside the
+            # source tree for the same reason, otherwise `fla/` shadows them.
+            echo "=== VERIFY INSTALLED WHEELS ==="
+            cd /tmp
+            python -c "import fla, fla.ops.gated_delta_rule, fla.layers, fla.models; assert fla.__version__ == '0.4.2', fla.__version__; print('installed', fla.__version__, fla.__file__)"
+            cd /workspace/source
+
+            echo "=== TEST ==="
+            # FLA_CI_ENV is deliberately unset: it downgrades assert_close to a
+            # warning, which would turn accuracy failures into passes.
+            # Archive live to NAS so partial results survive a scheduler kill.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR"
+            set +e
+            python .github/workflows/scripts/pr-fla-ut.py \
+              --caselist .github/workflows/scripts/casecmd.list \
+              --timeout 4200 --deadline 14400 \
+              --output-xml "$NAS_RESULT_DIR/test-results.xml" \
+              2>&1 | tee "$NAS_RESULT_DIR/test-output.log"
+            TEST_EXIT_CODE=${PIPESTATUS[0]}
+            set -euo pipefail
+            test -f "$NAS_RESULT_DIR/test-results.xml"
+            test -s "$NAS_RESULT_DIR/test-output.log"
+            exit "$TEST_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Test summary (${{ matrix.runner }})
+        if: always()
+        shell: bash
+        env:
+          # A skipped build step leaves no report on purpose; anything else that
+          # leaves no report means the run broke, so the summary must fail too.
+          PPU_TEST_OUTCOME: ${{ steps.ppu-test.outcome }}
+        run: |
+          export NAS_RESULT_DIR="/wl_nas/devops/fla-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
+          import xml.etree.ElementTree as ET
+
+          board = os.environ["NAS_RESULT_DIR"].rstrip("/").split("/")[-1]
+          path = os.path.join(os.environ["NAS_RESULT_DIR"], "test-results.xml")
+          print(f"## Runner: {board}")
+          if not os.path.isfile(path):
+              print(f"JUnit report not found: {path}")
+              skipped = os.environ.get("PPU_TEST_OUTCOME") == "skipped"
+              raise SystemExit(0 if skipped else 1)
+
+          tree = ET.parse(path)
+          counts = {}
+          for tc in tree.getroot().iter("testcase"):
+              name = tc.get("name", "?")
+              secs = float(tc.get("time") or 0)
+              failure = tc.find("failure")
+              error = tc.find("error")
+              skipped = tc.find("skipped")
+              if failure is not None:
+                  status, node = "FAIL", failure
+              elif error is not None:
+                  status, node = "ERROR", error
+              elif skipped is not None:
+                  # A deadline-skipped case never ran; calling it PASS would hide that.
+                  status, node = "SKIPPED", skipped
+              else:
+                  status, node = "PASS", None
+              counts[status] = counts.get(status, 0) + 1
+              print(f"- {status} `{name}` ({secs:.0f}s)")
+              if node is None:
+                  continue
+              print(f"  - Reason: {node.get('message') or 'unknown'}")
+              tail = (node.text or "").splitlines()[-60:]
+              if tail:
+                  print("  - Last output lines:")
+                  print("")
+                  print("    ```")
+                  for line in tail:
+                      print(f"    {line}")
+                  print("    ```")
+          print("")
+          print("- " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+          if not any(counts.get(s) for s in ("PASS", "FAIL", "ERROR")):
+              print("::error::no case ran, every case was skipped")
+              raise SystemExit(1)
+          PY
